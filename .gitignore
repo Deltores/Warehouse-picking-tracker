@@ -1,0 +1,106 @@
+# ==============================================================================
+# Picklist Tracker — Comprehensive Git Ignore
+# ==============================================================================
+
+# ------------------------------------------------------------------------------
+# Operating System Files
+# ------------------------------------------------------------------------------
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+desktop.ini
+$RECYCLE.BIN/
+
+# ------------------------------------------------------------------------------
+# Miscellaneous & Temp Files
+# ------------------------------------------------------------------------------
+*.class
+*.log
+*.pyc
+*.swp
+*.bak
+*.tmp
+*.temp
+.history
+.svn/
+.atom/
+.build/
+.buildlog/
+scratch*
+
+# ------------------------------------------------------------------------------
+# Flutter & Dart Build Artifacts
+# ------------------------------------------------------------------------------
+.dart_tool/
+.flutter-plugins
+.flutter-plugins-dependencies
+.packages
+.pub-cache/
+.pub/
+build/
+coverage/
+**/doc/api/
+.widget_preview/
+
+# Symbolication & Obfuscation
+app.*.symbols
+app.*.map.json
+
+# ------------------------------------------------------------------------------
+# Android Native & Gradle
+# ------------------------------------------------------------------------------
+**/android/.gradle/
+**/android/captures/
+**/android/gradle/wrapper/gradle-wrapper.jar
+**/android/local.properties
+**/android/app/debug/
+**/android/app/profile/
+**/android/app/release/
+**/android/**/build/
+
+# Signing keys and credentials (never commit sensitive keys!)
+*.keystore
+*.jks
+key.properties
+google-services.json
+
+# ------------------------------------------------------------------------------
+# IDEs and Code Editors
+# ------------------------------------------------------------------------------
+# JetBrains (IntelliJ, Android Studio)
+.idea/
+*.iml
+*.ipr
+*.iws
+out/
+
+# Visual Studio Code
+.vscode/
+
+# Eclipse
+.project
+.classpath
+.settings/
+
+# ------------------------------------------------------------------------------
+# Picklist Tracker Runtime Data, Local SQLite DBs, and Export Artifacts
+# ------------------------------------------------------------------------------
+# SQLite local databases & write-ahead logs
+*.db
+*.db-shm
+*.db-wal
+*.sqlite
+*.sqlite3
+
+# Safety backups and exported Excel spreadsheets generated during testing
+*_backup.xlsx
+*_backup_*.xlsx
+export/
+exports/
+test_export/
+test_output/
+*.csv.tmp
