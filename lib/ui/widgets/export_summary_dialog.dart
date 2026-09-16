@@ -162,14 +162,14 @@ class _ExportSummaryDialogState extends State<ExportSummaryDialog> {
               children: [
                 Expanded(
                   child: ChoiceChip(
-                    label: const Center(child: Text('Pending (Awaiting ERP)')),
-                    selected: _selectedIssuedStatus == 'Pending',
+                    label: const Center(child: Text('Pending Issue (Awaiting ERP)')),
+                    selected: _selectedIssuedStatus == 'Pending Issue' || _selectedIssuedStatus == 'Pending',
                     onSelected: (selected) {
-                      if (selected) setState(() => _selectedIssuedStatus = 'Pending');
+                      if (selected) setState(() => _selectedIssuedStatus = 'Pending Issue');
                     },
                     selectedColor: AppTheme.statusPartial.withOpacity(0.25),
                     labelStyle: TextStyle(
-                      color: _selectedIssuedStatus == 'Pending' ? AppTheme.statusPartial : AppTheme.textMuted,
+                      color: (_selectedIssuedStatus == 'Pending Issue' || _selectedIssuedStatus == 'Pending') ? AppTheme.statusPartial : AppTheme.textMuted,
                       fontWeight: FontWeight.bold,
                     ),
                   ),

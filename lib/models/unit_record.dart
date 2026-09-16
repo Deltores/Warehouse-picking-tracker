@@ -23,7 +23,10 @@ class UnitRecord {
     this.deletedAt,
   });
 
-  bool get isCompleted => status == 'COMPLETED' || (totalRequired > 0 && totalPicked >= totalRequired);
+  bool get isCompleted =>
+      status == 'COMPLETED' ||
+      status == 'FULLY_PICKED' ||
+      (totalRequired > 0 && totalPicked >= totalRequired);
   bool get isDeleted => deletedAt != null;
   double get progressPercentage => totalRequired > 0 ? (totalPicked / totalRequired) * 100 : 0.0;
 

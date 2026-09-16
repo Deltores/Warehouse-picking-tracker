@@ -333,6 +333,36 @@ class _HomeScreenState extends State<HomeScreen> {
                               ],
                             ),
                           ),
+                          const SizedBox(height: 10),
+                          Row(
+                            mainAxisAlignment: MainAxisAlignment.center,
+                            children: [
+                              Container(
+                                padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
+                                decoration: BoxDecoration(
+                                  color: AppTheme.bgDark.withValues(alpha: 0.8),
+                                  borderRadius: BorderRadius.circular(12),
+                                  border: Border.all(color: AppTheme.borderDark),
+                                ),
+                                child: const Row(
+                                  mainAxisSize: MainAxisSize.min,
+                                  children: [
+                                    Icon(Icons.terminal_rounded, size: 12, color: AppTheme.accentCyan),
+                                    SizedBox(width: 6),
+                                    Text(
+                                      'Picklist Tracker • v1.01 • Build: 12/Aug/2026 • Production Tablet',
+                                      style: TextStyle(
+                                        fontSize: 10.5,
+                                        fontWeight: FontWeight.w600,
+                                        color: AppTheme.textMuted,
+                                        letterSpacing: 0.4,
+                                      ),
+                                    ),
+                                  ],
+                                ),
+                              ),
+                            ],
+                          ),
                           const SizedBox(height: 8),
                         ],
                       ),

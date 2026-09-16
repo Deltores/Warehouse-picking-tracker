@@ -1,4 +1,3 @@
-import 'dart:io';
 import 'package:file_picker/file_picker.dart';
 import 'package:flutter/material.dart';
 import 'package:intl/intl.dart';
@@ -55,6 +54,7 @@ class _PickerFlowScreenState extends State<PickerFlowScreen> {
   List<UnitRecord> _availableUnits = [];
   Map<String, Map<String, int>> _unitPartProgress = {};
   Map<String, UnitPickDateUrgency> _unitUrgencies = {};
+  Map<String, int> _unitMissingParts = {};
   UnitRecord? _selectedUnit;
   bool _isImporting = false;
 
@@ -142,11 +142,13 @@ class _PickerFlowScreenState extends State<PickerFlowScreen> {
         ),
         actions: [
           TextButton(
-            onPressed: () {
-              Navigator.of(ctx).pop();
-              Navigator.of(context).pop(); // Exit back to HomeScreen
+            onPressed: () async {
+              final now = DateTime.now().millisecondsSinceEpoch;
+              await widget.dbService.closeAllActiveSessions(endTime: now);
+              if (ctx.mounted) Navigator.of(ctx).pop();
+              if (mounted) Navigator.of(context).pop(); // Exit back to HomeScreen
             },
-            child: const Text('Exit to Home'),
+            child: const Text('Close & Exit to Home'),
           ),
           OutlinedButton(
             style: OutlinedButton.styleFrom(
@@ -259,18 +261,21 @@ class _PickerFlowScreenState extends State<PickerFlowScreen> {
     final units = await widget.dbService.getAllUnits();
     final progressMap = <String, Map<String, int>>{};
     final urgencyMap = <String, UnitPickDateUrgency>{};
+    final missingMap = <String, int>{};
     for (final u in units) {
       progressMap[u.id] = await widget.dbService.getUnitPartProgress(u.id);
       final urgency = await widget.dbService.getUnitEarliestIncompletePickDate(u.id);
       if (urgency != null) {
         urgencyMap[u.id] = urgency;
       }
+      missingMap[u.id] = await widget.dbService.getUnitMissingPartsCount(u.id);
     }
     if (mounted) {
       setState(() {
         _availableUnits = units;
         _unitPartProgress = progressMap;
         _unitUrgencies = urgencyMap;
+        _unitMissingParts = missingMap;
       });
     }
   }
@@ -371,6 +376,93 @@ class _PickerFlowScreenState extends State<PickerFlowScreen> {
       return;
     }
 
+    // Check if previous picking history exists for this unit (e.g. if unit was deleted)
+    final history = await widget.dbService.findUnitHistory(fileName, filePath: filePath);
+    bool shouldRestore = false;
+
+    if (history['hasHistory'] == true && mounted) {
+      final sessionCount = (history['sessions'] as List).length;
+      final distinctParts = history['distinctPickedParts'] as int;
+      final workers = (history['workers'] as List<String>).join(', ');
+      final workerStr = workers.isNotEmpty ? ' by $workers' : '';
+
+      final recoveryChoice = await showDialog<String>(
+        context: context,
+        barrierDismissible: false,
+        builder: (ctx) => AlertDialog(
+          backgroundColor: AppTheme.cardDark,
+          shape: RoundedRectangleBorder(
+            borderRadius: BorderRadius.circular(16),
+            side: const BorderSide(color: AppTheme.borderDark),
+          ),
+          title: const Row(
+            children: [
+              Icon(Icons.history_rounded, color: AppTheme.accentCyan, size: 26),
+              SizedBox(width: 10),
+              Text('Recover Unit Picking History?', style: TextStyle(color: AppTheme.textLight, fontSize: 18)),
+            ],
+          ),
+          content: Column(
+            mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Text(
+                'Previous picking history was recognized for "$fileName".',
+                style: const TextStyle(color: AppTheme.textLight, fontSize: 14),
+              ),
+              const SizedBox(height: 12),
+              Container(
+                width: double.infinity,
+                padding: const EdgeInsets.all(12),
+                decoration: BoxDecoration(
+                  color: AppTheme.bgDark,
+                  borderRadius: BorderRadius.circular(8),
+                  border: Border.all(color: AppTheme.borderDark),
+                ),
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Text('Unit Name: $fileName', style: const TextStyle(color: AppTheme.accentCyan, fontWeight: FontWeight.bold)),
+                    const SizedBox(height: 4),
+                    Text(
+                      'History: $sessionCount session(s)$workerStr • $distinctParts distinct parts previously picked',
+                      style: const TextStyle(color: AppTheme.statusComplete, fontSize: 12, fontWeight: FontWeight.w600),
+                    ),
+                  ],
+                ),
+              ),
+              const SizedBox(height: 12),
+              const Text(
+                'Do you want to restore previous picking progress onto this newly imported file? All previously picked quantities and sessions will be preserved.',
+                style: const TextStyle(color: AppTheme.textMuted, fontSize: 13),
+              ),
+            ],
+          ),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.of(ctx).pop('CANCEL'),
+              child: const Text('Cancel'),
+            ),
+            TextButton(
+              onPressed: () => Navigator.of(ctx).pop('FRESH'),
+              child: const Text('Start Fresh', style: TextStyle(color: AppTheme.textMuted)),
+            ),
+            ElevatedButton.icon(
+              style: ElevatedButton.styleFrom(backgroundColor: AppTheme.statusComplete),
+              icon: const Icon(Icons.restore_rounded, size: 18),
+              label: const Text('⚡ Restore Progress & Sessions', style: TextStyle(fontWeight: FontWeight.bold)),
+              onPressed: () => Navigator.of(ctx).pop('RESTORE'),
+            ),
+          ],
+        ),
+      );
+
+      if (recoveryChoice == null || recoveryChoice == 'CANCEL') {
+        return;
+      }
+      shouldRestore = recoveryChoice == 'RESTORE';
+    }
+
     setState(() => _isImporting = true);
     try {
       final prunedId = await widget.storageManager.enforceCapacityLimit();
@@ -398,7 +490,7 @@ class _PickerFlowScreenState extends State<PickerFlowScreen> {
       final totalPicked = parsedItems.fold<double>(0.0, (s, i) => s + i.qtyPicked).round();
       final now = DateTime.now().millisecondsSinceEpoch;
 
-      final newUnit = UnitRecord(
+      final baseUnit = UnitRecord(
         id: unitId,
         name: unitId,
         filePath: filePath,
@@ -409,16 +501,35 @@ class _PickerFlowScreenState extends State<PickerFlowScreen> {
         lastAccessedAt: now,
       );
 
-      await widget.dbService.insertUnit(newUnit);
-      await widget.dbService.savePicklistItems(unitId, parsedItems);
-      await widget.dbService.saveDepartments(unitId, deptList);
+      UnitRecord finalUnit;
+      if (shouldRestore) {
+        finalUnit = await widget.dbService.restoreUnitWithPicks(
+          unit: baseUnit,
+          parsedItems: parsedItems,
+          departments: deptList,
+        );
+      } else {
+        await widget.dbService.insertUnit(baseUnit);
+        await widget.dbService.savePicklistItems(unitId, parsedItems);
+        await widget.dbService.saveDepartments(unitId, deptList);
+        finalUnit = baseUnit;
+      }
 
       await _loadUnits();
       setState(() {
-        _selectedUnit = newUnit;
+        _selectedUnit = finalUnit;
         _currentStep = 2;
       });
-      await _loadDepartments(newUnit);
+      await _loadDepartments(finalUnit);
+
+      if (shouldRestore && mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text('Unit "$unitId" successfully restored with historical picking progress!'),
+            backgroundColor: AppTheme.statusComplete,
+          ),
+        );
+      }
     } catch (e) {
       if (mounted) {
         ScaffoldMessenger.of(context).showSnackBar(
@@ -442,6 +553,57 @@ class _PickerFlowScreenState extends State<PickerFlowScreen> {
     for (final dept in depts.keys) {
       deptProgress[dept] = await widget.dbService.getDepartmentPartProgress(unit.id, dept);
     }
+
+    // Check if any Resource IDs are configured for MAIN LINE department-level picking
+    final mainLinePicks = await widget.dbService.getMainLineResourcePicks();
+    if (mainLinePicks.isNotEmpty) {
+      final allItems = await widget.dbService.getPicklistItems(unit.id);
+      final mainLineItems = allItems.where((i) =>
+          i.deptType.toUpperCase() == 'MAIN LINE' ||
+          i.department.toUpperCase().contains('MAIN') ||
+          i.department.toUpperCase().contains('MACG')).toList();
+
+      for (final res in mainLinePicks) {
+        final resItems = mainLineItems
+            .where((i) => i.resourceId.trim().toLowerCase() == res.trim().toLowerCase())
+            .toList();
+        if (resItems.isNotEmpty) {
+          final resKey = 'Resource: $res (MAIN LINE)';
+          depts[resKey] = true;
+
+          final partIds = resItems.map((i) => i.partId).toSet();
+          final totalParts = partIds.length;
+          final completedParts = partIds.where((pid) {
+            final forPart = resItems.where((i) => i.partId == pid);
+            final due = forPart.fold<double>(0.0, (s, i) => s + i.qtyDue);
+            return due <= 0.0001;
+          }).length;
+          deptProgress[resKey] = {
+            'totalParts': totalParts,
+            'completedParts': completedParts,
+          };
+
+          DateTime? earliest;
+          String? earliestStr;
+          for (final i in resItems) {
+            if (i.qtyDue > 0.0001 && i.pickDate.isNotEmpty) {
+              final parsed = UnitPickDateUrgency.parseDateRobust(i.pickDate);
+              if (parsed != null && (earliest == null || parsed.isBefore(earliest))) {
+                earliest = parsed;
+                earliestStr = i.pickDate;
+              }
+            }
+          }
+          final isAllCompleted = totalParts > 0 && completedParts >= totalParts;
+          deptUrgencies[resKey] = UnitPickDateUrgency.evaluate(
+            dateStr: earliestStr,
+            department: resKey,
+            isAllCompleted: isAllCompleted,
+          );
+        }
+      }
+    }
+
     setState(() {
       _departments = depts;
       _departmentUrgencies = deptUrgencies;
@@ -586,14 +748,17 @@ class _PickerFlowScreenState extends State<PickerFlowScreen> {
       }
       // choice == 'new': delete if empty, otherwise close/abandon old session, then create a new one below.
       if (choice == 'new') {
-        if (existingSession.totalItemsPicked <= 0) {
-          // Empty session — delete it so seq counter doesn't waste a number
+        final unitItems = await widget.dbService.getPicklistItems(existingSession.unitId);
+        final hasPicks = unitItems.any((i) => i.qtyPicked > 0.0001) || existingSession.totalItemsPicked > 0;
+        if (!hasPicks) {
+          // Genuinely empty session with 0 picks made anywhere on this unit
           await widget.dbService.deleteEmptySession(existingSession.id);
         } else {
+          final count = unitItems.where((i) => i.qtyPicked > 0.0001).length;
           await widget.dbService.closeSession(
             existingSession.id,
             DateTime.now().millisecondsSinceEpoch,
-            existingSession.totalItemsPicked,
+            existingSession.totalItemsPicked > 0 ? existingSession.totalItemsPicked : count,
           );
         }
       }
@@ -616,7 +781,7 @@ class _PickerFlowScreenState extends State<PickerFlowScreen> {
       startTime: now.millisecondsSinceEpoch,
       pickDate: DateFormat('yyyy-MM-dd').format(now),
       status: 'ACTIVE',
-      issuedStatus: 'Pending',
+      issuedStatus: 'Pending Issue',
       totalItemsPicked: 0,
     );
 
@@ -659,144 +824,69 @@ class _PickerFlowScreenState extends State<PickerFlowScreen> {
 
     if (!mounted) return;
 
-    final pinCtrl = TextEditingController();
-    String? inlineError;
-
     await showDialog<void>(
       context: context,
-      builder: (ctx) => StatefulBuilder(
-        builder: (ctx, setDialogState) => AlertDialog(
-          backgroundColor: AppTheme.cardDark,
-          shape: RoundedRectangleBorder(
-            borderRadius: BorderRadius.circular(16),
-            side: const BorderSide(color: AppTheme.borderDark),
-          ),
-          title: Row(
-            children: [
-              const Icon(Icons.exit_to_app_rounded, color: AppTheme.accentCyan, size: 24),
-              const SizedBox(width: 10),
-              Flexible(
-                child: Text('Exit Picker ($worker)', style: const TextStyle(color: AppTheme.textLight, fontSize: 18), overflow: TextOverflow.ellipsis),
-              ),
-            ],
-          ),
-          content: Column(
-            mainAxisSize: MainAxisSize.min,
-            crossAxisAlignment: CrossAxisAlignment.start,
-            children: [
-              Text(
-                session != null
-                    ? 'Active session is in progress for $worker.\nTo change worker or exit to Home, close the session or enter Admin PIN.'
-                    : 'Worker name is locked to $worker.\nTo change worker or exit to Home, enter Admin PIN.',
-                style: const TextStyle(color: AppTheme.textMuted, fontSize: 13, height: 1.4),
-              ),
-              const SizedBox(height: 16),
-              TextField(
-                controller: pinCtrl,
-                autofocus: true,
-                keyboardType: TextInputType.number,
-                obscureText: true,
-                style: const TextStyle(color: AppTheme.textLight, fontSize: 18),
-                decoration: InputDecoration(
-                  hintText: 'Enter Admin PIN to exit',
-                  errorText: inlineError,
-                  prefixIcon: const Icon(Icons.lock_outline, color: AppTheme.textMuted),
-                  border: OutlineInputBorder(borderRadius: BorderRadius.circular(10)),
-                ),
-              ),
-            ],
-          ),
-          actions: [
-            TextButton(
-              onPressed: () => Navigator.of(ctx).pop(),
-              child: const Text('Stay in Picker'),
-            ),
-            if (session != null)
-              ElevatedButton.icon(
-                style: ElevatedButton.styleFrom(backgroundColor: const Color(0xFFE07B00)),
-                icon: const Icon(Icons.lock_clock_rounded, size: 16),
-                label: const Text('End Session & Exit'),
-                onPressed: () async {
-                  final now = DateTime.now().millisecondsSinceEpoch;
-                  final activeSessions = await widget.dbService.getAllActiveSessions();
-                  for (final s in activeSessions) {
-                    if (s.totalItemsPicked > 0) {
-                      final unit = await widget.dbService.getUnit(s.unitId);
-                      if (unit != null) {
-                        try {
-                          final exportDir = await widget.dbService.getLastExportDir();
-                          final dir = (exportDir != null && exportDir.isNotEmpty)
-                              ? exportDir
-                              : File(unit.filePath).parent.path;
-                          final closedSession = s.copyWith(
-                            status: 'EXPORTED',
-                            endTime: now,
-                          );
-                          final outputPath = p.join(
-                            dir,
-                            closedSession.buildExportFileName(unit.name, customEndTime: now),
-                          );
-                          final items = await widget.dbService.getPicklistItems(unit.id);
-                          final returnComments = await widget.dbService.getReturnCommentsForUnit(unit.id);
-                          final autoIssueRes = await widget.dbService.getAutoIssueResourceIds();
-                          await widget.excelService.exportAndOverwrite(
-                            originalFilePath: unit.filePath,
-                            items: items,
-                            session: closedSession,
-                            unitName: unit.name,
-                            returnComments: returnComments,
-                            outputPath: outputPath,
-                            autoIssueResourceIds: autoIssueRes,
-                          );
-                          await widget.dbService.finishSession(s.id, now, s.totalItemsPicked, 'Exported');
-                          LogService.picker('Session ${s.id} auto-exported on exit to $outputPath');
-                        } catch (e) {
-                          LogService.error('PickerFlow', 'Auto-export on exit failed for session ${s.id}', stackTrace: e.toString());
-                        }
-                      }
-                    }
-                  }
-                  await widget.dbService.closeAllActiveSessions(endTime: now);
-                  LogService.picker('All active sessions ended by "$worker" from exit menu');
-                  if (ctx.mounted) Navigator.of(ctx).pop();
-                  if (mounted) Navigator.of(context).pop();
-                },
-              )
-            else
-              ElevatedButton(
-                style: ElevatedButton.styleFrom(backgroundColor: const Color(0xFFE07B00)),
-                onPressed: () {
-                  if (ctx.mounted) Navigator.of(ctx).pop();
-                  if (mounted) {
-                    setState(() {
-                      _workerName = '';
-                      _nameController.clear();
-                      _currentStep = 0;
-                    });
-                    Navigator.of(context).pop();
-                  }
-                },
-                child: const Text('Exit & Reset Name'),
-              ),
-            ElevatedButton(
-              style: ElevatedButton.styleFrom(backgroundColor: AppTheme.primaryBlue),
-              onPressed: () async {
-                final pin = pinCtrl.text.trim();
-                final ok = await widget.dbService.verifyAdminPin(pin);
-                if (ok) {
-                  ScaffoldMessenger.of(context).clearSnackBars();
-                  if (ctx.mounted) Navigator.of(ctx).pop();
-                  if (mounted) Navigator.of(context).pop();
-                } else {
-                  setDialogState(() {
-                    inlineError = 'Incorrect Admin PIN';
-                  });
-                }
-              },
-              child: const Text('Admin Exit'),
+      builder: (ctx) => AlertDialog(
+        backgroundColor: AppTheme.cardDark,
+        shape: RoundedRectangleBorder(
+          borderRadius: BorderRadius.circular(16),
+          side: const BorderSide(color: AppTheme.borderDark),
+        ),
+        title: const Row(
+          children: [
+            Icon(Icons.exit_to_app_rounded, color: Color(0xFFE07B00), size: 24),
+            SizedBox(width: 10),
+            Flexible(
+              child: Text('Exit to Home Screen?', style: TextStyle(color: AppTheme.textLight, fontSize: 18), overflow: TextOverflow.ellipsis),
             ),
           ],
         ),
+        content: Text(
+          session != null
+              ? 'An active picking session is in progress for "$worker".\n\nExiting to Home will terminate the active session, save all picked progress to the database, and return to the main launch screen.'
+              : 'Worker profile "$worker" is currently open.\n\nExit to the main launch screen?',
+          style: const TextStyle(color: AppTheme.textMuted, fontSize: 13, height: 1.4),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.of(ctx).pop(),
+            child: const Text('Cancel'),
+          ),
+          ElevatedButton.icon(
+            style: ElevatedButton.styleFrom(
+              backgroundColor: const Color(0xFFE07B00),
+              foregroundColor: Colors.white,
+              padding: const EdgeInsets.symmetric(horizontal: 18, vertical: 12),
+              shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(10)),
+            ),
+            icon: const Icon(Icons.stop_circle_rounded, size: 18, color: Colors.white),
+            label: const Text(
+              'Terminate Session & Exit',
+              style: TextStyle(fontWeight: FontWeight.bold, color: Colors.white),
+            ),
+            onPressed: () async {
+              final now = DateTime.now().millisecondsSinceEpoch;
+              await widget.dbService.closeAllActiveSessions(endTime: now);
+              LogService.picker('Session terminated and exited to Home by "$worker"');
+              if (ctx.mounted) Navigator.of(ctx).pop();
+              if (mounted) {
+                setState(() {
+                  _workerName = '';
+                  _nameController.clear();
+                  _currentStep = 0;
+                });
+                ScaffoldMessenger.of(context).showSnackBar(
+                  const SnackBar(
+                    content: Text('Active session closed and saved! Ready for batch export in Export Hub.'),
+                    backgroundColor: AppTheme.statusComplete,
+                    duration: Duration(seconds: 3),
+                  ),
+                );
+                Navigator.of(context).popUntil((route) => route.isFirst);
+              }
+            },
+          ),
+        ],
       ),
     );
   }
@@ -1390,6 +1480,9 @@ class _PickerFlowScreenState extends State<PickerFlowScreen> {
                                         final partProgressVal = totalParts > 0
                                             ? (completedParts / totalParts).clamp(0.0, 1.0)
                                             : 0.0;
+                                        final missingCount = _unitMissingParts[unit.id] ?? 0;
+                                        final isFullyPicked = (totalParts > 0 && completedParts >= totalParts) || unit.isCompleted;
+                                        final displayStatus = isFullyPicked ? 'FULLY_PICKED' : unit.status;
 
                                         return Column(
                                           crossAxisAlignment: CrossAxisAlignment.start,
@@ -1402,9 +1495,36 @@ class _PickerFlowScreenState extends State<PickerFlowScreen> {
                                                 color: isSelected ? AppTheme.accentCyan : AppTheme.textLight,
                                               ),
                                             ),
-                                            if (urgencyBadge != null) ...[
+                                            if (urgencyBadge != null || missingCount > 0) ...[
                                               const SizedBox(height: 6),
-                                              urgencyBadge,
+                                              Wrap(
+                                                spacing: 8,
+                                                runSpacing: 4,
+                                                crossAxisAlignment: WrapCrossAlignment.center,
+                                                children: [
+                                                  if (urgencyBadge != null) urgencyBadge,
+                                                  if (missingCount > 0)
+                                                    Container(
+                                                      padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 3),
+                                                      decoration: BoxDecoration(
+                                                        color: AppTheme.statusDanger.withValues(alpha: 0.15),
+                                                        borderRadius: BorderRadius.circular(6),
+                                                        border: Border.all(color: AppTheme.statusDanger.withValues(alpha: 0.6), width: 1.2),
+                                                      ),
+                                                      child: Row(
+                                                        mainAxisSize: MainAxisSize.min,
+                                                        children: [
+                                                          const Icon(Icons.warning_amber_rounded, size: 14, color: AppTheme.statusDanger),
+                                                          const SizedBox(width: 4),
+                                                          Text(
+                                                            '$missingCount MISSING ${missingCount == 1 ? "PART" : "PARTS"}',
+                                                            style: const TextStyle(fontSize: 11, fontWeight: FontWeight.bold, color: AppTheme.statusDanger),
+                                                          ),
+                                                        ],
+                                                      ),
+                                                    ),
+                                                ],
+                                              ),
                                             ],
                                             const SizedBox(height: 6),
                                             LinearProgressIndicator(
@@ -1421,12 +1541,20 @@ class _PickerFlowScreenState extends State<PickerFlowScreen> {
                                               children: [
                                                 Text(
                                                   '$completedParts / $totalParts parts ($partPct%)',
-                                                  style: const TextStyle(fontSize: 12, fontWeight: FontWeight.bold, color: AppTheme.accentCyan),
+                                                  style: TextStyle(
+                                                    fontSize: 12,
+                                                    fontWeight: FontWeight.bold,
+                                                    color: isFullyPicked ? AppTheme.statusComplete : AppTheme.accentCyan,
+                                                  ),
                                                 ),
                                                 const SizedBox(width: 8),
                                                 Text(
-                                                  '• ${unit.totalPicked}/${unit.totalRequired} pcs • ${unit.status}',
-                                                  style: const TextStyle(fontSize: 12, color: AppTheme.textMuted),
+                                                  '• $displayStatus',
+                                                  style: TextStyle(
+                                                    fontSize: 12,
+                                                    fontWeight: isFullyPicked ? FontWeight.bold : FontWeight.normal,
+                                                    color: isFullyPicked ? AppTheme.statusComplete : AppTheme.textMuted,
+                                                  ),
                                                 ),
                                               ],
                                             ),
@@ -1562,9 +1690,11 @@ class _PickerFlowScreenState extends State<PickerFlowScreen> {
                               Icon(
                                 isSelected
                                     ? Icons.radio_button_checked_rounded
-                                    : (isDeptCompleted
-                                        ? Icons.check_circle_rounded
-                                        : Icons.apartment_rounded),
+                                    : (dept.startsWith('Resource:')
+                                        ? Icons.precision_manufacturing_rounded
+                                        : (isDeptCompleted
+                                            ? Icons.check_circle_rounded
+                                            : Icons.apartment_rounded)),
                                 color: isSelected
                                     ? const Color(0xFF00B0FF)
                                     : (isDeptCompleted
@@ -1583,13 +1713,37 @@ class _PickerFlowScreenState extends State<PickerFlowScreen> {
                                 child: Column(
                                   crossAxisAlignment: CrossAxisAlignment.start,
                                   children: [
-                                    Text(
-                                      dept,
-                                      style: TextStyle(
-                                        fontSize: 18,
-                                        fontWeight: FontWeight.bold,
-                                        color: isSelected ? const Color(0xFFE0F2FE) : AppTheme.textLight,
-                                      ),
+                                    Row(
+                                      children: [
+                                        if (dept.startsWith('Resource:'))
+                                          Container(
+                                            margin: const EdgeInsets.only(right: 8),
+                                            padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
+                                            decoration: BoxDecoration(
+                                              color: const Color(0xFF0EA5E9).withValues(alpha: 0.2),
+                                              borderRadius: BorderRadius.circular(4),
+                                              border: Border.all(color: const Color(0xFF0EA5E9)),
+                                            ),
+                                            child: const Text(
+                                              'MAIN LINE RESOURCE',
+                                              style: TextStyle(
+                                                fontSize: 9,
+                                                fontWeight: FontWeight.bold,
+                                                color: Color(0xFF0EA5E9),
+                                              ),
+                                            ),
+                                          ),
+                                        Expanded(
+                                          child: Text(
+                                            dept,
+                                            style: TextStyle(
+                                              fontSize: 18,
+                                              fontWeight: FontWeight.bold,
+                                              color: isSelected ? const Color(0xFFE0F2FE) : AppTheme.textLight,
+                                            ),
+                                          ),
+                                        ),
+                                      ],
                                     ),
                                     if (deptUrgency != null && !isDeptCompleted && deptUrgency.earliestPickDateStr != null && deptUrgency.earliestPickDateStr!.isNotEmpty) ...[
                                       const SizedBox(height: 4),

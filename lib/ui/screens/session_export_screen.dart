@@ -5,6 +5,7 @@ import 'package:flutter/material.dart';
 import 'package:intl/intl.dart';
 import 'package:path/path.dart' as p;
 
+import '../../models/picklist_item.dart';
 import '../../models/session_metadata.dart';
 import '../../models/unit_record.dart';
 import '../../services/database_service.dart';
@@ -12,21 +13,45 @@ import '../../services/excel_service.dart';
 import '../../services/log_service.dart';
 import '../theme/app_theme.dart';
 
-/// SessionExportScreen: Shows all exportable sessions for the active unit.
+/// Represents a consolidated batch of sessions exported together.
+class SessionBatchGroup {
+  final String batchKey;
+  final String unitId;
+  final String unitName;
+  final String status;
+  final List<SessionMetadata> sessions;
+
+  SessionBatchGroup({
+    required this.batchKey,
+    required this.unitId,
+    required this.unitName,
+    required this.status,
+    required this.sessions,
+  });
+
+  Set<String> get unitIds => sessions.map((s) => s.unitId).toSet();
+
+  String get seqListStr {
+    final seqNos = sessions.map((s) => s.sessionSeqNo).where((n) => n > 0).toSet().toList()..sort();
+    return seqNos.isNotEmpty
+        ? seqNos.map((n) => '#$n').join(', ')
+        : '${sessions.length} sessions';
+  }
+
+  int get earliestStart => sessions.map((s) => s.startTime).reduce((a, b) => a < b ? a : b);
+  int get latestEnd => sessions.map((s) => s.endTime ?? s.startTime).reduce((a, b) => a > b ? a : b);
+  String get totalDurationStr => SessionMetadata.formatTotalDuration(sessions);
+  int get totalItemsPicked => sessions.fold<int>(0, (sum, s) => sum + s.totalItemsPicked);
+}
+
+/// SessionExportScreen: Global export hub for finished/closed worker sessions.
 ///
-/// Sessions are shown only when:
-///  - status == 'CLOSED' or 'FINISHED'
-///  - totalItemsPicked > 0
-///
-/// Badges:
-///  - 🟡 CLOSED — ready to export
-///  - 🟢 FINISHED — already exported (file may or may not exist)
-///
-/// Selecting a FINISHED session checks if the file exists:
-///  - File exists → "Already Exported" info dialog
-///  - File missing → allows re-export
-///
-/// Exported file name: {TabletID}_{sessionId}_{unitName}.xlsx
+/// Features:
+///  - Tab 1: CLOSED sessions waiting for batch super export (strictly parts count, no pcs)
+///  - Tab 2: EXPORTED super sessions (grouped by batchId, with enclosed sessions and bulk Mark as ISSUED)
+///  - Tab 3: ISSUED super sessions (ERP acknowledged)
+///  - Full batch delete support (trash icon) to purge old test sessions
+///  - Calm tab transitions without forced jumping
 class SessionExportScreen extends StatefulWidget {
   final DatabaseService dbService;
   final ExcelService excelService;
@@ -46,9 +71,9 @@ class _SessionExportScreenState extends State<SessionExportScreen>
   late TabController _tabController;
   List<SessionMetadata> _sessions = [];
   Map<String, UnitRecord> _units = {};
+  Map<String, Map<String, num>> _unitPickStats = {};
   String? _customExportDir;
   bool _isLoading = true;
-  String? _processingId;
 
   List<SessionMetadata> get _closedSessions =>
       _sessions.where((s) => s.isClosed).toList();
@@ -75,19 +100,33 @@ class _SessionExportScreenState extends State<SessionExportScreen>
   Future<void> _loadSessions() async {
     setState(() => _isLoading = true);
 
-    _customExportDir = await widget.dbService.getLastExportDir();
+    final lastExportDir = await widget.dbService.getLastExportDir();
+    if (lastExportDir != null && lastExportDir.isNotEmpty) {
+      _customExportDir = lastExportDir;
+    }
 
     final allUnits = await widget.dbService.getAllUnits(includeDeleted: true);
     _units = { for (var u in allUnits) u.id: u };
+
+    final statsMap = <String, Map<String, num>>{};
+    for (final u in allUnits) {
+      statsMap[u.id] = await widget.dbService.getUnitPartPickStats(u.id);
+    }
+
+    // Auto-purge sessions marked as ISSUED older than 60 days
+    await widget.dbService.purgeExpiredIssuedSessions(retentionDays: 60);
 
     final sessions = await widget.dbService.getAllExportableSessions();
     // LIFO sorting: newest sessions (by end time or start time) at top
     sessions.sort((a, b) => (b.endTime ?? b.startTime).compareTo(a.endTime ?? a.startTime));
 
-    setState(() {
-      _sessions = sessions;
-      _isLoading = false;
-    });
+    if (mounted) {
+      setState(() {
+        _sessions = sessions;
+        _unitPickStats = statsMap;
+        _isLoading = false;
+      });
+    }
   }
 
   Future<void> _chooseExportFolder() async {
@@ -106,352 +145,363 @@ class _SessionExportScreenState extends State<SessionExportScreen>
     }
   }
 
-  // ─── Export a single session ─────────────────────────────────
-
-  Future<void> _handleExport(SessionMetadata session) async {
-    final unit = _units[session.unitId];
-    if (unit == null) return; // Unit was deleted
-
-    // Determine the expected output file path for this session.
-    final dir = (_customExportDir != null && _customExportDir!.isNotEmpty)
-        ? _customExportDir!
-        : File(unit.filePath).parent.path;
-    final outputPath = p.join(dir, session.buildExportFileName(unit.name));
-
-    // If already EXPORTED or ISSUED, check if a file with this session's base name exists.
-    if (session.isExported || session.isFinished || session.isIssued) {
-      // Check directory for a file with the session display name prefix.
-      final existing = Directory(dir).existsSync()
-          ? Directory(dir)
-              .listSync()
-              .whereType<File>()
-              .where((f) => p.basename(f.path).startsWith(session.displayName(unit.name).replaceAll(RegExp(r'[^\w_\-]'), '_')))
-              .toList()
-          : <File>[];
-      if (existing.isNotEmpty) {
-        _showAlreadyExportedDialog(session, existing.first.path);
-        return;
-      }
-      // File doesn't exist → fall through and re-export.
+  String _sessionBatchKey(SessionMetadata s) {
+    if (s.batchId.isNotEmpty) {
+      return s.batchId;
     }
-
-    // Confirm ERP issued status before exporting.
-    final issuedStatus = await _showIssuedStatusDialog(session);
-    if (issuedStatus == null || !mounted) return;
-
-    setState(() => _processingId = session.id);
-    try {
-      final items = await widget.dbService.getPicklistItems(unit.id);
-      final returnComments = await widget.dbService.getReturnCommentsForUnit(unit.id);
-      final now = DateTime.now().millisecondsSinceEpoch;
-
-      final finalizedSession = session.copyWith(
-        endTime: session.endTime ?? now,
-        status: 'EXPORTED',
-        issuedStatus: issuedStatus,
-        totalItemsPicked: session.totalItemsPicked,
-      );
-
-      final autoIssueResourceIds = await widget.dbService.getAutoIssueResourceIds();
-      final writtenPath = await widget.excelService.exportAndOverwrite(
-        originalFilePath: unit.filePath,
-        items: items,
-        session: finalizedSession,
-        unitName: unit.name,
-        returnComments: returnComments,
-        outputPath: outputPath,
-        autoIssueResourceIds: autoIssueResourceIds,
-      );
-
-      await widget.dbService.finishSession(
-        session.id,
-        finalizedSession.endTime!,
-        finalizedSession.totalItemsPicked,
-        issuedStatus,
-      );
-
-      await _loadSessions();
-      if (!mounted) return;
-      _tabController.animateTo(1); // Move to Exported tab
-
-      _showSuccessDialog(finalizedSession, writtenPath, expectedPath: outputPath);
-    } catch (e) {
-      if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(content: Text('Export failed: $e'), backgroundColor: AppTheme.statusDanger),
-        );
-      }
-    } finally {
-      if (mounted) setState(() => _processingId = null);
-    }
+    // Fallback for older unbatched sessions: maintain distinct session cards
+    return 'SESSION_${s.id}';
   }
 
-  /// Admin action: mark an EXPORTED session as ISSUED with Admin PIN protection.
-  Future<void> _markAsIssued(SessionMetadata session) async {
-    final pinCtrl = TextEditingController();
-    String? inlineError;
-
-    final verified = await showDialog<bool>(
-      context: context,
-      builder: (ctx) => StatefulBuilder(
-        builder: (ctx, setDialogState) => AlertDialog(
-          backgroundColor: AppTheme.cardDark,
-          shape: RoundedRectangleBorder(
-            borderRadius: BorderRadius.circular(16),
-            side: const BorderSide(color: AppTheme.borderDark),
-          ),
-          title: const Row(
-            children: [
-              Icon(Icons.admin_panel_settings_rounded, color: AppTheme.accentCyan, size: 24),
-              SizedBox(width: 10),
-              Text('Admin Authorization', style: TextStyle(color: AppTheme.textLight, fontSize: 18)),
-            ],
-          ),
-          content: Column(
-            mainAxisSize: MainAxisSize.min,
-            crossAxisAlignment: CrossAxisAlignment.start,
-            children: [
-              const Text(
-                'Enter Admin PIN to mark this session as ISSUED in ERP:',
-                style: TextStyle(color: AppTheme.textMuted, fontSize: 13),
-              ),
-              const SizedBox(height: 14),
-              TextField(
-                controller: pinCtrl,
-                autofocus: true,
-                keyboardType: TextInputType.number,
-                obscureText: true,
-                style: const TextStyle(color: AppTheme.textLight, fontSize: 22, letterSpacing: 4),
-                decoration: InputDecoration(
-                  hintText: 'PIN (default 1234)',
-                  errorText: inlineError,
-                  filled: true,
-                  fillColor: AppTheme.bgDark,
-                  border: OutlineInputBorder(borderRadius: BorderRadius.circular(10)),
-                  focusedBorder: OutlineInputBorder(
-                    borderRadius: BorderRadius.circular(10),
-                    borderSide: const BorderSide(color: AppTheme.accentCyan, width: 2),
-                  ),
-                ),
-                onSubmitted: (_) async {
-                  final ok = await widget.dbService.verifyAdminPin(pinCtrl.text.trim());
-                  if (!ctx.mounted) return;
-                  if (ok) {
-                    Navigator.pop(ctx, true);
-                  } else {
-                    setDialogState(() {
-                      inlineError = 'Incorrect Admin PIN. Please try again.';
-                    });
-                  }
-                },
-              ),
-            ],
-          ),
-          actions: [
-            TextButton(
-              onPressed: () => Navigator.pop(ctx, null), // Cancel pressed — return null!
-              child: const Text('Cancel'),
-            ),
-            ElevatedButton(
-              style: ElevatedButton.styleFrom(backgroundColor: AppTheme.accentCyan),
-              onPressed: () async {
-                final ok = await widget.dbService.verifyAdminPin(pinCtrl.text.trim());
-                if (!ctx.mounted) return;
-                if (ok) {
-                  Navigator.pop(ctx, true);
-                } else {
-                  setDialogState(() {
-                    inlineError = 'Incorrect Admin PIN. Please try again.';
-                  });
-                }
-              },
-              child: const Text('Confirm ISSUED', style: TextStyle(color: AppTheme.bgDark, fontWeight: FontWeight.bold)),
-            ),
-          ],
-        ),
-      ),
-    );
-
-    if (verified == true) {
-      await widget.dbService.updateSessionIssuedStatus(session.id, 'ISSUED');
-      LogService.admin('Session ${session.id} marked as ISSUED by Admin');
-      await _loadSessions();
-      if (mounted) {
-        _tabController.animateTo(2); // Move to Issued tab!
-        ScaffoldMessenger.of(context).showSnackBar(
-          const SnackBar(
-            content: Text('Session marked as ISSUED and moved to Issued tab.'),
-            backgroundColor: AppTheme.accentCyan,
-          ),
-        );
-      }
+  List<SessionBatchGroup> _groupIntoBatches(List<SessionMetadata> sessions) {
+    final map = <String, List<SessionMetadata>>{};
+    for (final s in sessions) {
+      final key = _sessionBatchKey(s);
+      map.putIfAbsent(key, () => []).add(s);
     }
-    // If verified == null, worker cancelled — no error message!
+    final groups = map.entries.map((entry) {
+      final list = entry.value;
+      final unitIds = list.map((s) => s.unitId).toSet().toList();
+      final unitNames = unitIds.map((uid) => _units[uid]?.name ?? 'Unit $uid').toSet().toList();
+      return SessionBatchGroup(
+        batchKey: entry.key,
+        unitId: unitIds.join(', '),
+        unitName: unitNames.join(', '),
+        status: list.first.status,
+        sessions: list,
+      );
+    }).toList();
+    // Sort newest first (LIFO) so latest batches are at the top
+    groups.sort((a, b) => b.latestEnd.compareTo(a.latestEnd));
+    return groups;
   }
 
-  // ─── Dialogs ─────────────────────────────────────────────────
+  // ─── Batch Super Export (All Unexported Sessions) ────────────
 
-  Future<String?> _showIssuedStatusDialog(SessionMetadata session) {
-    String selectedStatus = 'Pending';
-    return showDialog<String>(
-      context: context,
-      builder: (ctx) => StatefulBuilder(
-        builder: (ctx, setLocal) => AlertDialog(
-          backgroundColor: AppTheme.cardDark,
-          title: Column(
-            crossAxisAlignment: CrossAxisAlignment.start,
-            children: [
-              const Row(children: [
-                Icon(Icons.upload_file_rounded, color: AppTheme.statusComplete),
-                SizedBox(width: 10),
-                Text('Export Session', style: TextStyle(color: AppTheme.textLight, fontSize: 18)),
-              ]),
-              const SizedBox(height: 4),
-              Text(
-                session.id,
-                style: const TextStyle(fontSize: 12, color: AppTheme.accentCyan, fontWeight: FontWeight.normal),
-              ),
-            ],
-          ),
-          content: Column(
-            mainAxisSize: MainAxisSize.min,
-            crossAxisAlignment: CrossAxisAlignment.start,
-            children: [
-              _infoRow('Worker', session.workerName),
-              _infoRow('Date', session.pickDate),
-              _infoRow('Items Picked', '${session.totalItemsPicked}'),
-              const SizedBox(height: 16),
-              const Text('ERP Issued Status:', style: TextStyle(fontSize: 14, color: AppTheme.textMuted)),
-              const SizedBox(height: 8),
-              Row(children: [
-                Expanded(child: ChoiceChip(
-                  label: const Center(child: Text('Pending')),
-                  selected: selectedStatus == 'Pending',
-                  onSelected: (s) { if (s) setLocal(() => selectedStatus = 'Pending'); },
-                  selectedColor: AppTheme.statusPartial.withValues(alpha: 0.25),
-                  labelStyle: TextStyle(color: selectedStatus == 'Pending' ? AppTheme.statusPartial : AppTheme.textMuted, fontWeight: FontWeight.bold),
-                )),
-                const SizedBox(width: 12),
-                Expanded(child: ChoiceChip(
-                  label: const Center(child: Text('Issued')),
-                  selected: selectedStatus == 'Issued',
-                  onSelected: (s) { if (s) setLocal(() => selectedStatus = 'Issued'); },
-                  selectedColor: AppTheme.statusComplete.withValues(alpha: 0.25),
-                  labelStyle: TextStyle(color: selectedStatus == 'Issued' ? AppTheme.statusComplete : AppTheme.textMuted, fontWeight: FontWeight.bold),
-                )),
-              ]),
-            ],
-          ),
-          actions: [
-            TextButton(onPressed: () => Navigator.of(ctx).pop(), child: const Text('Cancel')),
-            ElevatedButton.icon(
-              icon: const Icon(Icons.file_download_done_rounded, size: 18),
-              label: const Text('Export Now'),
-              style: ElevatedButton.styleFrom(backgroundColor: AppTheme.statusComplete),
-              onPressed: () => Navigator.of(ctx).pop(selectedStatus),
-            ),
-          ],
-        ),
-      ),
-    );
-  }
+  Future<void> _handleBatchExport() async {
+    if (_closedSessions.isEmpty) return;
 
-  void _showAlreadyExportedDialog(SessionMetadata session, String path) {
-    showDialog(
+    final confirmed = await showDialog<bool>(
       context: context,
       builder: (ctx) => AlertDialog(
         backgroundColor: AppTheme.cardDark,
-        title: const Row(children: [
-          Icon(Icons.check_circle_rounded, color: AppTheme.statusComplete),
-          SizedBox(width: 10),
-          Text('Already Exported', style: TextStyle(color: AppTheme.textLight)),
-        ]),
-        content: Column(
-          mainAxisSize: MainAxisSize.min,
-          crossAxisAlignment: CrossAxisAlignment.start,
+        shape: RoundedRectangleBorder(
+          borderRadius: BorderRadius.circular(16),
+          side: const BorderSide(color: AppTheme.borderDark),
+        ),
+        title: const Row(
           children: [
-            Text('Session ${session.id} has already been exported and the file still exists.', style: const TextStyle(color: AppTheme.textMuted, height: 1.5)),
-            const SizedBox(height: 12),
-            Container(
-              padding: const EdgeInsets.all(10),
-              decoration: BoxDecoration(color: AppTheme.bgDark, borderRadius: BorderRadius.circular(8)),
-              child: Text(path, style: const TextStyle(fontSize: 11, color: AppTheme.accentCyan, fontFamily: 'monospace')),
-            ),
+            Icon(Icons.bolt_rounded, color: Color(0xFFE07B00), size: 24),
+            SizedBox(width: 10),
+            Text('Export Batch Super Session?', style: TextStyle(color: AppTheme.textLight, fontSize: 18)),
           ],
         ),
+        content: Text(
+          'Export ${_closedSessions.length} closed session(s) across all units into a consolidated Excel file and mark them as EXPORTED?\n\n'
+          'All picked parts will be merged into a single Super Session workbook.',
+          style: const TextStyle(color: AppTheme.textMuted, fontSize: 13, height: 1.4),
+        ),
         actions: [
-          TextButton(onPressed: () => Navigator.of(ctx).pop(), child: const Text('OK')),
-          OutlinedButton(
-            onPressed: () async {
-              Navigator.of(ctx).pop();
-              // File exists but user wants to force re-export — delete file first then retry.
-              try { await File(path).delete(); } catch (_) {}
-              await _handleExport(session);
-            },
-            child: const Text('Force Re-Export', style: TextStyle(color: AppTheme.statusDanger)),
+          TextButton(
+            onPressed: () => Navigator.pop(ctx, false),
+            child: const Text('Cancel'),
+          ),
+          ElevatedButton.icon(
+            style: ElevatedButton.styleFrom(
+              backgroundColor: AppTheme.statusComplete,
+              foregroundColor: Colors.white,
+            ),
+            icon: const Icon(Icons.check_rounded, size: 18),
+            label: const Text('Export Now', style: TextStyle(fontWeight: FontWeight.bold)),
+            onPressed: () => Navigator.pop(ctx, true),
           ),
         ],
       ),
     );
+    if (confirmed != true) return;
+
+    const issuedStatus = 'Pending Issue';
+    setState(() => _isLoading = true);
+
+    try {
+      final sessionsToExport = List<SessionMetadata>.from(_closedSessions);
+      final allUnitIds = sessionsToExport.map((s) => s.unitId).toSet().toList();
+
+      final unitOriginalFiles = <String, String>{};
+      final unitItems = <String, List<PicklistItem>>{};
+      final unitNames = <String, String>{};
+      final unitReturnComments = <String, Map<String, List<String>>>{};
+      final unitAutoIssueResourceIds = <String, List<String>>{};
+      final autoIssueResourceIds = await widget.dbService.getAutoIssueResourceIds();
+
+      for (final uid in allUnitIds) {
+        final u = _units[uid];
+        if (u == null) continue;
+        unitOriginalFiles[uid] = u.filePath;
+        unitNames[uid] = u.name;
+        unitItems[uid] = await widget.dbService.getPicklistItems(uid);
+        unitReturnComments[uid] = await widget.dbService.getReturnCommentsForUnit(uid);
+        final isAutoAlreadyExported = await widget.dbService.isUnitAutoIssueExported(uid);
+        unitAutoIssueResourceIds[uid] = isAutoAlreadyExported ? <String>[] : autoIssueResourceIds;
+      }
+
+      if (unitOriginalFiles.isEmpty) {
+        throw Exception('No unit files found for closed sessions.');
+      }
+
+      final seqNos = sessionsToExport.map((s) => s.sessionSeqNo).where((n) => n > 0).toList()..sort();
+      final minSeq = seqNos.isNotEmpty ? seqNos.first : 1;
+      final maxSeq = seqNos.isNotEmpty ? seqNos.last : 1;
+      final earliestStart = sessionsToExport.map((s) => s.startTime).reduce((a, b) => a < b ? a : b);
+      final latestEnd = sessionsToExport.map((s) => s.endTime ?? s.startTime).reduce((a, b) => a > b ? a : b);
+      final tabletId = sessionsToExport.first.tabletId;
+      final now = DateTime.now().millisecondsSinceEpoch;
+
+      final combinedUnitName = unitNames.values.toSet().join('_');
+      final firstFilePath = unitOriginalFiles.values.first;
+      final dir = (_customExportDir != null && _customExportDir!.isNotEmpty)
+          ? _customExportDir!
+          : File(firstFilePath).parent.path;
+
+      final fileName = SessionMetadata.buildBatchExportFileName(
+        unitName: combinedUnitName,
+        tabletId: tabletId,
+        minSeq: minSeq,
+        maxSeq: maxSeq,
+        startTime: earliestStart,
+        endTime: latestEnd,
+      );
+      final outputPath = p.join(dir, fileName);
+
+      final writtenPath = await widget.excelService.exportMultiUnitBatchSuperSession(
+        unitOriginalFiles: unitOriginalFiles,
+        unitItems: unitItems,
+        unitNames: unitNames,
+        sessions: sessionsToExport,
+        unitReturnComments: unitReturnComments,
+        outputPath: outputPath,
+        unitAutoIssueResourceIds: unitAutoIssueResourceIds,
+        issuedStatus: issuedStatus,
+      );
+
+      // Single batchId grouping all sessions exported in this Super Session
+      final batchId = 'BATCH_SUPER_${tabletId}_${minSeq}_to_${maxSeq}_$now';
+
+      // Mark auto-issue items as exported for all participating units
+      for (final uid in allUnitIds) {
+        await widget.dbService.setUnitAutoIssueExported(uid, true);
+      }
+
+      // Mark all consolidated sessions as EXPORTED in DB with single batchId
+      for (final s in sessionsToExport) {
+        await widget.dbService.finishSession(
+          s.id,
+          s.endTime ?? now,
+          s.totalItemsPicked,
+          issuedStatus,
+          batchId: batchId,
+        );
+      }
+
+      await _loadSessions();
+      if (!mounted) return;
+      _tabController.animateTo(1); // Switch to Exported tab
+
+      _showBatchSuccessDialog([writtenPath], sessionsToExport.length);
+    } catch (e) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text('Batch Export failed: $e'), backgroundColor: AppTheme.statusDanger),
+        );
+      }
+    } finally {
+      if (mounted) setState(() => _isLoading = false);
+    }
   }
 
-  void _showSuccessDialog(SessionMetadata session, String writtenPath, {String? expectedPath}) {
-    final isFallback = expectedPath != null &&
-        p.canonicalize(writtenPath) != p.canonicalize(expectedPath);
+  Future<void> _handleReExportBatch(List<SessionMetadata> batchSessions) async {
+    if (batchSessions.isEmpty) return;
 
+    final issuedStatus = batchSessions.first.issuedStatus.isNotEmpty
+        ? batchSessions.first.issuedStatus
+        : 'Pending Issue';
+
+    setState(() => _isLoading = true);
+    try {
+      final allUnitIds = batchSessions.map((s) => s.unitId).toSet().toList();
+      final unitOriginalFiles = <String, String>{};
+      final unitItems = <String, List<PicklistItem>>{};
+      final unitNames = <String, String>{};
+      final unitReturnComments = <String, Map<String, List<String>>>{};
+      final unitAutoIssueResourceIds = <String, List<String>>{};
+      final autoIssueResourceIds = await widget.dbService.getAutoIssueResourceIds();
+
+      for (final uid in allUnitIds) {
+        final u = _units[uid];
+        if (u == null) continue;
+        unitOriginalFiles[uid] = u.filePath;
+        unitNames[uid] = u.name;
+        unitItems[uid] = await widget.dbService.getPicklistItems(uid);
+        unitReturnComments[uid] = await widget.dbService.getReturnCommentsForUnit(uid);
+        final isFirstBatch = batchSessions.any((s) => s.sessionSeqNo <= 1);
+        unitAutoIssueResourceIds[uid] = isFirstBatch ? autoIssueResourceIds : <String>[];
+      }
+
+      if (unitOriginalFiles.isEmpty) {
+        throw Exception('No unit files found for this batch.');
+      }
+
+      final seqNos = batchSessions.map((s) => s.sessionSeqNo).where((n) => n > 0).toList()..sort();
+      final minSeq = seqNos.isNotEmpty ? seqNos.first : 1;
+      final maxSeq = seqNos.isNotEmpty ? seqNos.last : 1;
+      final earliestStart = batchSessions.map((s) => s.startTime).reduce((a, b) => a < b ? a : b);
+      final latestEnd = batchSessions.map((s) => s.endTime ?? s.startTime).reduce((a, b) => a > b ? a : b);
+      final tabletId = batchSessions.first.tabletId;
+
+      final combinedUnitName = unitNames.values.toSet().join('_');
+      final firstFilePath = unitOriginalFiles.values.first;
+      final dir = (_customExportDir != null && _customExportDir!.isNotEmpty)
+          ? _customExportDir!
+          : File(firstFilePath).parent.path;
+
+      final fileName = SessionMetadata.buildBatchExportFileName(
+        unitName: combinedUnitName,
+        tabletId: tabletId,
+        minSeq: minSeq,
+        maxSeq: maxSeq,
+        startTime: earliestStart,
+        endTime: latestEnd,
+      );
+      final outputPath = p.join(dir, fileName);
+
+      final writtenPath = await widget.excelService.exportMultiUnitBatchSuperSession(
+        unitOriginalFiles: unitOriginalFiles,
+        unitItems: unitItems,
+        unitNames: unitNames,
+        sessions: batchSessions,
+        unitReturnComments: unitReturnComments,
+        outputPath: outputPath,
+        unitAutoIssueResourceIds: unitAutoIssueResourceIds,
+        issuedStatus: issuedStatus,
+      );
+
+      await _loadSessions();
+      if (!mounted) return;
+      _showBatchSuccessDialog([writtenPath], batchSessions.length);
+    } catch (e) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text('Re-Export Super Session failed: $e'), backgroundColor: AppTheme.statusDanger),
+        );
+      }
+    } finally {
+      if (mounted) setState(() => _isLoading = false);
+    }
+  }
+
+  Future<void> _markBatchAsIssued(List<SessionMetadata> unitSessions) async {
+    if (unitSessions.isEmpty) return;
+
+    final unitNames = unitSessions.map((s) => _units[s.unitId]?.name ?? 'Unit ${s.unitId}').toSet().join(', ');
+
+    final confirmed = await showDialog<bool>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        backgroundColor: AppTheme.cardDark,
+        shape: RoundedRectangleBorder(
+          borderRadius: BorderRadius.circular(16),
+          side: const BorderSide(color: AppTheme.borderDark),
+        ),
+        title: const Row(
+          children: [
+            Icon(Icons.verified_rounded, color: AppTheme.accentCyan, size: 24),
+            SizedBox(width: 10),
+            Text('Mark as ISSUED?', style: TextStyle(color: AppTheme.textLight, fontSize: 18)),
+          ],
+        ),
+        content: Text(
+          'Are you sure you want to mark ${unitSessions.length} session(s) for "$unitNames" as ISSUED in ERP?\n\n'
+          'Status will transition to ISSUED and move to the Issued tab.',
+          style: const TextStyle(color: AppTheme.textMuted, fontSize: 13, height: 1.4),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(ctx, false),
+            child: const Text('Cancel'),
+          ),
+          ElevatedButton.icon(
+            style: ElevatedButton.styleFrom(
+              backgroundColor: AppTheme.accentCyan,
+              foregroundColor: AppTheme.bgDark,
+            ),
+            icon: const Icon(Icons.verified_rounded, size: 18),
+            label: const Text('Confirm ISSUED', style: TextStyle(fontWeight: FontWeight.bold)),
+            onPressed: () => Navigator.pop(ctx, true),
+          ),
+        ],
+      ),
+    );
+
+    if (confirmed == true) {
+      final now = DateTime.now().millisecondsSinceEpoch;
+      for (final s in unitSessions) {
+        await widget.dbService.updateSessionIssuedStatus(s.id, 'ISSUED', issuedAt: now);
+      }
+      LogService.admin('Super Session (${unitSessions.length} sessions) marked as ISSUED');
+      await _loadSessions();
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text('Super Session ($unitNames, ${unitSessions.length} sessions) marked as ISSUED.'),
+            backgroundColor: AppTheme.accentCyan,
+            action: SnackBarAction(
+              label: 'View in Issued',
+              textColor: Colors.white,
+              onPressed: () => _tabController.animateTo(2),
+            ),
+          ),
+        );
+      }
+    }
+  }
+
+  void _showBatchSuccessDialog(List<String> writtenFiles, int sessionCount) {
     showDialog(
       context: context,
       builder: (ctx) => AlertDialog(
         backgroundColor: AppTheme.cardDark,
-        title: Row(children: [
-          Icon(
-            isFallback ? Icons.warning_amber_rounded : Icons.task_alt_rounded,
-            color: isFallback ? AppTheme.statusPartial : AppTheme.statusComplete,
-            size: 28,
-          ),
-          const SizedBox(width: 10),
-          Text(isFallback ? 'Export Saved (Fallback)' : 'Export Successful',
-              style: const TextStyle(color: AppTheme.textLight)),
+        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
+        title: const Row(children: [
+          Icon(Icons.task_alt_rounded, color: AppTheme.statusComplete, size: 28),
+          SizedBox(width: 10),
+          Text('Batch Export Successful', style: TextStyle(color: AppTheme.textLight)),
         ]),
         content: Column(
           mainAxisSize: MainAxisSize.min,
           crossAxisAlignment: CrossAxisAlignment.start,
           children: [
-            if (isFallback) ...[
-              Container(
-                padding: const EdgeInsets.all(10),
-                margin: const EdgeInsets.only(bottom: 12),
-                decoration: BoxDecoration(
-                  color: AppTheme.statusPartial.withValues(alpha: 0.15),
-                  borderRadius: BorderRadius.circular(8),
-                  border: Border.all(color: AppTheme.statusPartial.withValues(alpha: 0.4)),
-                ),
-                child: const Text(
-                  'Notice: Target directory was not writable (storage permissions needed). '
-                  'The file was safely saved to internal storage below.',
-                  style: TextStyle(fontSize: 12, color: AppTheme.statusPartial),
-                ),
-              ),
-            ],
-            const Text('File written successfully:', style: TextStyle(color: AppTheme.textMuted)),
-            const SizedBox(height: 8),
-            Container(
-              padding: const EdgeInsets.all(10),
-              decoration: BoxDecoration(color: AppTheme.bgDark, borderRadius: BorderRadius.circular(8)),
-              child: Text(writtenPath, style: const TextStyle(fontSize: 11, color: AppTheme.accentCyan, fontFamily: 'monospace')),
+            Text(
+              'Successfully consolidated and exported $sessionCount sessions to Excel:',
+              style: const TextStyle(color: AppTheme.textMuted),
             ),
-            const SizedBox(height: 12),
-            _infoRow('Session', session.id),
-            _infoRow('ERP Status', session.issuedStatus),
+            const SizedBox(height: 10),
+            ...writtenFiles.map((path) => Container(
+                  margin: const EdgeInsets.only(bottom: 6),
+                  padding: const EdgeInsets.all(10),
+                  decoration: BoxDecoration(color: AppTheme.bgDark, borderRadius: BorderRadius.circular(8)),
+                  child: Text(path, style: const TextStyle(fontSize: 11, color: AppTheme.accentCyan, fontFamily: 'monospace')),
+                )),
+            const SizedBox(height: 10),
+            const Text(
+              'All sessions have been transitioned to EXPORTED status and are viewable in the "Exported" tab.',
+              style: TextStyle(fontSize: 12, color: AppTheme.statusComplete),
+            ),
           ],
         ),
         actions: [
           ElevatedButton(
-            onPressed: () {
-              Navigator.of(ctx).pop();
-              Navigator.of(context).popUntil((r) => r.isFirst);
-            },
-            child: const Text('Done — Back to Home'),
+            onPressed: () => Navigator.of(ctx).pop(),
+            child: const Text('OK'),
           ),
         ],
       ),
@@ -515,19 +565,42 @@ class _SessionExportScreenState extends State<SessionExportScreen>
                   _closedSessions,
                   emptyMessage: 'No closed sessions waiting for export.',
                   emptyIcon: Icons.inbox_rounded,
+                  isClosedTab: true,
                 ),
                 _buildSessionListTab(
                   _exportedSessions,
                   emptyMessage: 'No exported sessions found.',
                   emptyIcon: Icons.file_download_done_rounded,
+                  isExportedTab: true,
                 ),
                 _buildSessionListTab(
                   _issuedSessions,
                   emptyMessage: 'No issued sessions found.',
                   emptyIcon: Icons.verified_outlined,
+                  isIssuedTab: true,
                 ),
               ],
             ),
+    );
+  }
+
+  Widget _buildEmptyState(String message, IconData icon) {
+    return Padding(
+      padding: const EdgeInsets.symmetric(vertical: 48),
+      child: Center(
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Icon(icon, size: 64, color: AppTheme.borderDark),
+            const SizedBox(height: 14),
+            Text(
+              message,
+              style: const TextStyle(fontSize: 16, color: AppTheme.textMuted),
+              textAlign: TextAlign.center,
+            ),
+          ],
+        ),
+      ),
     );
   }
 
@@ -535,12 +608,46 @@ class _SessionExportScreenState extends State<SessionExportScreen>
     List<SessionMetadata> list, {
     required String emptyMessage,
     required IconData emptyIcon,
+    bool isClosedTab = false,
+    bool isExportedTab = false,
+    bool isIssuedTab = false,
   }) {
+    if (isClosedTab) {
+      return RefreshIndicator(
+        onRefresh: _loadSessions,
+        child: ListView.builder(
+          padding: const EdgeInsets.all(20),
+          itemCount: list.isEmpty ? 2 : list.length + 1,
+          itemBuilder: (ctx, i) {
+            if (i == 0) {
+              return Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  _buildExportDestinationBar(),
+                  if (list.isNotEmpty) _buildBatchExportHeader(),
+                  _buildLegend(),
+                ],
+              );
+            }
+            if (list.isEmpty) {
+              return _buildEmptyState(emptyMessage, emptyIcon);
+            }
+            return _buildSessionCard(
+              list[i - 1],
+              isClosedTab: true,
+            );
+          },
+        ),
+      );
+    }
+
+    // Exported and Issued tabs: Render cohesive batches with enclosed child cards
+    final batches = _groupIntoBatches(list);
     return RefreshIndicator(
       onRefresh: _loadSessions,
       child: ListView.builder(
         padding: const EdgeInsets.all(20),
-        itemCount: list.isEmpty ? 2 : list.length + 1,
+        itemCount: batches.isEmpty ? 2 : batches.length + 1,
         itemBuilder: (ctx, i) {
           if (i == 0) {
             return Column(
@@ -551,27 +658,314 @@ class _SessionExportScreenState extends State<SessionExportScreen>
               ],
             );
           }
-          if (list.isEmpty) {
-            return Padding(
-              padding: const EdgeInsets.symmetric(vertical: 48),
-              child: Center(
+          if (batches.isEmpty) {
+            return _buildEmptyState(emptyMessage, emptyIcon);
+          }
+          final batch = batches[i - 1];
+          return _buildSuperSessionBatchCard(
+            batch,
+            isExportedTab: isExportedTab,
+          );
+        },
+      ),
+    );
+  }
+
+  Widget _buildBatchExportHeader() {
+    final totalDurationStr = SessionMetadata.formatTotalDuration(_closedSessions);
+    final earliestStart = _closedSessions.map((s) => s.startTime).reduce((a, b) => a < b ? a : b);
+    final latestEnd = _closedSessions.map((s) => s.endTime ?? s.startTime).reduce((a, b) => a > b ? a : b);
+    final startStr = DateFormat('yyyy-MM-dd HH:mm').format(DateTime.fromMillisecondsSinceEpoch(earliestStart));
+    final endStr = DateFormat('yyyy-MM-dd HH:mm').format(DateTime.fromMillisecondsSinceEpoch(latestEnd));
+
+    final closedUnitIds = _closedSessions.map((s) => s.unitId).toSet();
+    int totalPickedParts = 0;
+    int totalUnitParts = 0;
+    for (final uid in closedUnitIds) {
+      totalPickedParts += _unitPickStats[uid]?['picked_parts']?.toInt() ?? 0;
+      totalUnitParts += _unitPickStats[uid]?['total_parts']?.toInt() ?? 0;
+    }
+
+    final partsDisplay = totalUnitParts > 0
+        ? '$totalPickedParts / $totalUnitParts parts'
+        : '$totalPickedParts parts';
+
+    return Container(
+      margin: const EdgeInsets.only(bottom: 16),
+      padding: const EdgeInsets.all(16),
+      decoration: BoxDecoration(
+        color: const Color(0xFFE07B00).withValues(alpha: 0.12),
+        borderRadius: BorderRadius.circular(14),
+        border: Border.all(color: const Color(0xFFE07B00).withValues(alpha: 0.6), width: 1.5),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Row(
+            children: [
+              Container(
+                padding: const EdgeInsets.all(6),
+                decoration: BoxDecoration(
+                  color: const Color(0xFFE07B00).withValues(alpha: 0.2),
+                  borderRadius: BorderRadius.circular(8),
+                ),
+                child: const Icon(Icons.bolt_rounded, color: Color(0xFFE07B00), size: 22),
+              ),
+              const SizedBox(width: 10),
+              Expanded(
                 child: Column(
-                  mainAxisSize: MainAxisSize.min,
+                  crossAxisAlignment: CrossAxisAlignment.start,
                   children: [
-                    Icon(emptyIcon, size: 64, color: AppTheme.borderDark),
-                    const SizedBox(height: 14),
                     Text(
-                      emptyMessage,
-                      style: const TextStyle(fontSize: 16, color: AppTheme.textMuted),
-                      textAlign: TextAlign.center,
+                      'Batch Super Export (${_closedSessions.length} Closed Sessions)',
+                      style: const TextStyle(fontSize: 14, fontWeight: FontWeight.bold, color: AppTheme.textLight),
+                    ),
+                    const SizedBox(height: 2),
+                    Text(
+                      'Total Duration: $totalDurationStr • Parts Picked: $partsDisplay\nStart: $startStr • End: $endStr\nConsolidates all unexported sessions into 1 Excel file with unified audit columns.',
+                      style: const TextStyle(fontSize: 11, color: AppTheme.textMuted),
                     ),
                   ],
                 ),
               ),
-            );
-          }
-          return _buildSessionCard(list[i - 1]);
-        },
+            ],
+          ),
+          const SizedBox(height: 12),
+          ElevatedButton.icon(
+            style: ElevatedButton.styleFrom(
+              backgroundColor: const Color(0xFFE07B00),
+              foregroundColor: Colors.white,
+              minimumSize: const Size(double.infinity, 44),
+              shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(10)),
+            ),
+            icon: const Icon(Icons.bolt_rounded, size: 20),
+            label: Text(
+              '⚡ Export All Unexported (${_closedSessions.length} Sessions)',
+              style: const TextStyle(fontSize: 14, fontWeight: FontWeight.bold),
+            ),
+            onPressed: _handleBatchExport,
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildSuperSessionBatchCard(
+    SessionBatchGroup batch, {
+    required bool isExportedTab,
+  }) {
+    final accentColor = isExportedTab ? AppTheme.statusComplete : AppTheme.accentCyan;
+    final startStr = DateFormat('yyyy-MM-dd HH:mm').format(DateTime.fromMillisecondsSinceEpoch(batch.earliestStart));
+    final endStr = DateFormat('yyyy-MM-dd HH:mm').format(DateTime.fromMillisecondsSinceEpoch(batch.latestEnd));
+
+    int totalPickedParts = 0;
+    int totalUnitParts = 0;
+    for (final uid in batch.unitIds) {
+      final s = _unitPickStats[uid];
+      if (s != null) {
+        totalPickedParts += s['picked_parts']?.toInt() ?? 0;
+        totalUnitParts += s['total_parts']?.toInt() ?? 0;
+      }
+    }
+    final partsDisplay = totalUnitParts > 0
+        ? '$totalPickedParts / $totalUnitParts parts'
+        : '${batch.totalItemsPicked} parts';
+
+    int daysUntilPurge = 60;
+    if (!isExportedTab) {
+      final issuedTimes = batch.sessions.map((s) => s.issuedAt).whereType<int>().toList();
+      final latestIssuedAt = issuedTimes.isNotEmpty
+          ? issuedTimes.reduce((a, b) => a > b ? a : b)
+          : batch.latestEnd;
+      final expiryTime = latestIssuedAt + const Duration(days: 60).inMilliseconds;
+      final nowMs = DateTime.now().millisecondsSinceEpoch;
+      final msLeft = expiryTime - nowMs;
+      daysUntilPurge = (msLeft / (1000 * 60 * 60 * 24)).ceil().clamp(0, 60);
+    }
+
+    return Container(
+      margin: const EdgeInsets.only(bottom: 16),
+      padding: const EdgeInsets.all(16),
+      decoration: BoxDecoration(
+        color: accentColor.withValues(alpha: 0.1),
+        borderRadius: BorderRadius.circular(14),
+        border: Border.all(color: accentColor.withValues(alpha: 0.6), width: 1.5),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Row(
+            children: [
+              Container(
+                padding: const EdgeInsets.all(6),
+                decoration: BoxDecoration(
+                  color: accentColor.withValues(alpha: 0.2),
+                  borderRadius: BorderRadius.circular(8),
+                ),
+                child: Icon(
+                  isExportedTab ? Icons.inventory_2_rounded : Icons.verified_rounded,
+                  color: accentColor,
+                  size: 22,
+                ),
+              ),
+              const SizedBox(width: 10),
+              Expanded(
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Text(
+                      isExportedTab
+                          ? '⚡ Exported Super Session — ${batch.unitName}'
+                          : '✓ Issued Super Session — ${batch.unitName}',
+                      style: const TextStyle(fontSize: 14, fontWeight: FontWeight.bold, color: AppTheme.textLight),
+                    ),
+                    const SizedBox(height: 2),
+                    Text(
+                      'Sessions: ${batch.seqListStr} • Parts Picked: $partsDisplay • Duration: ${batch.totalDurationStr}',
+                      style: TextStyle(fontSize: 11, color: accentColor, fontWeight: FontWeight.w600),
+                    ),
+                    const SizedBox(height: 2),
+                    Text(
+                      'Start: $startStr • End: $endStr',
+                      style: const TextStyle(fontSize: 11, color: AppTheme.textMuted, fontWeight: FontWeight.w500),
+                    ),
+                    if (!isExportedTab) ...[
+                      const SizedBox(height: 4),
+                      Row(
+                        children: [
+                          Container(
+                            padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 3),
+                            decoration: BoxDecoration(
+                              color: Colors.amber.withValues(alpha: 0.12),
+                              borderRadius: BorderRadius.circular(6),
+                              border: Border.all(color: Colors.amber.withValues(alpha: 0.4)),
+                            ),
+                            child: Row(
+                              mainAxisSize: MainAxisSize.min,
+                              children: [
+                                const Icon(Icons.hourglass_bottom_rounded, size: 12, color: Colors.amber),
+                                const SizedBox(width: 4),
+                                Text(
+                                  '⏳ $daysUntilPurge days remaining until auto-purge (60d retention)',
+                                  style: const TextStyle(fontSize: 10, color: Colors.amber, fontWeight: FontWeight.bold),
+                                ),
+                              ],
+                            ),
+                          ),
+                        ],
+                      ),
+                    ],
+                  ],
+                ),
+              ),
+            ],
+          ),
+          const SizedBox(height: 12),
+          Row(
+            children: [
+              Expanded(
+                child: OutlinedButton.icon(
+                  style: OutlinedButton.styleFrom(
+                    side: const BorderSide(color: AppTheme.borderDark),
+                    foregroundColor: AppTheme.textLight,
+                    minimumSize: const Size(0, 40),
+                    shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(10)),
+                  ),
+                  icon: const Icon(Icons.refresh_rounded, size: 16),
+                  label: const Text('Re-Export Super Session', style: TextStyle(fontSize: 12)),
+                  onPressed: () => _handleReExportBatch(batch.sessions),
+                ),
+              ),
+              if (isExportedTab) ...[
+                const SizedBox(width: 10),
+                Expanded(
+                  child: ElevatedButton.icon(
+                    style: ElevatedButton.styleFrom(
+                      backgroundColor: AppTheme.accentCyan,
+                      foregroundColor: AppTheme.bgDark,
+                      minimumSize: const Size(0, 40),
+                      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(10)),
+                    ),
+                    icon: const Icon(Icons.verified_rounded, size: 16),
+                    label: const Text(
+                      'Mark as ISSUED',
+                      style: TextStyle(fontSize: 12, fontWeight: FontWeight.bold),
+                    ),
+                    onPressed: () => _markBatchAsIssued(batch.sessions),
+                  ),
+                ),
+              ],
+            ],
+          ),
+          const SizedBox(height: 10),
+          Theme(
+            data: Theme.of(context).copyWith(dividerColor: Colors.transparent),
+            child: ExpansionTile(
+              tilePadding: EdgeInsets.zero,
+              collapsedIconColor: AppTheme.textMuted,
+              iconColor: accentColor,
+              title: Text(
+                'Enclosed Sessions (${batch.sessions.length})',
+                style: TextStyle(fontSize: 12, fontWeight: FontWeight.w600, color: accentColor),
+              ),
+              children: batch.sessions
+                  .map((session) => _buildChildSessionCard(session, isExportedTab: isExportedTab))
+                  .toList(),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildChildSessionCard(
+    SessionMetadata session, {
+    required bool isExportedTab,
+  }) {
+    final statusColor = isExportedTab ? AppTheme.statusComplete : AppTheme.accentCyan;
+    final startTimeStr = DateFormat('yyyy-MM-dd HH:mm').format(
+      DateTime.fromMillisecondsSinceEpoch(session.startTime),
+    );
+    final endTimeStr = session.endTime != null
+        ? DateFormat('yyyy-MM-dd HH:mm').format(DateTime.fromMillisecondsSinceEpoch(session.endTime!))
+        : 'In progress';
+
+    return Container(
+      margin: const EdgeInsets.only(top: 8),
+      padding: const EdgeInsets.all(12),
+      decoration: BoxDecoration(
+        color: AppTheme.bgDark.withValues(alpha: 0.6),
+        borderRadius: BorderRadius.circular(10),
+        border: Border.all(color: AppTheme.borderDark.withValues(alpha: 0.6)),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Row(
+            children: [
+              Container(width: 8, height: 8, decoration: BoxDecoration(color: statusColor, shape: BoxShape.circle)),
+              const SizedBox(width: 8),
+              Expanded(
+                child: Text(
+                  session.cardDisplayTitle,
+                  style: const TextStyle(fontSize: 13, fontWeight: FontWeight.bold, color: AppTheme.textLight),
+                ),
+              ),
+            ],
+          ),
+          const SizedBox(height: 6),
+          Wrap(
+            spacing: 8,
+            runSpacing: 4,
+            children: [
+              _metaChip(Icons.person_rounded, session.workerName),
+              _metaChip(Icons.play_circle_outline_rounded, 'Start: $startTimeStr'),
+              _metaChip(Icons.stop_circle_outlined, 'End: $endTimeStr'),
+              _metaChip(Icons.timer_outlined, session.formattedDuration),
+              _metaChip(Icons.check_box_rounded, '${session.totalItemsPicked} parts'),
+            ],
+          ),
+        ],
       ),
     );
   }
@@ -666,23 +1060,12 @@ class _SessionExportScreenState extends State<SessionExportScreen>
     decoration: BoxDecoration(color: color, shape: BoxShape.circle),
   );
 
-  Widget _buildSessionCard(SessionMetadata session) {
-    final isProcessing = _processingId == session.id;
-    Color statusColor;
-    String statusLabel;
-    if (session.isIssued) {
-      statusColor = AppTheme.accentCyan;
-      statusLabel = 'ISSUED';
-    } else if (session.isExported || session.isFinished) {
-      statusColor = AppTheme.statusComplete;
-      statusLabel = 'EXPORTED';
-    } else if (session.isClosed) {
-      statusColor = const Color(0xFFE07B00);
-      statusLabel = 'CLOSED';
-    } else {
-      statusColor = AppTheme.primaryBlue;
-      statusLabel = 'OPEN';
-    }
+  Widget _buildSessionCard(
+    SessionMetadata session, {
+    bool isClosedTab = false,
+  }) {
+    const statusColor = Color(0xFFE07B00);
+    const statusLabel = 'CLOSED';
 
     final unit = _units[session.unitId];
     final startTimeStr = DateFormat('yyyy-MM-dd HH:mm').format(
@@ -710,13 +1093,13 @@ class _SessionExportScreenState extends State<SessionExportScreen>
                 child: Column(
                   crossAxisAlignment: CrossAxisAlignment.start,
                   children: [
-                    if (unit != null && session.sessionSeqNo > 0)
-                      Text(
-                        session.displayName(unit.name),
-                        style: const TextStyle(fontSize: 13, fontWeight: FontWeight.bold, color: AppTheme.textLight),
-                      ),
                     Text(
-                      session.id.length > 20 ? '${session.id.substring(0, 20)}...' : session.id,
+                      session.cardDisplayTitle,
+                      style: const TextStyle(fontSize: 14, fontWeight: FontWeight.bold, color: AppTheme.textLight),
+                    ),
+                    const SizedBox(height: 2),
+                    Text(
+                      session.id.length > 24 ? '${session.id.substring(0, 24)}...' : session.id,
                       style: const TextStyle(fontSize: 10, color: AppTheme.textMuted, fontFamily: 'monospace'),
                     ),
                   ],
@@ -741,7 +1124,6 @@ class _SessionExportScreenState extends State<SessionExportScreen>
                 ]),
               ),
             const SizedBox(height: 10),
-            // Start and End Times prominently displayed
             Wrap(
               spacing: 8,
               runSpacing: 6,
@@ -749,58 +1131,30 @@ class _SessionExportScreenState extends State<SessionExportScreen>
                 _metaChip(Icons.person_rounded, session.workerName),
                 _metaChip(Icons.play_circle_outline_rounded, 'Start: $startTimeStr'),
                 _metaChip(Icons.stop_circle_outlined, 'End: $endTimeStr'),
-                _metaChip(Icons.check_box_rounded, '${session.totalItemsPicked} pcs'),
+                _metaChip(Icons.timer_outlined, session.formattedDuration),
+                _metaChip(Icons.check_box_rounded, '${session.totalItemsPicked} parts'),
               ],
             ),
-            if ((session.isExported || session.isFinished || session.isIssued) && session.issuedStatus.isNotEmpty) ...[  
-              const SizedBox(height: 8),
-              Row(children: [
-                _metaChip(Icons.tag_rounded, 'ERP: ${session.issuedStatus}'),
-              ]),
-            ],
             const SizedBox(height: 14),
-            SizedBox(
+            Container(
               width: double.infinity,
-              child: isProcessing
-                  ? const Center(child: SizedBox(height: 24, width: 24, child: CircularProgressIndicator(strokeWidth: 2)))
-                  : Column(
-                      children: [
-                        ElevatedButton.icon(
-                          icon: Icon(
-                            (session.isExported || session.isFinished || session.isIssued)
-                                ? Icons.refresh_rounded
-                                : Icons.file_download_rounded,
-                            size: 18,
-                          ),
-                          label: Text(
-                            (session.isExported || session.isFinished || session.isIssued)
-                                ? 'Re-Export'
-                                : 'Export This Session',
-                          ),
-                          style: ElevatedButton.styleFrom(
-                            backgroundColor: (session.isExported || session.isFinished || session.isIssued)
-                                ? AppTheme.borderDark
-                                : AppTheme.statusComplete,
-                            minimumSize: const Size(double.infinity, 44),
-                          ),
-                          onPressed: () => _handleExport(session),
-                        ),
-                        // Mark as Issued — only for EXPORTED sessions (not yet ISSUED)
-                        if (!session.isIssued && (session.isExported || session.isFinished)) ...[  
-                          const SizedBox(height: 8),
-                          OutlinedButton.icon(
-                            style: OutlinedButton.styleFrom(
-                              side: const BorderSide(color: AppTheme.accentCyan),
-                              foregroundColor: AppTheme.accentCyan,
-                              minimumSize: const Size(double.infinity, 40),
-                            ),
-                            icon: const Icon(Icons.verified_rounded, size: 16),
-                            label: const Text('Mark as ISSUED (Admin)', style: TextStyle(fontWeight: FontWeight.bold)),
-                            onPressed: () => _markAsIssued(session),
-                          ),
-                        ],
-                      ],
-                    ),
+              padding: const EdgeInsets.symmetric(vertical: 8, horizontal: 12),
+              decoration: BoxDecoration(
+                color: const Color(0xFFE07B00).withValues(alpha: 0.08),
+                borderRadius: BorderRadius.circular(8),
+                border: Border.all(color: const Color(0xFFE07B00).withValues(alpha: 0.25)),
+              ),
+              child: const Row(
+                mainAxisAlignment: MainAxisAlignment.center,
+                children: [
+                  Icon(Icons.bolt_rounded, size: 16, color: Color(0xFFE07B00)),
+                  SizedBox(width: 6),
+                  Text(
+                    'Included in Batch Super Export above',
+                    style: TextStyle(fontSize: 12, color: Color(0xFFE07B00), fontWeight: FontWeight.w600),
+                  ),
+                ],
+              ),
             ),
           ],
         ),
@@ -814,18 +1168,5 @@ class _SessionExportScreenState extends State<SessionExportScreen>
       const SizedBox(width: 4),
       Text(label, style: const TextStyle(fontSize: 12, color: AppTheme.textMuted)),
     ]);
-  }
-
-  Widget _infoRow(String label, String value) {
-    return Padding(
-      padding: const EdgeInsets.symmetric(vertical: 3),
-      child: Row(
-        mainAxisAlignment: MainAxisAlignment.spaceBetween,
-        children: [
-          Text(label, style: const TextStyle(color: AppTheme.textMuted, fontSize: 13)),
-          Text(value, style: const TextStyle(color: AppTheme.textLight, fontSize: 13, fontWeight: FontWeight.bold)),
-        ],
-      ),
-    );
   }
 }

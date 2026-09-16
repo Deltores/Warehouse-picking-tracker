@@ -331,70 +331,116 @@ class ExcelService {
         ? timeFormatter.format(DateTime.fromMillisecondsSinceEpoch(session.endTime!))
         : '';
 
-    // Update data rows
+    // Create a new Excel workbook containing ONLY picked or auto-issued rows
+    final outExcel = Excel.createExcel();
+    final defaultSheet = outExcel.getDefaultSheet();
+    final outSheet = outExcel[targetSheetName];
+    if (defaultSheet != null && defaultSheet != targetSheetName) {
+      outExcel.delete(defaultSheet);
+    }
+
+    // Write row 0 headers (original columns + service columns)
+    for (int col = 0; col < headerRow.length; col++) {
+      final v = headerRow[col]?.value;
+      if (v != null) {
+        outSheet.cell(CellIndex.indexByColumnRow(columnIndex: col, rowIndex: 0)).value = v;
+      }
+    }
+    for (final entry in serviceColIndices.entries) {
+      outSheet.cell(CellIndex.indexByColumnRow(columnIndex: entry.value, rowIndex: 0)).value =
+          TextCellValue(entry.key);
+    }
+    if (colPicked != null) {
+      outSheet.cell(CellIndex.indexByColumnRow(columnIndex: colPicked, rowIndex: 0)).value =
+          TextCellValue('Qty Picked');
+    }
+    if (colDue != null) {
+      outSheet.cell(CellIndex.indexByColumnRow(columnIndex: colDue, rowIndex: 0)).value =
+          TextCellValue('Qty Due');
+    }
+
+    int outRowIdx = 1;
+    // Export data rows — ONLY those with qtyPicked > 0 or belonging to Auto-Issue resource IDs
     for (int rowIdx = 1; rowIdx < sheet.rows.length; rowIdx++) {
       final item = itemByRowOrder[rowIdx];
-      if (item != null) {
-        final woKey = '${item.department}___${item.workOrder}';
-        final woStatus = woStatusMap[woKey] ?? 'Not Picked';
-        final woProgress = woProgressMap[woKey] ?? '0.0%';
+      if (item == null) continue;
 
-        CellValue qtyToCell(double val) {
-          if (val % 1 == 0) return IntCellValue(val.toInt());
-          return DoubleCellValue(val);
-        }
+      final isItemResEmpty = item.resourceId.trim().isEmpty;
+      final isAutoResource = isItemResEmpty
+          ? autoIssueResourceIds.any((r) => r.trim().isEmpty || r == '(Empty / Unassigned)')
+          : autoIssueResourceIds.any((r) => r.trim().toLowerCase() == item.resourceId.trim().toLowerCase());
 
-        final isItemResEmpty = item.resourceId.trim().isEmpty;
-        final isAutoResource = isItemResEmpty
-            ? autoIssueResourceIds.any((r) => r.trim().isEmpty || r == '(Empty / Unassigned)')
-            : autoIssueResourceIds.any((r) => r.trim().toLowerCase() == item.resourceId.trim().toLowerCase());
-        final pickedVal = isAutoResource ? item.qtyRequired : item.qtyPicked;
-        final dueVal = isAutoResource ? 0.0 : item.qtyDue;
+      final shouldExport = item.qtyPicked > 0.0001 || isAutoResource;
+      if (!shouldExport) {
+        continue; // Skip unpicked and non-auto-issued rows!
+      }
 
-        // Update Qty Picked
-        sheet.cell(CellIndex.indexByColumnRow(columnIndex: colPicked, rowIndex: rowIdx)).value =
-            qtyToCell(pickedVal);
-
-        // Update Qty Due
-        sheet.cell(CellIndex.indexByColumnRow(columnIndex: colDue, rowIndex: rowIdx)).value =
-            qtyToCell(dueVal);
-
-        // Set WO Status & Progress Columns
-        sheet.cell(CellIndex.indexByColumnRow(columnIndex: serviceColIndices['WO Status']!, rowIndex: rowIdx)).value =
-            TextCellValue(woStatus);
-        sheet.cell(CellIndex.indexByColumnRow(columnIndex: serviceColIndices['WO Progress %']!, rowIndex: rowIdx)).value =
-            TextCellValue(woProgress);
-        sheet.cell(CellIndex.indexByColumnRow(columnIndex: serviceColIndices['Total Picked']!, rowIndex: rowIdx)).value =
-            qtyToCell(pickedVal);
-        sheet.cell(CellIndex.indexByColumnRow(columnIndex: serviceColIndices['Session Picked']!, rowIndex: rowIdx)).value =
-            qtyToCell(pickedVal);
-
-        // Set ERP Audit Columns
-        sheet.cell(CellIndex.indexByColumnRow(columnIndex: serviceColIndices['Session ID']!, rowIndex: rowIdx)).value =
-            TextCellValue(session.id);
-        sheet.cell(CellIndex.indexByColumnRow(columnIndex: serviceColIndices['Worker Name']!, rowIndex: rowIdx)).value =
-            TextCellValue(session.workerName);
-        sheet.cell(CellIndex.indexByColumnRow(columnIndex: serviceColIndices['Pick Date']!, rowIndex: rowIdx)).value =
-            TextCellValue(item.pickDate.isNotEmpty ? item.pickDate : session.pickDate);
-        sheet.cell(CellIndex.indexByColumnRow(columnIndex: serviceColIndices['Start Time']!, rowIndex: rowIdx)).value =
-            TextCellValue(startTimeStr);
-        sheet.cell(CellIndex.indexByColumnRow(columnIndex: serviceColIndices['End Time']!, rowIndex: rowIdx)).value =
-            TextCellValue(endTimeStr);
-        sheet.cell(CellIndex.indexByColumnRow(columnIndex: serviceColIndices['Issued Status']!, rowIndex: rowIdx)).value =
-            TextCellValue(session.issuedStatus);
-
-        // Return Comments: join all return comments for this part ID with " | " separator
-        if (serviceColIndices.containsKey('Return Comments')) {
-          final comments = returnComments[item.partId] ?? [];
-          final commentsStr = comments.join(' | ');
-          sheet.cell(CellIndex.indexByColumnRow(columnIndex: serviceColIndices['Return Comments']!, rowIndex: rowIdx)).value =
-              commentsStr.isNotEmpty ? TextCellValue(commentsStr) : TextCellValue('');
+      // Copy original cells from this row
+      final origRow = sheet.rows[rowIdx];
+      for (int c = 0; c < origRow.length; c++) {
+        final cellVal = origRow[c]?.value;
+        if (cellVal != null) {
+          outSheet.cell(CellIndex.indexByColumnRow(columnIndex: c, rowIndex: outRowIdx)).value = cellVal;
         }
       }
+
+      final woKey = '${item.department}___${item.workOrder}';
+      final woStatus = woStatusMap[woKey] ?? 'Not Picked';
+      final woProgress = woProgressMap[woKey] ?? '0.0%';
+
+      CellValue qtyToCell(double val) {
+        if (val % 1 == 0) return IntCellValue(val.toInt());
+        return DoubleCellValue(val);
+      }
+
+      final pickedVal = isAutoResource ? item.qtyRequired : item.qtyPicked;
+      final dueVal = isAutoResource ? 0.0 : item.qtyDue;
+
+      // Update Qty Picked
+      outSheet.cell(CellIndex.indexByColumnRow(columnIndex: colPicked, rowIndex: outRowIdx)).value =
+          qtyToCell(pickedVal);
+
+      // Update Qty Due
+      outSheet.cell(CellIndex.indexByColumnRow(columnIndex: colDue, rowIndex: outRowIdx)).value =
+          qtyToCell(dueVal);
+
+      // Set WO Status & Progress Columns
+      outSheet.cell(CellIndex.indexByColumnRow(columnIndex: serviceColIndices['WO Status']!, rowIndex: outRowIdx)).value =
+          TextCellValue(woStatus);
+      outSheet.cell(CellIndex.indexByColumnRow(columnIndex: serviceColIndices['WO Progress %']!, rowIndex: outRowIdx)).value =
+          TextCellValue(woProgress);
+      outSheet.cell(CellIndex.indexByColumnRow(columnIndex: serviceColIndices['Total Picked']!, rowIndex: outRowIdx)).value =
+          qtyToCell(pickedVal);
+      outSheet.cell(CellIndex.indexByColumnRow(columnIndex: serviceColIndices['Session Picked']!, rowIndex: outRowIdx)).value =
+          qtyToCell(pickedVal);
+
+      // Set ERP Audit Columns
+      outSheet.cell(CellIndex.indexByColumnRow(columnIndex: serviceColIndices['Session ID']!, rowIndex: outRowIdx)).value =
+          TextCellValue(session.id);
+      outSheet.cell(CellIndex.indexByColumnRow(columnIndex: serviceColIndices['Worker Name']!, rowIndex: outRowIdx)).value =
+          TextCellValue(session.workerName);
+      outSheet.cell(CellIndex.indexByColumnRow(columnIndex: serviceColIndices['Pick Date']!, rowIndex: outRowIdx)).value =
+          TextCellValue(item.pickDate.isNotEmpty ? item.pickDate : session.pickDate);
+      outSheet.cell(CellIndex.indexByColumnRow(columnIndex: serviceColIndices['Start Time']!, rowIndex: outRowIdx)).value =
+          TextCellValue(startTimeStr);
+      outSheet.cell(CellIndex.indexByColumnRow(columnIndex: serviceColIndices['End Time']!, rowIndex: outRowIdx)).value =
+          TextCellValue(endTimeStr);
+      outSheet.cell(CellIndex.indexByColumnRow(columnIndex: serviceColIndices['Issued Status']!, rowIndex: outRowIdx)).value =
+          TextCellValue(session.issuedStatus);
+
+      // Return Comments: join all return comments for this part ID with " | " separator
+      if (serviceColIndices.containsKey('Return Comments')) {
+        final comments = returnComments[item.partId] ?? [];
+        final commentsStr = comments.join(' | ');
+        outSheet.cell(CellIndex.indexByColumnRow(columnIndex: serviceColIndices['Return Comments']!, rowIndex: outRowIdx)).value =
+            commentsStr.isNotEmpty ? TextCellValue(commentsStr) : TextCellValue('');
+      }
+
+      outRowIdx++;
     }
 
     // 3. Encode and write to the session-named output file (NOT the source file)
-    final updatedBytes = excel.encode();
+    final updatedBytes = outExcel.encode();
     if (updatedBytes != null) {
       try {
         final outputFile = File(resolvedOutputPath);
@@ -421,5 +467,414 @@ class ExcelService {
     }
 
     return resolvedOutputPath;
+  }
+
+  /// Exports a consolidated Super Export Excel file combining multiple unexported sessions across one or more units.
+  /// Writes all picked items from all participating units, with consolidated audit columns:
+  /// - Session ID: list of session sequence numbers (e.g. "Batch: #1, #2, #3")
+  /// - Worker Name: comma-separated distinct worker names (e.g. "Alex, John")
+  /// - Start Time: earliest session start time
+  /// - End Time: latest session end time
+  /// - Issued Status: ERP status (e.g. "Pending Issue" or custom)
+  Future<String> exportMultiUnitBatchSuperSession({
+    required Map<String, String> unitOriginalFiles, // unitId -> filePath
+    required Map<String, List<PicklistItem>> unitItems, // unitId -> items
+    required Map<String, String> unitNames, // unitId -> unitName
+    required List<SessionMetadata> sessions,
+    required Map<String, Map<String, List<String>>> unitReturnComments, // unitId -> partId -> comments
+    required String outputPath,
+    Map<String, List<String>> unitAutoIssueResourceIds = const {},
+    String issuedStatus = 'Pending Issue',
+  }) async {
+    if (sessions.isEmpty || unitOriginalFiles.isEmpty) {
+      throw Exception('No sessions or units provided for multi-unit batch export.');
+    }
+
+    final earliestStart = sessions.map((s) => s.startTime).reduce((a, b) => a < b ? a : b);
+    final latestEnd = sessions.map((s) => s.endTime ?? s.startTime).reduce((a, b) => a > b ? a : b);
+    final workers = sessions
+        .map((s) => s.workerName.trim())
+        .where((w) => w.isNotEmpty)
+        .toSet()
+        .join(', ');
+
+    final seqNos = sessions.map((s) => s.sessionSeqNo).where((n) => n > 0).toSet().toList()..sort();
+    final seqListStr = seqNos.isNotEmpty
+        ? seqNos.map((n) => '#$n').join(', ')
+        : sessions.map((s) => s.id.length > 8 ? s.id.substring(0, 8) : s.id).join(', ');
+    final sessionDetails = sessions.map((s) {
+      final sSeq = s.sessionSeqNo > 0 ? '#${s.sessionSeqNo}' : s.id.substring(0, 6);
+      return '$sSeq (${s.workerName}: ${s.totalItemsPicked} parts, ${s.formattedDuration})';
+    }).join(' | ');
+    final batchLabel = 'Batch: $seqListStr [$sessionDetails]';
+
+    final pickDates = sessions.map((s) => s.pickDate).where((d) => d.isNotEmpty).toSet();
+    final combinedPickDate = pickDates.isNotEmpty ? pickDates.join(', ') : '';
+
+    final timeFormatter = DateFormat('HH:mm:ss');
+    final startTimeStr = timeFormatter.format(DateTime.fromMillisecondsSinceEpoch(earliestStart));
+    final endTimeStr = timeFormatter.format(DateTime.fromMillisecondsSinceEpoch(latestEnd));
+
+    // 1. Read first available unit file as reference structure
+    final firstUnitId = unitOriginalFiles.keys.first;
+    final firstFilePath = unitOriginalFiles[firstUnitId]!;
+    final firstFile = File(firstFilePath);
+    if (!await firstFile.exists()) {
+      throw Exception('Source file not found: $firstFilePath');
+    }
+
+    final firstBytes = await firstFile.readAsBytes();
+    final firstExcel = Excel.decodeBytes(firstBytes);
+    String targetSheetName = firstExcel.tables.keys.first;
+    for (final name in firstExcel.tables.keys) {
+      if (firstExcel.tables[name]?.rows.isNotEmpty ?? false) {
+        targetSheetName = name;
+        break;
+      }
+    }
+
+    final firstSheet = firstExcel.tables[targetSheetName]!;
+    final firstHeaderRow = firstSheet.rows.first;
+
+    final headerNames = <String>[];
+    int? origColPicked;
+    int? origColDue;
+    int? origColUnit;
+
+    for (int col = 0; col < firstHeaderRow.length; col++) {
+      final val = firstHeaderRow[col]?.value?.toString() ?? '';
+      headerNames.add(val);
+      final key = columnMapper.identifyColumn(val);
+      if (key == ColumnMapper.keyQtyPicked) origColPicked = col;
+      if (key == ColumnMapper.keyQtyDue) origColDue = col;
+      if (key == ColumnMapper.keyUnit) origColUnit = col;
+    }
+
+    // Next available column index after 'File Name' (col 0) and all original headers (cols 1..length)
+    int nextCol = firstHeaderRow.length + 1;
+    final serviceHeaders = [
+      'WO Status',
+      'WO Progress %',
+      'Total Picked',
+      'Session Picked',
+      'Session ID',
+      'Worker Name',
+      'Pick Date',
+      'Start Time',
+      'End Time',
+      'Issued Status',
+      'Return Comments',
+    ];
+
+    final serviceColIndices = <String, int>{};
+    for (final sHeader in serviceHeaders) {
+      bool found = false;
+      for (int c = 0; c < firstHeaderRow.length; c++) {
+        if (firstHeaderRow[c]?.value?.toString().trim().toLowerCase() == sHeader.toLowerCase()) {
+          serviceColIndices[sHeader] = c + 1;
+          found = true;
+          break;
+        }
+      }
+      if (!found) {
+        serviceColIndices[sHeader] = nextCol;
+        nextCol++;
+      }
+    }
+
+    final int colPicked = origColPicked != null ? (origColPicked + 1) : nextCol++;
+    final int colDue = origColDue != null ? (origColDue + 1) : nextCol++;
+    final int colUnit = origColUnit != null ? (origColUnit + 1) : nextCol++;
+
+    // 2. Create target workbook
+    final outExcel = Excel.createExcel();
+    final defaultSheet = outExcel.getDefaultSheet();
+    final outSheet = outExcel[targetSheetName];
+    if (defaultSheet != null && defaultSheet != targetSheetName) {
+      outExcel.delete(defaultSheet);
+    }
+
+    // Write row 0 headers — Column 0 is reserved for File Name
+    outSheet.cell(CellIndex.indexByColumnRow(columnIndex: 0, rowIndex: 0)).value =
+        TextCellValue('File Name');
+
+    for (int col = 0; col < firstHeaderRow.length; col++) {
+      final v = firstHeaderRow[col]?.value;
+      if (v != null) {
+        outSheet.cell(CellIndex.indexByColumnRow(columnIndex: col + 1, rowIndex: 0)).value = v;
+      }
+    }
+    for (final entry in serviceColIndices.entries) {
+      outSheet.cell(CellIndex.indexByColumnRow(columnIndex: entry.value, rowIndex: 0)).value =
+          TextCellValue(entry.key);
+    }
+    if (origColPicked == null) {
+      outSheet.cell(CellIndex.indexByColumnRow(columnIndex: colPicked, rowIndex: 0)).value =
+          TextCellValue('Qty Picked');
+    }
+    if (origColDue == null) {
+      outSheet.cell(CellIndex.indexByColumnRow(columnIndex: colDue, rowIndex: 0)).value =
+          TextCellValue('Qty Due');
+    }
+    if (origColUnit == null) {
+      outSheet.cell(CellIndex.indexByColumnRow(columnIndex: colUnit, rowIndex: 0)).value =
+          TextCellValue('Unit');
+    }
+
+    int outRowIdx = 1;
+
+    CellValue qtyToCell(double val) {
+      if (val % 1 == 0) return IntCellValue(val.toInt());
+      return DoubleCellValue(val);
+    }
+
+    // 3. Process each unit's rows
+    for (final unitId in unitOriginalFiles.keys) {
+      final filePath = unitOriginalFiles[unitId]!;
+      final items = unitItems[unitId] ?? [];
+      final unitName = unitNames[unitId] ?? unitId;
+      final returnComments = unitReturnComments[unitId] ?? {};
+      final autoIssueResourceIds = unitAutoIssueResourceIds[unitId] ?? [];
+
+      final file = File(filePath);
+      if (!await file.exists()) continue;
+
+      final bytes = await file.readAsBytes();
+      final unitExcel = Excel.decodeBytes(bytes);
+      String sheetName = unitExcel.tables.keys.first;
+      for (final name in unitExcel.tables.keys) {
+        if (unitExcel.tables[name]?.rows.isNotEmpty ?? false) {
+          sheetName = name;
+          break;
+        }
+      }
+      final unitSheet = unitExcel.tables[sheetName];
+      if (unitSheet == null || unitSheet.rows.isEmpty) continue;
+
+      // Precalculate Work Order progress per (department, workOrder) for this unit
+      final woGroups = <String, List<PicklistItem>>{};
+      for (final item in items) {
+        final key = '${item.department}___${item.workOrder}';
+        woGroups.putIfAbsent(key, () => []).add(item);
+      }
+
+      final woStatusMap = <String, String>{};
+      final woProgressMap = <String, String>{};
+
+      for (final entry in woGroups.entries) {
+        final woItems = entry.value;
+        final partReqMap = <String, double>{};
+        final partPickedMap = <String, double>{};
+        for (final it in woItems) {
+          partReqMap[it.partId] = (partReqMap[it.partId] ?? 0.0) + it.qtyRequired;
+          partPickedMap[it.partId] = (partPickedMap[it.partId] ?? 0.0) + it.qtyPicked;
+        }
+
+        if (partReqMap.isEmpty) {
+          woStatusMap[entry.key] = 'Not Picked';
+          woProgressMap[entry.key] = '0.0%';
+          continue;
+        }
+
+        double totalRatio = 0.0;
+        for (final partId in partReqMap.keys) {
+          final req = partReqMap[partId] ?? 0.0;
+          final picked = partPickedMap[partId] ?? 0.0;
+          if (req > 0) {
+            final ratio = (picked / req).clamp(0.0, 1.0);
+            totalRatio += ratio;
+          } else {
+            totalRatio += 1.0;
+          }
+        }
+
+        final progressRatio = totalRatio / partReqMap.length;
+        final progressPercent = progressRatio * 100.0;
+        woProgressMap[entry.key] = '${progressPercent.toStringAsFixed(1)}%';
+
+        if (progressRatio >= 1.0) {
+          woStatusMap[entry.key] = 'Fully Picked';
+        } else if (progressRatio > 0.0) {
+          woStatusMap[entry.key] = 'Partially Picked';
+        } else {
+          woStatusMap[entry.key] = 'Not Picked';
+        }
+      }
+
+      final itemByRowOrder = <int, PicklistItem>{};
+      for (final item in items) {
+        itemByRowOrder[item.rowOrder] = item;
+      }
+
+      // Map unitSheet column indices to outSheet column indices
+      final unitHeaderRow = unitSheet.rows.first;
+      final colMapping = <int, int>{};
+      for (int uCol = 0; uCol < unitHeaderRow.length; uCol++) {
+        final uHeader = unitHeaderRow[uCol]?.value?.toString().trim().toLowerCase() ?? '';
+        int? matchedOutCol;
+        for (int oCol = 0; oCol < headerNames.length; oCol++) {
+          if (headerNames[oCol].trim().toLowerCase() == uHeader) {
+            matchedOutCol = oCol + 1; // Shifted by 1 because col 0 is File Name
+            break;
+          }
+        }
+        colMapping[uCol] = matchedOutCol ?? (uCol + 1);
+      }
+
+      final sourceFileName = p.basename(filePath);
+
+      for (int rowIdx = 1; rowIdx < unitSheet.rows.length; rowIdx++) {
+        final item = itemByRowOrder[rowIdx];
+        if (item == null) continue;
+
+        final isItemResEmpty = item.resourceId.trim().isEmpty;
+        final isAutoResource = isItemResEmpty
+            ? autoIssueResourceIds.any((r) => r.trim().isEmpty || r == '(Empty / Unassigned)')
+            : autoIssueResourceIds.any((r) => r.trim().toLowerCase() == item.resourceId.trim().toLowerCase());
+
+        final shouldExport = item.qtyPicked > 0.0001 || isAutoResource;
+        if (!shouldExport) continue;
+
+        // Write source File Name in Column 0
+        outSheet.cell(CellIndex.indexByColumnRow(columnIndex: 0, rowIndex: outRowIdx)).value =
+            TextCellValue(sourceFileName);
+
+        final origRow = unitSheet.rows[rowIdx];
+        for (int c = 0; c < origRow.length; c++) {
+          final targetCol = colMapping[c];
+          final cellVal = origRow[c]?.value;
+          if (targetCol != null && cellVal != null) {
+            outSheet.cell(CellIndex.indexByColumnRow(columnIndex: targetCol, rowIndex: outRowIdx)).value = cellVal;
+          }
+        }
+
+        final woKey = '${item.department}___${item.workOrder}';
+        final woStatus = woStatusMap[woKey] ?? 'Not Picked';
+        final woProgress = woProgressMap[woKey] ?? '0.0%';
+
+        final pickedVal = isAutoResource ? item.qtyRequired : item.qtyPicked;
+        final dueVal = isAutoResource ? 0.0 : item.qtyDue;
+
+        if (colPicked != null) {
+          outSheet.cell(CellIndex.indexByColumnRow(columnIndex: colPicked, rowIndex: outRowIdx)).value =
+              qtyToCell(pickedVal);
+        }
+        if (colDue != null) {
+          outSheet.cell(CellIndex.indexByColumnRow(columnIndex: colDue, rowIndex: outRowIdx)).value =
+              qtyToCell(dueVal);
+        }
+
+        if (serviceColIndices.containsKey('WO Status')) {
+          outSheet.cell(CellIndex.indexByColumnRow(columnIndex: serviceColIndices['WO Status']!, rowIndex: outRowIdx)).value =
+              TextCellValue(woStatus);
+        }
+        if (serviceColIndices.containsKey('WO Progress %')) {
+          outSheet.cell(CellIndex.indexByColumnRow(columnIndex: serviceColIndices['WO Progress %']!, rowIndex: outRowIdx)).value =
+              TextCellValue(woProgress);
+        }
+        if (serviceColIndices.containsKey('Total Picked')) {
+          outSheet.cell(CellIndex.indexByColumnRow(columnIndex: serviceColIndices['Total Picked']!, rowIndex: outRowIdx)).value =
+              qtyToCell(pickedVal);
+        }
+        if (serviceColIndices.containsKey('Session Picked')) {
+          outSheet.cell(CellIndex.indexByColumnRow(columnIndex: serviceColIndices['Session Picked']!, rowIndex: outRowIdx)).value =
+              qtyToCell(pickedVal);
+        }
+        if (serviceColIndices.containsKey('Session ID')) {
+          outSheet.cell(CellIndex.indexByColumnRow(columnIndex: serviceColIndices['Session ID']!, rowIndex: outRowIdx)).value =
+              TextCellValue(batchLabel);
+        }
+        if (serviceColIndices.containsKey('Worker Name')) {
+          outSheet.cell(CellIndex.indexByColumnRow(columnIndex: serviceColIndices['Worker Name']!, rowIndex: outRowIdx)).value =
+              TextCellValue(workers);
+        }
+        if (serviceColIndices.containsKey('Pick Date')) {
+          outSheet.cell(CellIndex.indexByColumnRow(columnIndex: serviceColIndices['Pick Date']!, rowIndex: outRowIdx)).value =
+              TextCellValue(item.pickDate.isNotEmpty ? item.pickDate : combinedPickDate);
+        }
+        if (serviceColIndices.containsKey('Start Time')) {
+          outSheet.cell(CellIndex.indexByColumnRow(columnIndex: serviceColIndices['Start Time']!, rowIndex: outRowIdx)).value =
+              TextCellValue(startTimeStr);
+        }
+        if (serviceColIndices.containsKey('End Time')) {
+          outSheet.cell(CellIndex.indexByColumnRow(columnIndex: serviceColIndices['End Time']!, rowIndex: outRowIdx)).value =
+              TextCellValue(endTimeStr);
+        }
+        if (serviceColIndices.containsKey('Issued Status')) {
+          outSheet.cell(CellIndex.indexByColumnRow(columnIndex: serviceColIndices['Issued Status']!, rowIndex: outRowIdx)).value =
+              TextCellValue(issuedStatus);
+        }
+        if (serviceColIndices.containsKey('Return Comments')) {
+          final comments = returnComments[item.partId] ?? [];
+          final commentsStr = comments.join(' | ');
+          outSheet.cell(CellIndex.indexByColumnRow(columnIndex: serviceColIndices['Return Comments']!, rowIndex: outRowIdx)).value =
+              commentsStr.isNotEmpty ? TextCellValue(commentsStr) : TextCellValue('');
+        }
+        if (colUnit != null) {
+          outSheet.cell(CellIndex.indexByColumnRow(columnIndex: colUnit, rowIndex: outRowIdx)).value =
+              TextCellValue(item.subUnit.isNotEmpty ? item.subUnit : unitName);
+        }
+
+        outRowIdx++;
+      }
+    }
+
+    final updatedBytes = outExcel.encode();
+    if (updatedBytes != null) {
+      try {
+        final outputFile = File(outputPath);
+        if (!await outputFile.parent.exists()) {
+          await outputFile.parent.create(recursive: true);
+        }
+        await outputFile.writeAsBytes(updatedBytes, flush: true);
+        LogService.info('EXCEL', 'Exported multi-unit super session to: $outputPath');
+        return outputPath;
+      } on FileSystemException catch (e) {
+        LogService.warn('EXCEL', 'Failed writing to $outputPath ($e). Trying fallback storage directory.');
+        try {
+          final appDir = await getApplicationDocumentsDirectory();
+          final fileName = p.basename(outputPath);
+          final fallbackPath = p.join(appDir.path, fileName);
+          final fallbackFile = File(fallbackPath);
+          await fallbackFile.writeAsBytes(updatedBytes, flush: true);
+          LogService.info('EXCEL', 'Exported multi-unit super session via fallback to: $fallbackPath');
+          return fallbackPath;
+        } catch (fallbackErr) {
+          LogService.error('EXCEL', 'Fallback export also failed: $fallbackErr');
+          rethrow;
+        }
+      }
+    }
+
+    return outputPath;
+  }
+
+  /// Exports a consolidated Super Export Excel file combining multiple unexported sessions for a single unit.
+  /// Delegates to [exportMultiUnitBatchSuperSession].
+  Future<String> exportBatchSuperSession({
+    required String originalFilePath,
+    required List<PicklistItem> items,
+    required List<SessionMetadata> sessions,
+    required String unitName,
+    required Map<String, List<String>> returnComments,
+    required String outputPath,
+    List<String> autoIssueResourceIds = const [],
+    String issuedStatus = 'Pending Issue',
+  }) async {
+    if (sessions.isEmpty) {
+      throw Exception('No sessions provided for batch export.');
+    }
+
+    final unitId = sessions.first.unitId;
+    return exportMultiUnitBatchSuperSession(
+      unitOriginalFiles: {unitId: originalFilePath},
+      unitItems: {unitId: items},
+      unitNames: {unitId: unitName},
+      sessions: sessions,
+      unitReturnComments: {unitId: returnComments},
+      outputPath: outputPath,
+      unitAutoIssueResourceIds: {unitId: autoIssueResourceIds},
+      issuedStatus: issuedStatus,
+    );
   }
 }

@@ -60,10 +60,12 @@ class _PickingScreenState extends State<PickingScreen> with WidgetsBindingObserv
   Map<String, bool> _departmentsMap = {};
   late List<GroupingPreset> _presets;
   late GroupingPreset _selectedPreset;
+  bool _combineDepartments = true;
 
   String? _activeDepartment;
   String _tabletId = '';
   Map<String, Map<String, dynamic>> _partFlags = {};
+  List<String> _mainLineResourcePicks = [];
 
   bool _isLoading = false;
 
@@ -73,7 +75,13 @@ class _PickingScreenState extends State<PickingScreen> with WidgetsBindingObserv
     WidgetsBinding.instance.addObserver(this);
     _presets = GroupingPreset.defaultPresets;
     _activeDepartment = widget.initialDepartment;
-    _selectedPreset = GroupingEngine.getPresetForDepartment(_activeDepartment ?? '', customPresets: _presets);
+    _selectedPreset = GroupingEngine.getPresetForDepartment(
+      _activeDepartment ?? '',
+      customPresets: _presets,
+      includeLine: !_isResourceScope,
+      bypassDepartmentLevel: _isResourceScope && _combineDepartments,
+      isResourceScope: _isResourceScope,
+    );
 
     if (widget.initialUnit != null) {
       _activeSession = widget.initialSession;
@@ -103,7 +111,7 @@ class _PickingScreenState extends State<PickingScreen> with WidgetsBindingObserv
     if (_activeSession == null || _activeUnit == null) return;
     try {
       final nowMs = DateTime.now().millisecondsSinceEpoch;
-      final pickedPartsCount = _items.where((i) => i.qtyPicked > 0).length;
+      final pickedPartsCount = _items.where((i) => i.qtyPicked > 0.0001).map((i) => i.partId).toSet().length;
       await widget.dbService.updateSessionProgress(
         _activeSession!.id,
         pickedPartsCount,
@@ -136,16 +144,26 @@ class _PickingScreenState extends State<PickingScreen> with WidgetsBindingObserv
     final depts = await widget.dbService.getDepartmentsForUnit(unit.id);
 
     SessionMetadata? session = _activeSession;
-    if (session == null) {
-      session = await widget.dbService.getActiveSession(unit.id);
-    }
+    session ??= await widget.dbService.getActiveSession(unit.id);
 
-    final includeLine = await widget.dbService.shouldGroupByLineForDept(_activeDepartment ?? '');
+    final includeLine = _isResourceScope
+        ? false
+        : await widget.dbService.shouldGroupByLineForDept(_activeDepartment ?? '');
+    if (_isResourceScope) {
+      final viewMode = await widget.dbService.getMainLineResourceView(_targetResourceName);
+      _combineDepartments = (viewMode != 'split_by_dept');
+    } else {
+      final defCombine = (await widget.dbService.getConfig('mainline_resource_default_view')) != 'split_by_dept';
+      _combineDepartments = defCombine;
+    }
     final autoPreset = GroupingEngine.getPresetForDepartment(
       _activeDepartment ?? '',
       customPresets: _presets,
       includeLine: includeLine,
+      bypassDepartmentLevel: _isResourceScope && _combineDepartments,
+      isResourceScope: _isResourceScope,
     );
+    _selectedPreset = autoPreset;
 
     final tabletId = await widget.dbService.getConfig('tablet_id') ?? '';
 
@@ -184,6 +202,8 @@ class _PickingScreenState extends State<PickingScreen> with WidgetsBindingObserv
       return true;
     }).toList();
 
+    final mainLinePicks = await widget.dbService.getMainLineResourcePicks();
+
     setState(() {
       _activeUnit = unit;
       _items = visibleItems;
@@ -192,6 +212,7 @@ class _PickingScreenState extends State<PickingScreen> with WidgetsBindingObserv
       _selectedPreset = autoPreset;
       _tabletId = tabletId;
       _partFlags = flagMap;
+      _mainLineResourcePicks = mainLinePicks;
       _isLoading = false;
     });
   }
@@ -208,14 +229,19 @@ class _PickingScreenState extends State<PickingScreen> with WidgetsBindingObserv
 
     final newTotalPicked = updatedList.fold<double>(0.0, (sum, i) => sum + i.qtyPicked).round();
     final nowMs = DateTime.now().millisecondsSinceEpoch;
+
+    final allPartIds = updatedList.map((i) => i.partId).toSet();
+    final allPartsDone = allPartIds.isNotEmpty && allPartIds.every((pid) {
+      final itemsForPart = updatedList.where((i) => i.partId == pid);
+      final totalDue = itemsForPart.fold<double>(0.0, (s, i) => s + i.qtyDue);
+      return totalDue <= 0.0001;
+    });
+    final isUnitComplete = allPartsDone || (newTotalPicked >= _activeUnit!.totalRequired && _activeUnit!.totalRequired > 0);
+
     final updatedUnit = _activeUnit!.copyWith(
       totalPicked: newTotalPicked,
-      status: newTotalPicked >= _activeUnit!.totalRequired && _activeUnit!.totalRequired > 0
-          ? 'COMPLETED'
-          : 'IN_PROGRESS',
-      completedAt: newTotalPicked >= _activeUnit!.totalRequired && _activeUnit!.totalRequired > 0
-          ? nowMs
-          : null,
+      status: isUnitComplete ? 'FULLY_PICKED' : 'IN_PROGRESS',
+      completedAt: isUnitComplete ? nowMs : null,
       lastAccessedAt: nowMs,
     );
 
@@ -236,7 +262,24 @@ class _PickingScreenState extends State<PickingScreen> with WidgetsBindingObserv
     LogService.picker('PICK: $partId (Allocated: $newPickedTotal) → Unit: ${_activeUnit?.name}, Dept: $department');
 
     if (_activeSession != null) {
-      final pickedCount = updatedList.where((i) => i.qtyPicked > 0).length;
+      final oldItems = _items.where((i) => i.partId == partId).toList();
+      final oldPickedSum = oldItems.fold<double>(0.0, (s, i) => s + i.qtyPicked);
+      if (newPickedTotal > oldPickedSum) {
+        for (final item in updatedList.where((i) => i.partId == partId)) {
+          final old = oldItems.firstWhere((o) => o.id == item.id, orElse: () => item);
+          final delta = item.qtyPicked - old.qtyPicked;
+          if (delta > 0.0001) {
+            await widget.dbService.recordSessionPick(
+              sessionId: _activeSession!.id,
+              unitId: _activeUnit!.id,
+              itemId: item.id,
+              partId: partId,
+              qtyPickedDelta: delta,
+            );
+          }
+        }
+      }
+      final pickedCount = await widget.dbService.getSessionPickedPartCount(_activeSession!.id);
       await widget.dbService.updateSessionProgress(
         _activeSession!.id,
         pickedCount,
@@ -278,7 +321,17 @@ class _PickingScreenState extends State<PickingScreen> with WidgetsBindingObserv
     LogService.picker('PICK: ${updated.partId} (Override: $newPickedQty) → Unit: ${_activeUnit?.name}, Line: ${updated.line}');
 
     if (_activeSession != null) {
-      final pickedCount = _items.where((i) => i.qtyPicked > 0).length;
+      final delta = updated.qtyPicked - item.qtyPicked;
+      if (delta > 0.0001) {
+        await widget.dbService.recordSessionPick(
+          sessionId: _activeSession!.id,
+          unitId: _activeUnit!.id,
+          itemId: item.id,
+          partId: updated.partId,
+          qtyPickedDelta: delta,
+        );
+      }
+      final pickedCount = await widget.dbService.getSessionPickedPartCount(_activeSession!.id);
       await widget.dbService.updateSessionProgress(
         _activeSession!.id,
         pickedCount,
@@ -291,12 +344,73 @@ class _PickingScreenState extends State<PickingScreen> with WidgetsBindingObserv
     }
   }
 
-  /// Build the sorted part summaries for the active department (optionally filtered to a line).
+  bool get _isResourceScope =>
+      _activeDepartment != null &&
+      _activeDepartment!.startsWith('Resource: ') &&
+      _activeDepartment!.endsWith(' (MAIN LINE)');
+
+  String get _targetResourceName => _isResourceScope
+      ? _activeDepartment!
+          .substring('Resource: '.length, _activeDepartment!.length - ' (MAIN LINE)'.length)
+          .trim()
+      : '';
+
+  void _toggleCombineDepartments(bool combine) {
+    if (_combineDepartments == combine) return;
+    setState(() {
+      _combineDepartments = combine;
+      final includeLine = _isResourceScope ? false : _selectedPreset.levels.contains(GroupLevel.line);
+      _selectedPreset = GroupingEngine.getPresetForDepartment(
+        _activeDepartment ?? '',
+        customPresets: _presets,
+        includeLine: includeLine,
+        bypassDepartmentLevel: _isResourceScope && _combineDepartments,
+        isResourceScope: _isResourceScope,
+      );
+    });
+  }
+
+  bool _itemMatchesActiveScope(PicklistItem i) {
+    if (_activeDepartment == null) return true;
+    if (_isResourceScope) {
+      final isMainLine = i.deptType.toUpperCase() == 'MAIN LINE' ||
+          i.department.toUpperCase().contains('MAIN') ||
+          i.department.toUpperCase().contains('MACG');
+      if (!isMainLine) return false;
+      final res = i.resourceId.trim();
+      final target = _targetResourceName;
+      if (target == '(Empty / Unassigned)') {
+        return res.isEmpty || res == '(Empty / Unassigned)';
+      }
+      return res.toLowerCase() == target.toLowerCase();
+    }
+
+    // Standard department picking
+    if (i.department != _activeDepartment) return false;
+
+    // If active department is a MAIN LINE department and item belongs to a resource picked separately, exclude it!
+    final isMainLineDept = _activeDepartment!.toUpperCase().contains('MAIN') ||
+        _activeDepartment!.toUpperCase().contains('MACG');
+    if (isMainLineDept && _mainLineResourcePicks.isNotEmpty) {
+      final res = i.resourceId.trim();
+      for (final wholeRes in _mainLineResourcePicks) {
+        if (wholeRes == '(Empty / Unassigned)') {
+          if (res.isEmpty || res == '(Empty / Unassigned)') return false;
+        } else {
+          if (res.toLowerCase() == wholeRes.trim().toLowerCase()) return false;
+        }
+      }
+    }
+
+    return true;
+  }
+
+  /// Build the sorted part summaries for the active department or resource (optionally filtered to a line).
   /// [pendingOnly]: when true (for Pick Mode), excludes fully picked parts while keeping pending and missing parts.
   List<PartSummary> _buildPartSummaries({String? lineFilter, bool pendingOnly = false}) {
     final partsMap = <String, PartSummary>{};
     for (final item in _items) {
-      if (_activeDepartment != null && item.department != _activeDepartment) continue;
+      if (!_itemMatchesActiveScope(item)) continue;
       if (lineFilter != null && item.line != lineFilter) continue;
       if (partsMap.containsKey(item.partId)) {
         partsMap[item.partId] = partsMap[item.partId]!.add(item);
@@ -326,7 +440,7 @@ class _PickingScreenState extends State<PickingScreen> with WidgetsBindingObserv
   /// Navigate to PickModeScreen starting at the part index corresponding to [partId].
   void _openPickModeAtPart(String partId) {
     final matchingItem = _items.firstWhere(
-      (i) => i.partId == partId && (_activeDepartment == null || i.department == _activeDepartment),
+      (i) => i.partId == partId && _itemMatchesActiveScope(i),
       orElse: () => _items.firstWhere(
         (i) => i.partId == partId,
         orElse: () => PicklistItem(id: '', unitId: '', department: '', line: '', workOrder: '', partId: '', partDescription: '', qtyRequired: 0, qtyDue: 0, qtyPicked: 0, rowOrder: 0),
@@ -337,7 +451,7 @@ class _PickingScreenState extends State<PickingScreen> with WidgetsBindingObserv
 
     final parts = _buildPartSummaries(lineFilter: lineLabel, pendingOnly: false);
     final deptItems = _items
-        .where((i) => (_activeDepartment == null || i.department == _activeDepartment) &&
+        .where((i) => _itemMatchesActiveScope(i) &&
                       (lineLabel == null || i.line == lineLabel))
         .toList()
       ..sort((a, b) => a.rowOrder.compareTo(b.rowOrder));
@@ -410,20 +524,20 @@ class _PickingScreenState extends State<PickingScreen> with WidgetsBindingObserv
   void _openPickModeAtLine(String? lineLabel) {
     final parts = _buildPartSummaries(lineFilter: lineLabel, pendingOnly: true);
     final deptItems = _items
-        .where((i) => ((_activeDepartment == null || i.department == _activeDepartment) &&
-                       (lineLabel == null || i.line == lineLabel)))
+        .where((i) => _itemMatchesActiveScope(i) &&
+                       (lineLabel == null || i.line == lineLabel))
         .toList()
       ..sort((a, b) => a.rowOrder.compareTo(b.rowOrder));
     _navigateToPickMode(parts, deptItems, startIndex: 0, lineLabel: lineLabel);
   }
 
-  void _navigateToPickMode(
+  Future<void> _navigateToPickMode(
     List<PartSummary> parts,
     List<PicklistItem> deptItems, {
     int startIndex = 0,
     String? lineLabel,
-  }) {
-    Navigator.of(context).push(
+  }) async {
+    await Navigator.of(context).push(
       MaterialPageRoute(
         builder: (_) => PickModeScreen(
           unit: _activeUnit!,
@@ -451,12 +565,96 @@ class _PickingScreenState extends State<PickingScreen> with WidgetsBindingObserv
                   if (idx >= 0) _items[idx] = updated;
                 }
                 _partFlags = freshMap;
+                final newTotalPicked = _items.fold<double>(0.0, (sum, i) => sum + i.qtyPicked).round();
+                final allPartIds = _items.map((i) => i.partId).toSet();
+                final allPartsDone = allPartIds.isNotEmpty && allPartIds.every((pid) {
+                  final itemsForPart = _items.where((i) => i.partId == pid);
+                  final totalDue = itemsForPart.fold<double>(0.0, (s, i) => s + i.qtyDue);
+                  return totalDue <= 0.0001;
+                });
+                final isUnitComplete = allPartsDone || (newTotalPicked >= _activeUnit!.totalRequired && _activeUnit!.totalRequired > 0);
+                _activeUnit = _activeUnit!.copyWith(
+                  totalPicked: newTotalPicked,
+                  status: isUnitComplete ? 'FULLY_PICKED' : 'IN_PROGRESS',
+                );
+                if (_activeSession != null) {
+                  widget.dbService.getSessionPickedPartCount(_activeSession!.id).then((count) {
+                    if (mounted) {
+                      setState(() {
+                        _activeSession = _activeSession!.copyWith(totalItemsPicked: count);
+                      });
+                    }
+                  });
+                }
               });
             }
           },
         ),
       ),
     );
+
+    // Immediately refresh flags and items from DB upon returning to PickingScreen
+    if (mounted && _activeUnit != null) {
+      final freshFlags = await widget.dbService.getPartFlags(_activeUnit!.id);
+      final freshMap = <String, Map<String, dynamic>>{};
+      for (final f in freshFlags) {
+        final pid = f['part_id']?.toString() ?? '';
+        if (pid.isNotEmpty && !freshMap.containsKey(pid)) {
+          freshMap[pid] = f;
+        }
+      }
+      final freshItems = await widget.dbService.getPicklistItems(_activeUnit!.id);
+      final blockedRes = await widget.dbService.getBlockedResourceIds();
+      final isBlockedEmpty = blockedRes.any((r) => r.trim().isEmpty || r == '(Empty / Unassigned)');
+      final blockedSet = blockedRes
+          .map((r) => r.trim().toLowerCase())
+          .where((s) => s.isNotEmpty && s != '(empty / unassigned)')
+          .toSet();
+
+      final autoIssueRes = await widget.dbService.getAutoIssueResourceIds();
+      final isAutoEmpty = autoIssueRes.any((r) => r.trim().isEmpty || r == '(Empty / Unassigned)');
+      final autoIssueResSet = autoIssueRes
+          .map((r) => r.trim().toLowerCase())
+          .where((s) => s.isNotEmpty && s != '(empty / unassigned)')
+          .toSet();
+
+      final visibleItems = freshItems.where((i) {
+        final r = i.resourceId.trim().toLowerCase();
+        final isEmpty = r.isEmpty;
+        if (isEmpty) {
+          if (isBlockedEmpty || isAutoEmpty) return false;
+        } else {
+          if (blockedSet.contains(r) || autoIssueResSet.contains(r)) return false;
+        }
+        return true;
+      }).toList();
+
+      final newTotalPicked = visibleItems.fold<double>(0.0, (sum, i) => sum + i.qtyPicked).round();
+      final allPartIds = visibleItems.map((i) => i.partId).toSet();
+      final allPartsDone = allPartIds.isNotEmpty && allPartIds.every((pid) {
+        final itemsForPart = visibleItems.where((i) => i.partId == pid);
+        final totalDue = itemsForPart.fold<double>(0.0, (s, i) => s + i.qtyDue);
+        return totalDue <= 0.0001;
+      });
+      final isUnitComplete = allPartsDone || (newTotalPicked >= _activeUnit!.totalRequired && _activeUnit!.totalRequired > 0);
+      final sessionPickCount = _activeSession != null
+          ? await widget.dbService.getSessionPickedPartCount(_activeSession!.id)
+          : 0;
+
+      setState(() {
+        _items = visibleItems;
+        _partFlags = freshMap;
+        _activeUnit = _activeUnit!.copyWith(
+          totalPicked: newTotalPicked,
+          status: isUnitComplete ? 'FULLY_PICKED' : 'IN_PROGRESS',
+        );
+        if (_activeSession != null) {
+          _activeSession = _activeSession!.copyWith(
+            totalItemsPicked: sessionPickCount,
+          );
+        }
+      });
+    }
   }
 
   /// Calmly return back to PickerFlowScreen (Department / Unit selection) without requiring a PIN.
@@ -466,7 +664,7 @@ class _PickingScreenState extends State<PickingScreen> with WidgetsBindingObserv
     Navigator.of(context).pop();
   }
 
-  /// Close Session: marks CLOSED, auto-exports immediately (prompting for export folder if first time).
+  /// Close Session: marks session as CLOSED in SQLite (ready for Batch Super Export in Export Hub).
   Future<void> _handleCloseSession() async {
     if (_activeSession == null || _activeUnit == null) return;
 
@@ -482,12 +680,13 @@ class _PickingScreenState extends State<PickingScreen> with WidgetsBindingObserv
           children: [
             Icon(Icons.lock_clock_rounded, color: Color(0xFFE07B00), size: 24),
             SizedBox(width: 10),
-            Text('Close & Export Session?', style: TextStyle(color: AppTheme.textLight)),
+            Text('Close Picking Session?', style: TextStyle(color: AppTheme.textLight)),
           ],
         ),
         content: Text(
-          'This will close the current session for ${_activeSession!.workerName} and automatically export the file to Excel. '
-          'Status will update to EXPORTED.',
+          'Are you sure you want to close this picking session for ${_activeSession!.workerName}?\n\n'
+          'All progress will be saved in SQLite and the session will be marked as CLOSED, '
+          'ready for consolidated Batch Super Export in the Export Hub.',
           style: const TextStyle(color: AppTheme.textMuted),
         ),
         actions: [
@@ -498,7 +697,7 @@ class _PickingScreenState extends State<PickingScreen> with WidgetsBindingObserv
           ElevatedButton(
             style: ElevatedButton.styleFrom(backgroundColor: const Color(0xFFE07B00)),
             onPressed: () => Navigator.of(ctx).pop(true),
-            child: const Text('Close & Export'),
+            child: const Text('Close Session'),
           ),
         ],
       ),
@@ -507,117 +706,37 @@ class _PickingScreenState extends State<PickingScreen> with WidgetsBindingObserv
     if (confirmed != true || !mounted) return;
 
     final now = DateTime.now().millisecondsSinceEpoch;
-    final totalPicked = _activeUnit!.totalPicked;
+    final sessionPickCount = await widget.dbService.getSessionPickedPartCount(_activeSession!.id);
+    final effectivePicks = sessionPickCount > 0 ? sessionPickCount : (_activeSession?.totalItemsPicked ?? 0);
+    final unitTotalQty = _items.fold<double>(0.0, (sum, i) => sum + i.qtyPicked).round();
 
-    await widget.dbService.closeSession(_activeSession!.id, now, totalPicked);
-    LogService.picker('Session "${_activeSession!.id}" closed by "${_activeSession!.workerName}" on unit "${_activeUnit!.name}" with $totalPicked items picked');
+    final allPartIds = _items.map((i) => i.partId).toSet();
+    final allPartsDone = allPartIds.isNotEmpty && allPartIds.every((pid) {
+      final itemsForPart = _items.where((i) => i.partId == pid);
+      final totalDue = itemsForPart.fold<double>(0.0, (s, i) => s + i.qtyDue);
+      return totalDue <= 0.0001;
+    });
+    final isUnitComplete = allPartsDone || (unitTotalQty >= _activeUnit!.totalRequired && _activeUnit!.totalRequired > 0);
 
-    // Auto-export: check export directory or prompt user on first export
-    String? exportDir = await widget.dbService.getLastExportDir();
-    if ((exportDir == null || exportDir.isEmpty) && mounted) {
-      // First-time export prompt: ask picker/admin to choose destination directory
-      final pickFolder = await showDialog<bool>(
-        context: context,
-        barrierDismissible: false,
-        builder: (ctx) => AlertDialog(
-          backgroundColor: AppTheme.cardDark,
-          title: const Row(
-            children: [
-              Icon(Icons.folder_open_rounded, color: AppTheme.accentCyan),
-              SizedBox(width: 10),
-              Text('Select Export Folder', style: TextStyle(color: AppTheme.textLight, fontSize: 18)),
-            ],
-          ),
-          content: const Text(
-            'Export directory is not configured yet. Please select the folder where picklist files will be saved.',
-            style: TextStyle(color: AppTheme.textMuted),
-          ),
-          actions: [
-            TextButton(
-              onPressed: () => Navigator.of(ctx).pop(false),
-              child: const Text('Skip Export for Now'),
-            ),
-            ElevatedButton(
-              style: ElevatedButton.styleFrom(backgroundColor: AppTheme.primaryBlue),
-              onPressed: () => Navigator.of(ctx).pop(true),
-              child: const Text('Choose Folder'),
-            ),
-          ],
-        ),
-      );
+    final updatedUnit = _activeUnit!.copyWith(
+      totalPicked: unitTotalQty,
+      status: isUnitComplete ? 'FULLY_PICKED' : 'IN_PROGRESS',
+      completedAt: isUnitComplete ? now : null,
+      lastAccessedAt: now,
+    );
+    await widget.dbService.updateUnit(updatedUnit);
 
-      if (pickFolder == true) {
-        final selected = await FilePicker.getDirectoryPath();
-        if (selected != null && selected.isNotEmpty) {
-          await widget.dbService.setLastExportDir(selected);
-          exportDir = selected;
-        }
-      }
-    }
-
-    if (exportDir != null && exportDir.isNotEmpty && _activeUnit?.filePath != null) {
-      try {
-        final returnComments = await widget.dbService.getReturnCommentsForUnit(_activeUnit!.id);
-        final closedSession = _activeSession!.copyWith(
-          status: 'EXPORTED',
-          endTime: now,
-          totalItemsPicked: totalPicked,
-        );
-
-        final outputPath = p.join(
-          exportDir,
-          closedSession.buildExportFileName(_activeUnit!.name, customEndTime: now),
-        );
-
-        final finalPath = await widget.excelService.exportAndOverwrite(
-          originalFilePath: _activeUnit!.filePath,
-          items: _items,
-          session: closedSession,
-          unitName: _activeUnit!.name,
-          returnComments: returnComments,
-          outputPath: outputPath,
-        );
-
-        await widget.dbService.finishSession(
-          _activeSession!.id,
-          now,
-          totalPicked,
-          'Exported',
-        );
-
-        if (mounted) {
-          ScaffoldMessenger.of(context).showSnackBar(
-            SnackBar(
-              content: Text('Session EXPORTED successfully! Saved to: $finalPath'),
-              backgroundColor: AppTheme.statusComplete,
-              duration: const Duration(seconds: 4),
-            ),
-          );
-        }
-      } catch (e) {
-        if (mounted) {
-          ScaffoldMessenger.of(context).showSnackBar(
-            SnackBar(
-              content: Text('Auto-export failed: $e. Session saved as CLOSED.'),
-              backgroundColor: AppTheme.statusDanger,
-              duration: const Duration(seconds: 4),
-            ),
-          );
-        }
-      }
-    } else {
-      if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          const SnackBar(
-            content: Text('Session saved as CLOSED. You can export later from the Export Hub.'),
-            backgroundColor: Color(0xFFE07B00),
-            duration: const Duration(seconds: 3),
-          ),
-        );
-      }
-    }
+    await widget.dbService.closeSession(_activeSession!.id, now, effectivePicks);
+    LogService.picker('Session "${_activeSession!.id}" closed by "${_activeSession!.workerName}" on unit "${_activeUnit!.name}" with $effectivePicks items picked');
 
     if (mounted) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(
+          content: Text('Session CLOSED and saved! Ready for batch export in Export Hub.'),
+          backgroundColor: AppTheme.statusComplete,
+          duration: Duration(seconds: 3),
+        ),
+      );
       Navigator.of(context).popUntil((route) => route.isFirst);
     }
   }
@@ -637,10 +756,16 @@ class _PickingScreenState extends State<PickingScreen> with WidgetsBindingObserv
     }
 
     // List Mode (formerly "Accordion")
-    Set<String> activeDepts;
-    if (_activeDepartment != null) {
+    List<PicklistItem> itemsForTree;
+    Set<String>? activeDepts;
+    if (_isResourceScope) {
+      itemsForTree = _items.where(_itemMatchesActiveScope).toList();
+      activeDepts = null;
+    } else if (_activeDepartment != null) {
+      itemsForTree = _items.where(_itemMatchesActiveScope).toList();
       activeDepts = {_activeDepartment!};
     } else {
+      itemsForTree = _items;
       activeDepts = _departmentsMap.entries
           .where((e) => e.value == true)
           .map((e) => e.key)
@@ -648,9 +773,9 @@ class _PickingScreenState extends State<PickingScreen> with WidgetsBindingObserv
     }
 
     final treeNodes = GroupingEngine.buildTree(
-      items: _items,
+      items: itemsForTree,
       preset: _selectedPreset,
-      activeDepartments: activeDepts.isNotEmpty ? activeDepts : null,
+      activeDepartments: activeDepts,
       componentMapping: const {},
     );
 
@@ -679,7 +804,7 @@ class _PickingScreenState extends State<PickingScreen> with WidgetsBindingObserv
             if (_activeDepartment != null)
               Builder(
                 builder: (context) {
-                  final deptItems = _items.where((i) => i.department == _activeDepartment).toList();
+                  final deptItems = _items.where(_itemMatchesActiveScope).toList();
                   final deptPartIds = deptItems.map((i) => i.partId).toSet();
                   final deptTotalParts = deptPartIds.length;
                   final deptCompletedParts = deptPartIds.where((pid) {
@@ -695,12 +820,14 @@ class _PickingScreenState extends State<PickingScreen> with WidgetsBindingObserv
                   final deptTypeFromItems = deptItems.isNotEmpty
                       ? deptItems.first.deptType
                       : '';
-                  final autoType = deptTypeFromItems.isNotEmpty
-                      ? deptTypeFromItems
-                      : ((_activeDepartment?.toUpperCase().contains('MAIN') ?? false) ||
-                              (_activeDepartment?.toUpperCase().contains('MACG') ?? false)
-                          ? 'MAIN LINE'
-                          : 'SUBASSEMBLY');
+                  final autoType = _isResourceScope
+                      ? 'MAIN LINE RESOURCE'
+                      : (deptTypeFromItems.isNotEmpty
+                          ? deptTypeFromItems
+                          : ((_activeDepartment?.toUpperCase().contains('MAIN') ?? false) ||
+                                  (_activeDepartment?.toUpperCase().contains('MACG') ?? false)
+                              ? 'MAIN LINE'
+                              : 'SUBASSEMBLY'));
 
                   final pickDateRaw = deptItems.firstWhere(
                     (i) => i.pickDate.isNotEmpty,
@@ -729,20 +856,24 @@ class _PickingScreenState extends State<PickingScreen> with WidgetsBindingObserv
                       scrollDirection: Axis.horizontal,
                       child: Row(
                         children: [
-                          const Icon(Icons.apartment_rounded, size: 16, color: AppTheme.accentCyan),
+                          Icon(
+                            _isResourceScope ? Icons.precision_manufacturing_rounded : Icons.apartment_rounded,
+                            size: 16,
+                            color: AppTheme.accentCyan,
+                          ),
                           const SizedBox(width: 8),
                           // Dept type badge (MAIN LINE / SUBASSEMBLY)
                           Container(
                             padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
                             decoration: BoxDecoration(
-                              color: autoType == 'MAIN LINE'
-                                  ? const Color(0xFF0EA5E9).withOpacity(0.15)
-                                  : const Color(0xFFF97316).withOpacity(0.15),
+                              color: (_isResourceScope || autoType == 'MAIN LINE')
+                                  ? const Color(0xFF0EA5E9).withValues(alpha: 0.15)
+                                  : const Color(0xFFF97316).withValues(alpha: 0.15),
                               borderRadius: BorderRadius.circular(4),
                               border: Border.all(
-                                color: autoType == 'MAIN LINE'
-                                    ? const Color(0xFF0EA5E9).withOpacity(0.5)
-                                    : const Color(0xFFF97316).withOpacity(0.5),
+                                color: (_isResourceScope || autoType == 'MAIN LINE')
+                                    ? const Color(0xFF0EA5E9).withValues(alpha: 0.5)
+                                    : const Color(0xFFF97316).withValues(alpha: 0.5),
                               ),
                             ),
                             child: Text(
@@ -750,7 +881,7 @@ class _PickingScreenState extends State<PickingScreen> with WidgetsBindingObserv
                               style: TextStyle(
                                 fontSize: 9,
                                 fontWeight: FontWeight.bold,
-                                color: autoType == 'MAIN LINE'
+                                color: (_isResourceScope || autoType == 'MAIN LINE')
                                     ? const Color(0xFF0EA5E9)
                                     : const Color(0xFFF97316),
                               ),
@@ -758,7 +889,9 @@ class _PickingScreenState extends State<PickingScreen> with WidgetsBindingObserv
                           ),
                           const SizedBox(width: 8),
                           Text(
-                            'Department: $_activeDepartment',
+                            _isResourceScope
+                                ? 'Resource: $_targetResourceName (MAIN LINE)'
+                                : 'Department: $_activeDepartment',
                             style: const TextStyle(
                               fontSize: 13,
                               fontWeight: FontWeight.bold,
@@ -779,7 +912,7 @@ class _PickingScreenState extends State<PickingScreen> with WidgetsBindingObserv
                               ),
                             ),
                             child: Text(
-                              '$deptCompletedParts / $deptTotalParts parts ($deptPct%)',
+                              '${_isResourceScope ? "Resource" : "Dept"}: $deptCompletedParts / $deptTotalParts parts ($deptPct%)',
                               style: TextStyle(
                                 fontSize: 11,
                                 fontWeight: FontWeight.bold,
@@ -789,6 +922,82 @@ class _PickingScreenState extends State<PickingScreen> with WidgetsBindingObserv
                               ),
                             ),
                           ),
+                          if (_isResourceScope) ...[
+                            const SizedBox(width: 12),
+                            Container(
+                              decoration: BoxDecoration(
+                                color: AppTheme.cardDark,
+                                borderRadius: BorderRadius.circular(8),
+                                border: Border.all(color: AppTheme.borderDark),
+                              ),
+                              padding: const EdgeInsets.all(2),
+                              child: Row(
+                                mainAxisSize: MainAxisSize.min,
+                                children: [
+                                  InkWell(
+                                    onTap: () => _toggleCombineDepartments(true),
+                                    borderRadius: BorderRadius.circular(6),
+                                    child: Container(
+                                      padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+                                      decoration: BoxDecoration(
+                                        color: _combineDepartments ? AppTheme.primaryBlue : Colors.transparent,
+                                        borderRadius: BorderRadius.circular(6),
+                                      ),
+                                      child: Row(
+                                        mainAxisSize: MainAxisSize.min,
+                                        children: [
+                                          Icon(
+                                            Icons.merge_type_rounded,
+                                            size: 13,
+                                            color: _combineDepartments ? AppTheme.textLight : AppTheme.textMuted,
+                                          ),
+                                          const SizedBox(width: 4),
+                                          Text(
+                                            'Combined (All Depts)',
+                                            style: TextStyle(
+                                              fontSize: 11,
+                                              fontWeight: _combineDepartments ? FontWeight.bold : FontWeight.normal,
+                                              color: _combineDepartments ? AppTheme.textLight : AppTheme.textMuted,
+                                            ),
+                                          ),
+                                        ],
+                                      ),
+                                    ),
+                                  ),
+                                  InkWell(
+                                    onTap: () => _toggleCombineDepartments(false),
+                                    borderRadius: BorderRadius.circular(6),
+                                    child: Container(
+                                      padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+                                      decoration: BoxDecoration(
+                                        color: !_combineDepartments ? AppTheme.primaryBlue : Colors.transparent,
+                                        borderRadius: BorderRadius.circular(6),
+                                      ),
+                                      child: Row(
+                                        mainAxisSize: MainAxisSize.min,
+                                        children: [
+                                          Icon(
+                                            Icons.account_tree_rounded,
+                                            size: 13,
+                                            color: !_combineDepartments ? AppTheme.textLight : AppTheme.textMuted,
+                                          ),
+                                          const SizedBox(width: 4),
+                                          Text(
+                                            'By Department',
+                                            style: TextStyle(
+                                              fontSize: 11,
+                                              fontWeight: !_combineDepartments ? FontWeight.bold : FontWeight.normal,
+                                              color: !_combineDepartments ? AppTheme.textLight : AppTheme.textMuted,
+                                            ),
+                                          ),
+                                        ],
+                                      ),
+                                    ),
+                                  ),
+                                ],
+                              ),
+                            ),
+                          ],
                           if (pickDate.isNotEmpty) ...[
                             const SizedBox(width: 16),
                             const Icon(Icons.event_available_rounded, size: 15, color: AppTheme.statusPartial),

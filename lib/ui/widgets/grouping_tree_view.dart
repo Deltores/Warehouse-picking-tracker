@@ -135,9 +135,52 @@ class _TreeNodeWidgetState extends State<_TreeNodeWidget> {
     }
   }
 
+  int get _missingPartsCount {
+    if (widget.partFlags == null || widget.partFlags!.isEmpty) return 0;
+    final leafPartIds = widget.node.leafItems.map((i) => i.partId).toSet();
+    int count = 0;
+    for (final pid in leafPartIds) {
+      if (widget.partFlags![pid]?['flag_type']?.toString().toUpperCase() == 'MISSING') {
+        final items = widget.node.leafItems.where((i) => i.partId == pid);
+        final totalDue = items.fold<double>(0.0, (s, i) => s + i.qtyDue);
+        if (totalDue > 0.0001) {
+          count++;
+        }
+      }
+    }
+    return count;
+  }
+
   bool get _isMissing =>
       !widget.node.isComplete &&
-      widget.partFlags?[widget.node.label]?['flag_type']?.toString().toUpperCase() == 'MISSING';
+      ((widget.partFlags?[widget.node.label]?['flag_type']?.toString().toUpperCase() == 'MISSING') ||
+          _missingPartsCount > 0);
+
+  Widget _buildMissingBadge(int count) {
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 3),
+      decoration: BoxDecoration(
+        color: AppTheme.statusDanger.withValues(alpha: 0.15),
+        borderRadius: BorderRadius.circular(6),
+        border: Border.all(color: AppTheme.statusDanger.withValues(alpha: 0.6)),
+      ),
+      child: Row(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          const Icon(Icons.warning_amber_rounded, size: 13, color: AppTheme.statusDanger),
+          const SizedBox(width: 3),
+          Text(
+            '$count MISSING',
+            style: const TextStyle(
+              fontSize: 11,
+              fontWeight: FontWeight.bold,
+              color: AppTheme.statusDanger,
+            ),
+          ),
+        ],
+      ),
+    );
+  }
 
   Color _getStatusColor() {
     if (_isMissing) return AppTheme.statusDanger;
@@ -147,17 +190,29 @@ class _TreeNodeWidgetState extends State<_TreeNodeWidget> {
   }
 
   /// Whether this level should always be expanded and not collapsible by the user.
-  /// Unit (depth 0) and Department (depth 1) are pre-selected in picker flow.
-  bool get _isAlwaysExpanded =>
-      widget.node.level == GroupLevel.unit || widget.node.level == GroupLevel.department;
+  /// Unit (depth 0) and top-level container (depth <= 1).
+  /// In By Department Whole Resource mode, Department is at depth > 1 and is COLLAPSIBLE!
+  bool get _isAlwaysExpanded {
+    if (widget.node.level == GroupLevel.unit) return true;
+    if (widget.node.level == GroupLevel.resourceId && widget.depth <= 1) return true;
+    if (widget.node.level == GroupLevel.department && widget.depth <= 1) return true;
+    return false;
+  }
 
   /// Whether to show the Pick Mode button inline on this branch node.
-  /// Shows on Resource ID level, Line level, or on direct parent of leaves.
-  bool get _showPickModeButton =>
-      (widget.onPickModeFromNode != null || widget.onPickModeFromLine != null) &&
-      (widget.node.level == GroupLevel.line ||
-          widget.node.level == GroupLevel.resourceId ||
-          widget.node.children.any((c) => c.isLeaf));
+  /// In By Department mode, Resource ID contains Department children -> NO Pick Mode on Resource ID!
+  /// Pick Mode button is shown on Department nodes (which contain leaf parts).
+  /// In Combined mode, Resource ID contains leaf parts -> Pick Mode IS shown on Resource ID.
+  bool get _showPickModeButton {
+    if (widget.onPickModeFromNode == null && widget.onPickModeFromLine == null) return false;
+    if (widget.node.level == GroupLevel.resourceId &&
+        widget.node.children.any((c) => c.level == GroupLevel.department)) {
+      return false;
+    }
+    return widget.node.level == GroupLevel.line ||
+        widget.node.level == GroupLevel.resourceId ||
+        widget.node.children.any((c) => c.isLeaf);
+  }
 
   @override
   Widget build(BuildContext context) {
@@ -195,7 +250,11 @@ class _TreeNodeWidgetState extends State<_TreeNodeWidget> {
               child: Row(
                 children: [
                   Icon(
-                    widget.node.level == GroupLevel.unit ? Icons.inventory_2_rounded : Icons.apartment_rounded,
+                    widget.node.level == GroupLevel.unit
+                        ? Icons.inventory_2_rounded
+                        : (widget.node.level == GroupLevel.resourceId
+                            ? Icons.precision_manufacturing_rounded
+                            : Icons.apartment_rounded),
                     size: 18,
                     color: AppTheme.accentCyan,
                   ),
@@ -212,6 +271,10 @@ class _TreeNodeWidgetState extends State<_TreeNodeWidget> {
                     ),
                   ),
                   const SizedBox(width: 10),
+                  if (_missingPartsCount > 0) ...[
+                    _buildMissingBadge(_missingPartsCount),
+                    const SizedBox(width: 8),
+                  ],
                   // Progress badge
                   Container(
                     padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
@@ -229,6 +292,30 @@ class _TreeNodeWidgetState extends State<_TreeNodeWidget> {
                       ),
                     ),
                   ),
+                  if (_showPickModeButton) ...[
+                    const SizedBox(width: 8),
+                    ElevatedButton.icon(
+                      style: ElevatedButton.styleFrom(
+                        backgroundColor: AppTheme.primaryBlue,
+                        foregroundColor: Colors.white,
+                        padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 8),
+                        minimumSize: const Size(100, 36),
+                        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(8)),
+                        elevation: 2,
+                      ),
+                      icon: const Icon(Icons.bolt_rounded, size: 16),
+                      label: const Text('Pick Mode', style: TextStyle(fontSize: 12, fontWeight: FontWeight.bold)),
+                      onPressed: () {
+                        if (widget.onPickModeFromNode != null) {
+                          widget.onPickModeFromNode!(widget.node);
+                        } else {
+                          widget.onPickModeFromLine?.call(
+                            widget.node.level == GroupLevel.line ? widget.node.label : null,
+                          );
+                        }
+                      },
+                    ),
+                  ],
                 ],
               ),
             ),
@@ -355,6 +442,10 @@ class _TreeNodeWidgetState extends State<_TreeNodeWidget> {
           trailing: Row(
             mainAxisSize: MainAxisSize.min,
             children: [
+              if (_missingPartsCount > 0) ...[
+                _buildMissingBadge(_missingPartsCount),
+                const SizedBox(width: 8),
+              ],
               Container(
                 padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
                 decoration: BoxDecoration(
@@ -491,31 +582,70 @@ class _TreeNodeWidgetState extends State<_TreeNodeWidget> {
                         );
                       }),
                     ],
-                    if (widget.node.partDescription != null && widget.node.partDescription!.isNotEmpty) ...[
-                      const SizedBox(height: 2),
-                      Text(
-                        widget.node.partDescription!,
-                        style: const TextStyle(fontSize: 13, color: AppTheme.textMuted),
-                        maxLines: 1,
-                        overflow: TextOverflow.ellipsis,
-                      ),
-                    ],
-                    if (onHandInfo.isNotEmpty) ...[
+                    if ((widget.node.partDescription != null && widget.node.partDescription!.isNotEmpty) || onHandInfo.isNotEmpty) ...[
                       const SizedBox(height: 3),
-                      Row(
+                      Wrap(
+                        crossAxisAlignment: WrapCrossAlignment.center,
+                        spacing: 8,
+                        runSpacing: 4,
                         children: [
-                          const Icon(Icons.location_on_outlined, size: 13, color: AppTheme.accentCyan),
-                          const SizedBox(width: 4),
-                          Flexible(
-                            child: Text(
-                              'ON-HAND: $onHandInfo',
-                              style: const TextStyle(fontSize: 12, color: AppTheme.accentCyan, fontWeight: FontWeight.w500),
+                          if (widget.node.partDescription != null && widget.node.partDescription!.isNotEmpty)
+                            Text(
+                              widget.node.partDescription!,
+                              style: const TextStyle(fontSize: 13, color: AppTheme.textMuted),
+                              maxLines: 2,
                               overflow: TextOverflow.ellipsis,
                             ),
-                          ),
+                          if (onHandInfo.isNotEmpty)
+                            Container(
+                              padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
+                              decoration: BoxDecoration(
+                                color: AppTheme.accentCyan.withValues(alpha: 0.12),
+                                borderRadius: BorderRadius.circular(4),
+                                border: Border.all(color: AppTheme.accentCyan.withValues(alpha: 0.4)),
+                              ),
+                              child: Row(
+                                mainAxisSize: MainAxisSize.min,
+                                children: [
+                                  const Icon(Icons.location_on_rounded, size: 12, color: AppTheme.accentCyan),
+                                  const SizedBox(width: 3),
+                                  Text(
+                                    'ON-HAND: $onHandInfo',
+                                    style: const TextStyle(
+                                      fontSize: 11,
+                                      color: AppTheme.accentCyan,
+                                      fontWeight: FontWeight.bold,
+                                    ),
+                                  ),
+                                ],
+                              ),
+                            ),
                         ],
                       ),
                     ],
+                    Builder(builder: (_) {
+                      final depts = widget.node.leafItems
+                          .map((i) => i.department.trim())
+                          .where((d) => d.isNotEmpty)
+                          .toSet();
+                      if (depts.isEmpty) return const SizedBox.shrink();
+                      return Padding(
+                        padding: const EdgeInsets.only(top: 3),
+                        child: Row(
+                          children: [
+                            const Icon(Icons.domain_rounded, size: 13, color: Color(0xFF0EA5E9)),
+                            const SizedBox(width: 4),
+                            Flexible(
+                              child: Text(
+                                'Dept: ${depts.join(', ')}',
+                                style: const TextStyle(fontSize: 11, color: Color(0xFF0EA5E9), fontWeight: FontWeight.w600),
+                                overflow: TextOverflow.ellipsis,
+                              ),
+                            ),
+                          ],
+                        ),
+                      );
+                    }),
                     if (widget.node.leafItems.length > 1) ...[
                       const SizedBox(height: 4),
                       Text(

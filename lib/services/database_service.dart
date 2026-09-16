@@ -49,7 +49,7 @@ class DatabaseService implements LogDatabase {
     return await factory.openDatabase(
       dbPath,
       options: OpenDatabaseOptions(
-        version: 8,
+        version: 11,
         onCreate: _onCreate,
         onUpgrade: _onUpgrade,
         onOpen: (db) async {
@@ -121,8 +121,10 @@ class DatabaseService implements LogDatabase {
         end_time INTEGER,
         pick_date TEXT NOT NULL,
         status TEXT NOT NULL DEFAULT 'ACTIVE',
-        issued_status TEXT NOT NULL DEFAULT 'Pending',
+        issued_status TEXT NOT NULL DEFAULT 'Pending Issue',
         total_items_picked INTEGER NOT NULL DEFAULT 0,
+        batch_id TEXT NOT NULL DEFAULT '',
+        issued_at INTEGER,
         FOREIGN KEY(unit_id) REFERENCES units(id) ON DELETE CASCADE
       );
     ''');
@@ -191,6 +193,22 @@ class DatabaseService implements LogDatabase {
     ''');
     await db.execute("CREATE INDEX IF NOT EXISTS idx_app_logs_timestamp ON app_logs(timestamp);");
     await db.execute("CREATE INDEX IF NOT EXISTS idx_app_logs_level ON app_logs(level);");
+
+    // Session picks table for tracking parts picked in specific sessions
+    await db.execute('''
+      CREATE TABLE IF NOT EXISTS session_picks (
+        id TEXT PRIMARY KEY,
+        session_id TEXT NOT NULL,
+        unit_id TEXT NOT NULL,
+        item_id TEXT NOT NULL,
+        part_id TEXT NOT NULL,
+        qty_picked REAL NOT NULL,
+        created_at INTEGER NOT NULL,
+        FOREIGN KEY(session_id) REFERENCES sessions(id) ON DELETE CASCADE
+      );
+    ''');
+    await db.execute("CREATE INDEX IF NOT EXISTS idx_session_picks_session ON session_picks(session_id);");
+    await db.execute("CREATE INDEX IF NOT EXISTS idx_session_picks_part ON session_picks(session_id, part_id);");
   }
 
   Future<void> _onUpgrade(Database db, int oldVersion, int newVersion) async {
@@ -258,6 +276,28 @@ class DatabaseService implements LogDatabase {
     if (oldVersion < 8) {
       await db.execute("UPDATE admin_config SET value = '9999' WHERE key = 'super_admin_pin' AND value = '7777';");
     }
+    if (oldVersion < 9) {
+      await db.execute("ALTER TABLE sessions ADD COLUMN batch_id TEXT NOT NULL DEFAULT '';");
+    }
+    if (oldVersion < 10) {
+      await db.execute("ALTER TABLE sessions ADD COLUMN issued_at INTEGER;");
+    }
+    if (oldVersion < 11) {
+      await db.execute('''
+        CREATE TABLE IF NOT EXISTS session_picks (
+          id TEXT PRIMARY KEY,
+          session_id TEXT NOT NULL,
+          unit_id TEXT NOT NULL,
+          item_id TEXT NOT NULL,
+          part_id TEXT NOT NULL,
+          qty_picked REAL NOT NULL,
+          created_at INTEGER NOT NULL,
+          FOREIGN KEY(session_id) REFERENCES sessions(id) ON DELETE CASCADE
+        );
+      ''');
+      await db.execute("CREATE INDEX IF NOT EXISTS idx_session_picks_session ON session_picks(session_id);");
+      await db.execute("CREATE INDEX IF NOT EXISTS idx_session_picks_part ON session_picks(session_id, part_id);");
+    }
   }
 
   // --- UNIT OPERATIONS ---
@@ -313,6 +353,207 @@ class DatabaseService implements LogDatabase {
     );
   }
 
+  /// Checks whether there is previous picking history or a soft-deleted record for this unit name / file name.
+  /// Used during Excel import to detect accidental unit deletion and restore historical picks.
+  Future<Map<String, dynamic>> findUnitHistory(String unitId, {String filePath = ''}) async {
+    final db = await database;
+    final fileBase = filePath.isNotEmpty ? p.basenameWithoutExtension(filePath) : unitId;
+
+    // Check if unit exists in 'units' table (active or soft-deleted)
+    final unitMaps = await db.query(
+      'units',
+      where: 'LOWER(id) = ? OR LOWER(name) = ? OR LOWER(id) = ? OR LOWER(name) = ?',
+      whereArgs: [unitId.toLowerCase(), unitId.toLowerCase(), fileBase.toLowerCase(), fileBase.toLowerCase()],
+      limit: 1,
+    );
+
+    UnitRecord? existingUnit;
+    String matchedUnitId = unitId;
+    if (unitMaps.isNotEmpty) {
+      existingUnit = UnitRecord.fromMap(unitMaps.first);
+      matchedUnitId = existingUnit.id;
+    }
+
+    // Query historical sessions for this unitId
+    final sessionMaps = await db.query(
+      'sessions',
+      where: 'LOWER(unit_id) = ? OR LOWER(unit_id) = ?',
+      whereArgs: [unitId.toLowerCase(), matchedUnitId.toLowerCase()],
+      orderBy: 'start_time DESC',
+    );
+    final sessions = sessionMaps.map((m) => SessionMetadata.fromMap(m)).toList();
+
+    // Query distinct picked parts and total quantity from session_picks
+    final pickRows = await db.rawQuery('''
+      SELECT COUNT(DISTINCT part_id) as distinct_parts,
+             COALESCE(SUM(qty_picked), 0.0) as total_qty
+      FROM session_picks
+      WHERE LOWER(unit_id) = ? OR LOWER(unit_id) = ?
+    ''', [unitId.toLowerCase(), matchedUnitId.toLowerCase()]);
+
+    int distinctPickedParts = 0;
+    double totalPickedQty = 0.0;
+    if (pickRows.isNotEmpty) {
+      distinctPickedParts = (pickRows.first['distinct_parts'] as num?)?.toInt() ?? 0;
+      totalPickedQty = (pickRows.first['total_qty'] as num?)?.toDouble() ?? 0.0;
+    }
+
+    // Also check picklist_items table if any items still remain in DB
+    final itemRows = await db.rawQuery('''
+      SELECT COUNT(DISTINCT part_id) as distinct_parts,
+             COALESCE(SUM(qty_picked), 0.0) as total_qty
+      FROM picklist_items
+      WHERE (LOWER(unit_id) = ? OR LOWER(unit_id) = ?) AND qty_picked > 0
+    ''', [unitId.toLowerCase(), matchedUnitId.toLowerCase()]);
+    if (itemRows.isNotEmpty) {
+      final itemParts = (itemRows.first['distinct_parts'] as num?)?.toInt() ?? 0;
+      final itemQty = (itemRows.first['total_qty'] as num?)?.toDouble() ?? 0.0;
+      if (itemParts > distinctPickedParts) distinctPickedParts = itemParts;
+      if (itemQty > totalPickedQty) totalPickedQty = itemQty;
+    }
+
+    final workers = sessions.map((s) => s.workerName.trim()).where((w) => w.isNotEmpty).toSet().toList();
+    final isDeleted = existingUnit != null && existingUnit.deletedAt != null;
+    final hasHistory = sessions.isNotEmpty || distinctPickedParts > 0 || isDeleted;
+
+    return {
+      'hasHistory': hasHistory,
+      'isDeleted': isDeleted,
+      'matchedUnitId': matchedUnitId,
+      'unit': existingUnit,
+      'sessions': sessions,
+      'distinctPickedParts': distinctPickedParts,
+      'totalPickedQty': totalPickedQty,
+      'workers': workers,
+    };
+  }
+
+  /// Restores past picking progress onto freshly parsed picklist items when re-importing a previously deleted unit.
+  /// Restores picked quantities from SQLite `session_picks` and previous item records,
+  /// clears deleted_at, updates unit status, and reconnects the unit to its historical sessions.
+  Future<UnitRecord> restoreUnitWithPicks({
+    required UnitRecord unit,
+    required List<PicklistItem> parsedItems,
+    required List<String> departments,
+  }) async {
+    final db = await database;
+    final now = DateTime.now().millisecondsSinceEpoch;
+    final unitId = unit.id;
+
+    return await db.transaction((txn) async {
+      // 1. Collect historical picks by part_id from session_picks
+      final sessionPickRows = await txn.rawQuery('''
+        SELECT part_id, COALESCE(SUM(qty_picked), 0.0) as sum_picked
+        FROM session_picks
+        WHERE LOWER(unit_id) = ?
+        GROUP BY part_id
+      ''', [unitId.toLowerCase()]);
+
+      final historicalPartPicks = <String, double>{};
+      for (final r in sessionPickRows) {
+        final pid = r['part_id']?.toString() ?? '';
+        final qp = (r['sum_picked'] as num?)?.toDouble() ?? 0.0;
+        if (pid.isNotEmpty && qp > 0) {
+          historicalPartPicks[pid] = qp;
+        }
+      }
+
+      // Also check existing picklist_items table in case picks were recorded there
+      final existingItemRows = await txn.query(
+        'picklist_items',
+        columns: ['work_order', 'part_id', 'row_order', 'qty_picked'],
+        where: 'LOWER(unit_id) = ? AND qty_picked > 0',
+        whereArgs: [unitId.toLowerCase()],
+      );
+      final exactPickedMap = <String, double>{};
+      for (final r in existingItemRows) {
+        final wo = r['work_order']?.toString() ?? '';
+        final pid = r['part_id']?.toString() ?? '';
+        final ro = r['row_order']?.toString() ?? '';
+        final qp = (r['qty_picked'] as num?)?.toDouble() ?? 0.0;
+        exactPickedMap['${wo}__${pid}__$ro'] = qp;
+        if ((historicalPartPicks[pid] ?? 0.0) < qp) {
+          historicalPartPicks[pid] = qp;
+        }
+      }
+
+      // 2. Allocate historical picks onto the new parsed items
+      final remainingPicks = Map<String, double>.from(historicalPartPicks);
+      final itemsToInsert = <PicklistItem>[];
+      double totalRestored = 0.0;
+
+      for (final item in parsedItems) {
+        double restoredQty = item.qtyPicked;
+        final exactKey = '${item.workOrder}__${item.partId}__${item.rowOrder}';
+
+        if (exactPickedMap.containsKey(exactKey)) {
+          restoredQty = exactPickedMap[exactKey]!;
+        } else if (remainingPicks.containsKey(item.partId) && remainingPicks[item.partId]! > 0) {
+          final available = remainingPicks[item.partId]!;
+          restoredQty = available > item.qtyRequired ? item.qtyRequired : available;
+          remainingPicks[item.partId] = (available - restoredQty).clamp(0.0, double.infinity);
+        }
+
+        totalRestored += restoredQty;
+        final due = (item.qtyRequired - restoredQty).clamp(0.0, item.qtyRequired);
+        itemsToInsert.add(item.copyWith(
+          qtyPicked: restoredQty,
+          qtyDue: due,
+        ));
+      }
+
+      // 3. Replace picklist_items
+      await txn.delete('picklist_items', where: 'LOWER(unit_id) = ?', whereArgs: [unitId.toLowerCase()]);
+      final batch = txn.batch();
+      for (final it in itemsToInsert) {
+        batch.insert('picklist_items', it.toMap());
+      }
+      await batch.commit(noResult: true);
+
+      // 4. Save departments
+      await txn.delete('departments', where: 'LOWER(unit_id) = ?', whereArgs: [unitId.toLowerCase()]);
+      final deptBatch = txn.batch();
+      for (final d in departments) {
+        deptBatch.insert('departments', {
+          'unit_id': unitId,
+          'name': d,
+          'is_active': 1,
+        });
+      }
+      await deptBatch.commit(noResult: true);
+
+      // 5. Re-link historical sessions and session picks to this unitId
+      await txn.update(
+        'sessions',
+        {'unit_id': unitId},
+        where: 'LOWER(unit_id) = ?',
+        whereArgs: [unitId.toLowerCase()],
+      );
+      await txn.update(
+        'session_picks',
+        {'unit_id': unitId},
+        where: 'LOWER(unit_id) = ?',
+        whereArgs: [unitId.toLowerCase()],
+      );
+
+      // 6. Save active unit record (clear deleted_at)
+      final totalReq = parsedItems.fold<double>(0.0, (s, i) => s + i.qtyRequired).round();
+      final restoredUnit = unit.copyWith(
+        filePath: unit.filePath,
+        totalRequired: totalReq,
+        totalPicked: totalRestored.round(),
+        status: (totalRestored >= totalReq && totalReq > 0) ? 'FULLY_PICKED' : 'IN_PROGRESS',
+        lastAccessedAt: now,
+        clearDeletedAt: true,
+      );
+
+      await txn.insert('units', restoredUnit.toMap(), conflictAlgorithm: ConflictAlgorithm.replace);
+      LogService.admin('Unit "${unit.name}" recovered with $totalRestored picked pcs across ${itemsToInsert.length} items');
+
+      return restoredUnit;
+    });
+  }
+
   /// Permanently removes units (and cascade-deletes their sessions and items)
   /// that have been soft-deleted for more than [retentionDays] days (default 30 days).
   Future<int> purgeExpiredDeletedUnits({int retentionDays = 30}) async {
@@ -331,12 +572,24 @@ class DatabaseService implements LogDatabase {
       await db.transaction((txn) async {
         await txn.delete('picklist_items', where: 'unit_id = ?', whereArgs: [uid]);
         await txn.delete('departments', where: 'unit_id = ?', whereArgs: [uid]);
-        await txn.delete('sessions', where: 'unit_id = ?', whereArgs: [uid]);
+        // Note: Sessions are NOT deleted on unit expiration!
+        // Sessions are retained for 60 days after being marked as ISSUED.
         await txn.delete('units', where: 'id = ?', whereArgs: [uid]);
       });
       purgedCount++;
     }
     return purgedCount;
+  }
+
+  /// Permanently removes sessions marked as ISSUED older than [retentionDays] days (default 60 days).
+  Future<int> purgeExpiredIssuedSessions({int retentionDays = 60}) async {
+    final db = await database;
+    final cutoff = DateTime.now().subtract(Duration(days: retentionDays)).millisecondsSinceEpoch;
+    return await db.delete(
+      'sessions',
+      where: "status = 'ISSUED' AND ((issued_at IS NOT NULL AND issued_at < ?) OR (issued_at IS NULL AND end_time IS NOT NULL AND end_time < ?))",
+      whereArgs: [cutoff, cutoff],
+    );
   }
 
   Future<void> clearAllData() async {
@@ -693,16 +946,20 @@ class DatabaseService implements LogDatabase {
   }
 
   /// Marks a session as EXPORTED — file has been successfully written to disk.
-  Future<void> finishSession(String sessionId, int endTime, int totalPicked, String issuedStatus) async {
+  Future<void> finishSession(String sessionId, int endTime, int totalPicked, String issuedStatus, {String? batchId}) async {
     final db = await database;
+    final updates = <String, dynamic>{
+      'end_time': endTime,
+      'status': 'EXPORTED',
+      'issued_status': issuedStatus,
+      'total_items_picked': totalPicked,
+    };
+    if (batchId != null) {
+      updates['batch_id'] = batchId;
+    }
     await db.update(
       'sessions',
-      {
-        'end_time': endTime,
-        'status': 'EXPORTED',
-        'issued_status': issuedStatus,
-        'total_items_picked': totalPicked,
-      },
+      updates,
       where: 'id = ?',
       whereArgs: [sessionId],
     );
@@ -712,39 +969,64 @@ class DatabaseService implements LogDatabase {
   /// CLOSED sessions appear in the export list and block re-opening.
   Future<void> closeSession(String sessionId, int endTime, int totalPicked) async {
     final db = await database;
-    await db.update(
-      'sessions',
-      {
-        'end_time': endTime,
-        'status': 'CLOSED',
-        'total_items_picked': totalPicked,
-      },
-      where: 'id = ?',
-      whereArgs: [sessionId],
-    );
+    await db.rawUpdate('''
+      UPDATE sessions
+      SET end_time = ?,
+          status = 'CLOSED',
+          total_items_picked = MAX(total_items_picked, ?)
+      WHERE id = ?
+    ''', [endTime, totalPicked, sessionId]);
   }
 
   /// Closes all active or open sessions across all units.
   Future<void> closeAllActiveSessions({int? endTime}) async {
     final db = await database;
     final now = endTime ?? DateTime.now().millisecondsSinceEpoch;
-    await db.update(
+    final activeSessions = await db.query(
       'sessions',
-      {
-        'end_time': now,
-        'status': 'CLOSED',
-      },
       where: 'status = ? OR status = ?',
       whereArgs: ['ACTIVE', 'OPEN'],
     );
+    for (final s in activeSessions) {
+      final sId = s['id']?.toString() ?? '';
+      final unitId = s['unit_id']?.toString() ?? '';
+      int currentPicked = (s['total_items_picked'] as num?)?.toInt() ?? 0;
+      if (currentPicked <= 0 && unitId.isNotEmpty) {
+        final res = await db.rawQuery(
+          'SELECT COUNT(DISTINCT part_id) as cnt FROM picklist_items WHERE unit_id = ? AND qty_picked > 0.0001',
+          [unitId],
+        );
+        final cnt = (res.first['cnt'] as num?)?.toInt() ?? 0;
+        if (cnt > 0) {
+          currentPicked = cnt;
+        }
+      }
+      await db.update(
+        'sessions',
+        {
+          'end_time': now,
+          'status': 'CLOSED',
+          'total_items_picked': currentPicked,
+        },
+        where: 'id = ?',
+        whereArgs: [sId],
+      );
+    }
   }
 
   /// Admin action: mark a CLOSED or EXPORTED session as ISSUED.
-  Future<void> updateSessionIssuedStatus(String sessionId, String status) async {
+  Future<void> updateSessionIssuedStatus(String sessionId, String status, {int? issuedAt}) async {
     final db = await database;
+    final updates = <String, dynamic>{
+      'status': status,
+      'issued_status': status == 'ISSUED' ? 'Issued' : 'Pending Issue',
+    };
+    if (status == 'ISSUED') {
+      updates['issued_at'] = issuedAt ?? DateTime.now().millisecondsSinceEpoch;
+    }
     await db.update(
       'sessions',
-      {'status': status, 'issued_status': status == 'ISSUED' ? 'Issued' : 'Pending'},
+      updates,
       where: 'id = ?',
       whereArgs: [sessionId],
     );
@@ -770,20 +1052,48 @@ class DatabaseService implements LogDatabase {
   /// Deletes a session that has zero picks (abandoned empty session).
   Future<void> deleteEmptySession(String sessionId) async {
     final db = await database;
+    // Safety check: before deleting, verify that NO items were picked for its unit
+    final sessRows = await db.query('sessions', where: 'id = ?', whereArgs: [sessionId]);
+    if (sessRows.isNotEmpty) {
+      final unitId = sessRows.first['unit_id']?.toString() ?? '';
+      if (unitId.isNotEmpty) {
+        final pickRes = await db.rawQuery(
+          'SELECT COUNT(DISTINCT part_id) as cnt FROM picklist_items WHERE unit_id = ? AND qty_picked > 0.0001',
+          [unitId],
+        );
+        final cnt = (pickRes.first['cnt'] as num?)?.toInt() ?? 0;
+        if (cnt > 0) {
+          // Picks exist on this unit! Do not delete — update total_items_picked and keep CLOSED
+          await db.update('sessions', {'total_items_picked': cnt, 'status': 'CLOSED'}, where: 'id = ?', whereArgs: [sessionId]);
+          return;
+        }
+      }
+    }
     await db.delete('sessions', where: 'id = ? AND total_items_picked = 0', whereArgs: [sessionId]);
   }
 
-  /// Returns next sequential session number for a unit (1..9999 wrapping).
-  /// Monotonically increases and never decrements even if previous sessions are deleted.
-  Future<int> nextSessionSeqNo(String unitId) async {
+  /// Permanently deletes specific sessions by IDs (e.g. cleaning up test or legacy batches).
+  Future<void> deleteSessions(List<String> sessionIds) async {
+    if (sessionIds.isEmpty) return;
     final db = await database;
-    final configKey = 'last_seq_no_$unitId';
+    final placeholders = List.filled(sessionIds.length, '?').join(',');
+    await db.delete(
+      'sessions',
+      where: 'id IN ($placeholders)',
+      whereArgs: sessionIds,
+    );
+  }
+
+  /// Returns next sequential session number globally for the tablet (1..9999 wrapping).
+  /// Monotonically increases across all units so session numbers never duplicate.
+  Future<int> nextSessionSeqNo([String? unitId]) async {
+    final db = await database;
+    const configKey = 'global_last_session_seq_no';
     final savedValStr = await getConfig(configKey);
     final savedVal = int.tryParse(savedValStr ?? '') ?? 0;
 
     final result = await db.rawQuery(
-      'SELECT MAX(session_seq_no) as mx FROM sessions WHERE unit_id = ?',
-      [unitId],
+      'SELECT MAX(session_seq_no) as mx FROM sessions',
     );
     final dbMax = (result.first['mx'] as num?)?.toInt() ?? 0;
 
@@ -791,7 +1101,42 @@ class DatabaseService implements LogDatabase {
     final next = current >= 9999 ? 1 : current + 1;
 
     await setConfig(configKey, next.toString());
+    if (unitId != null && unitId.isNotEmpty) {
+      await setConfig('last_seq_no_$unitId', next.toString());
+    }
     return next;
+  }
+
+  /// Returns the total count of distinct parts flagged as MISSING for a unit.
+  Future<int> getUnitMissingPartsCount(String unitId) async {
+    final db = await database;
+    final res = await db.rawQuery(
+      "SELECT COUNT(DISTINCT part_id) as cnt FROM part_flags WHERE unit_id = ? AND UPPER(flag_type) = 'MISSING'",
+      [unitId],
+    );
+    return (res.first['cnt'] as num?)?.toInt() ?? 0;
+  }
+
+  /// Returns pick statistics for a unit:
+  /// - picked_parts: distinct part IDs with qty_picked > 0.0001 (partially or fully picked)
+  /// - total_parts: distinct part IDs in the entire picklist for this unit
+  /// - total_pieces: sum of qty_picked across all items
+  Future<Map<String, num>> getUnitPartPickStats(String unitId) async {
+    final db = await database;
+    final res = await db.rawQuery('''
+      SELECT 
+        COUNT(DISTINCT CASE WHEN qty_picked > 0.0001 THEN part_id END) as picked_parts,
+        COUNT(DISTINCT part_id) as total_parts,
+        COALESCE(SUM(qty_picked), 0.0) as total_pieces
+      FROM picklist_items
+      WHERE unit_id = ?
+    ''', [unitId]);
+    if (res.isEmpty) return {'picked_parts': 0, 'total_parts': 0, 'total_pieces': 0.0};
+    return {
+      'picked_parts': (res.first['picked_parts'] as num?)?.toInt() ?? 0,
+      'total_parts': (res.first['total_parts'] as num?)?.toInt() ?? 0,
+      'total_pieces': (res.first['total_pieces'] as num?)?.toDouble() ?? 0.0,
+    };
   }
 
   /// Auto-closes sessions older than 13 hours that are still ACTIVE.
@@ -836,28 +1181,52 @@ class DatabaseService implements LogDatabase {
     return maps.map((m) => SessionMetadata.fromMap(m)).toList();
   }
 
-  /// Returns all sessions across all units that are CLOSED or FINISHED with picks > 0.
+  /// Returns all sessions for a unit that are CLOSED or FINISHED.
   /// Used by the session export screen.
   Future<List<SessionMetadata>> getExportableSessionsForUnit(String unitId) async {
     final db = await database;
     final maps = await db.query(
       'sessions',
-      where: 'unit_id = ? AND total_items_picked > 0 AND (status = ? OR status = ?)',
-      whereArgs: [unitId, 'CLOSED', 'FINISHED'],
+      where: "unit_id = ? AND status IN ('CLOSED', 'FINISHED')",
+      whereArgs: [unitId],
       orderBy: 'start_time DESC',
     );
-    return maps.map((m) => SessionMetadata.fromMap(m)).toList();
+    final list = <SessionMetadata>[];
+    for (final m in maps) {
+      var sess = SessionMetadata.fromMap(m);
+      if (sess.totalItemsPicked <= 0) {
+        final cnt = await getSessionPickedPartCount(sess.id);
+        if (cnt > 0) {
+          sess = sess.copyWith(totalItemsPicked: cnt);
+          await db.update('sessions', {'total_items_picked': cnt}, where: 'id = ?', whereArgs: [sess.id]);
+        }
+      }
+      list.add(sess);
+    }
+    return list;
   }
 
-  /// Returns all sessions across ALL units that are CLOSED/EXPORTED/ISSUED with picks > 0.
+  /// Returns all sessions across ALL units that are CLOSED/EXPORTED/ISSUED.
   Future<List<SessionMetadata>> getAllExportableSessions() async {
     final db = await database;
     final maps = await db.query(
       'sessions',
-      where: "total_items_picked > 0 AND (status = 'CLOSED' OR status = 'EXPORTED' OR status = 'FINISHED' OR status = 'ISSUED')",
+      where: "status IN ('CLOSED', 'EXPORTED', 'FINISHED', 'ISSUED')",
       orderBy: 'start_time DESC',
     );
-    return maps.map((m) => SessionMetadata.fromMap(m)).toList();
+    final list = <SessionMetadata>[];
+    for (final m in maps) {
+      var sess = SessionMetadata.fromMap(m);
+      if (sess.totalItemsPicked <= 0) {
+        final cnt = await getSessionPickedPartCount(sess.id);
+        if (cnt > 0) {
+          sess = sess.copyWith(totalItemsPicked: cnt);
+          await db.update('sessions', {'total_items_picked': cnt}, where: 'id = ?', whereArgs: [sess.id]);
+        }
+      }
+      list.add(sess);
+    }
+    return list;
   }
 
 
@@ -1039,15 +1408,36 @@ class DatabaseService implements LogDatabase {
     };
   }
 
+  String _buildMainLineResourceExcludeSql(List<String> mainLineResourcePicks) {
+    if (mainLineResourcePicks.isEmpty) return '';
+    final conditions = <String>[];
+    for (final r in mainLineResourcePicks) {
+      if (r == '(Empty / Unassigned)') {
+        conditions.add("(resource_id IS NULL OR TRIM(resource_id) = '')");
+      } else {
+        final escaped = r.replaceAll("'", "''").trim().toLowerCase();
+        conditions.add("LOWER(TRIM(resource_id)) = '$escaped'");
+      }
+    }
+    if (conditions.isEmpty) return '';
+    return ' AND NOT (${conditions.join(' OR ')})';
+  }
+
   /// Calculates progress by unique Part IDs for the given department in a unit.
   /// Returns a Map with 'totalParts', 'completedParts', and 'missingParts'.
   Future<Map<String, int>> getDepartmentPartProgress(String unitId, String department) async {
     await cleanupResolvedMissingFlags(unitId);
     final db = await database;
+
+    final isMainLineDept = department.toUpperCase().contains('MAIN') ||
+        department.toUpperCase().contains('MACG');
+    final mainLineResourcePicks = isMainLineDept ? await getMainLineResourcePicks() : <String>[];
+    final excludeSql = isMainLineDept ? _buildMainLineResourceExcludeSql(mainLineResourcePicks) : '';
+
     final rows = await db.rawQuery('''
       SELECT part_id, SUM(qty_due) as total_due
       FROM picklist_items
-      WHERE unit_id = ? AND department = ?
+      WHERE unit_id = ? AND department = ? $excludeSql
       GROUP BY part_id
     ''', [unitId, department]);
 
@@ -1063,7 +1453,7 @@ class DatabaseService implements LogDatabase {
       FROM part_flags
       WHERE unit_id = ? AND department = ? AND UPPER(flag_type) = 'MISSING'
         AND part_id IN (
-          SELECT part_id FROM picklist_items WHERE unit_id = ? AND department = ? GROUP BY part_id HAVING SUM(qty_due) > 0.0001
+          SELECT part_id FROM picklist_items WHERE unit_id = ? AND department = ? $excludeSql GROUP BY part_id HAVING SUM(qty_due) > 0.0001
         )
     ''', [unitId, department, unitId, department]);
 
@@ -1125,6 +1515,15 @@ class DatabaseService implements LogDatabase {
         .where((d) => d.isNotEmpty)
         .toList();
 
+    if (incompleteDepts.isEmpty) {
+      return UnitPickDateUrgency.evaluate(
+        dateStr: null,
+        department: 'All Complete',
+        isAllCompleted: true,
+        referenceToday: referenceToday,
+      );
+    }
+
     // For each incomplete department, find its pick_date
     String? earliestDateStr;
     DateTime? earliestParsedDate;
@@ -1181,10 +1580,14 @@ class DatabaseService implements LogDatabase {
     ''', [unitId]);
 
     final result = <String, UnitPickDateUrgency>{};
+    final mainLineResourcePicks = await getMainLineResourcePicks();
 
     for (final r in deptRows) {
       final dept = r['department']?.toString() ?? '';
       if (dept.isEmpty) continue;
+
+      final isMainLineDept = dept.toUpperCase().contains('MAIN') || dept.toUpperCase().contains('MACG');
+      final excludeSql = isMainLineDept ? _buildMainLineResourceExcludeSql(mainLineResourcePicks) : '';
 
       // Check if department has unpicked non-missing items
       final incompleteCount = Sqflite.firstIntValue(
@@ -1193,6 +1596,7 @@ class DatabaseService implements LogDatabase {
           FROM picklist_items
           WHERE unit_id = ?
             AND department = ?
+            $excludeSql
             AND qty_due > 0.0001
             AND part_id NOT IN (
               SELECT part_id FROM part_flags WHERE unit_id = ? AND UPPER(flag_type) = 'MISSING'
@@ -1206,7 +1610,7 @@ class DatabaseService implements LogDatabase {
       final dateRow = await db.rawQuery('''
         SELECT pick_date
         FROM picklist_items
-        WHERE unit_id = ? AND department = ? AND pick_date IS NOT NULL AND TRIM(pick_date) != ''
+        WHERE unit_id = ? AND department = ? $excludeSql AND pick_date IS NOT NULL AND TRIM(pick_date) != ''
         LIMIT 1
       ''', [unitId, dept]);
 
@@ -1313,13 +1717,31 @@ class DatabaseService implements LogDatabase {
 
   Future<List<String>> getBlockedResourceIds() async {
     final val = await getConfig('blocked_resource_ids');
+    final set = <String>{};
     if (val != null && val.isNotEmpty) {
       try {
         final list = jsonDecode(val) as List;
-        return list.map((e) => e.toString().trim()).where((s) => s.isNotEmpty).toList();
+        set.addAll(list.map((e) => e.toString().trim()).where((s) => s.isNotEmpty));
       } catch (_) {}
     }
-    return [];
+
+    // Include resources matching any blocked pattern rules
+    final rules = await getResourcePatternRules();
+    if (rules.isNotEmpty) {
+      final allRes = await _getRawDistinctResourceNames();
+      for (final rule in rules) {
+        final pat = (rule['pattern']?.toString() ?? '').trim().toLowerCase();
+        final allowPick = rule['allowPick'] == true;
+        if (pat.isNotEmpty && !allowPick) {
+          for (final res in allRes) {
+            if (res.toLowerCase().contains(pat)) {
+              set.add(res);
+            }
+          }
+        }
+      }
+    }
+    return set.toList();
   }
 
   Future<void> setBlockedResourceIds(List<String> list) async {
@@ -1343,6 +1765,115 @@ class DatabaseService implements LogDatabase {
 
   Future<List<String>> getAutoIssueResourceIds() async {
     final val = await getConfig('auto_issue_resource_ids');
+    final set = <String>{};
+    if (val != null && val.isNotEmpty) {
+      try {
+        final list = jsonDecode(val) as List;
+        set.addAll(list.map((e) => e.toString().trim()).where((s) => s.isNotEmpty));
+      } catch (_) {}
+    }
+
+    // Include resources matching any auto-issue pattern rules
+    final rules = await getResourcePatternRules();
+    if (rules.isNotEmpty) {
+      final allRes = await _getRawDistinctResourceNames();
+      for (final rule in rules) {
+        final pat = (rule['pattern']?.toString() ?? '').trim().toLowerCase();
+        final autoIssue = rule['autoIssue'] == true;
+        if (pat.isNotEmpty && autoIssue) {
+          for (final res in allRes) {
+            if (res.toLowerCase().contains(pat)) {
+              set.add(res);
+            }
+          }
+        }
+      }
+    }
+
+    // Enforce dependency rule: blocked resources cannot be auto-issued
+    final blocked = await getBlockedResourceIds();
+    set.removeWhere((r) => blocked.contains(r));
+
+    return set.toList();
+  }
+
+  Future<void> setAutoIssueResourceIds(List<String> list) async {
+    await setConfig('auto_issue_resource_ids', jsonEncode(list));
+  }
+
+  Future<List<String>> _getRawDistinctResourceNames() async {
+    final db = await database;
+    final rows = await db.rawQuery(
+      "SELECT DISTINCT resource_id FROM picklist_items WHERE resource_id IS NOT NULL AND TRIM(resource_id) != ''",
+    );
+    final list = rows.map((r) => (r['resource_id'] as String).trim()).where((s) => s.isNotEmpty).toList();
+    list.add('(Empty / Unassigned)');
+    return list;
+  }
+
+  Future<List<Map<String, dynamic>>> getResourcePatternRules() async {
+    final val = await getConfig('component_resource_pattern_rules');
+    if (val != null && val.isNotEmpty) {
+      try {
+        final decoded = jsonDecode(val) as List;
+        return decoded.map((e) => Map<String, dynamic>.from(e as Map)).toList();
+      } catch (_) {}
+    }
+    return [];
+  }
+
+  Future<void> setResourcePatternRules(List<Map<String, dynamic>> rules) async {
+    await setConfig('component_resource_pattern_rules', jsonEncode(rules));
+  }
+
+  // --- SESSION PICKS TRACKING ---
+
+  Future<void> recordSessionPick({
+    required String sessionId,
+    required String unitId,
+    required String itemId,
+    required String partId,
+    required double qtyPickedDelta,
+  }) async {
+    if (qtyPickedDelta <= 0) return;
+    final db = await database;
+    final id = '${sessionId}_${itemId}_${DateTime.now().microsecondsSinceEpoch}';
+    await db.insert(
+      'session_picks',
+      {
+        'id': id,
+        'session_id': sessionId,
+        'unit_id': unitId,
+        'item_id': itemId,
+        'part_id': partId,
+        'qty_picked': qtyPickedDelta,
+        'created_at': DateTime.now().millisecondsSinceEpoch,
+      },
+      conflictAlgorithm: ConflictAlgorithm.replace,
+    );
+  }
+
+  Future<Set<String>> getSessionPickedPartIds(String sessionId) async {
+    final db = await database;
+    final rows = await db.rawQuery(
+      'SELECT DISTINCT part_id FROM session_picks WHERE session_id = ? AND qty_picked > 0.0001',
+      [sessionId],
+    );
+    return rows.map((r) => r['part_id'].toString()).where((s) => s.isNotEmpty).toSet();
+  }
+
+  Future<int> getSessionPickedPartCount(String sessionId) async {
+    final db = await database;
+    final rows = await db.rawQuery(
+      'SELECT COUNT(DISTINCT part_id) as cnt FROM session_picks WHERE session_id = ? AND qty_picked > 0.0001',
+      [sessionId],
+    );
+    return (rows.first['cnt'] as num?)?.toInt() ?? 0;
+  }
+
+  /// List of Resource IDs configured to be picked across all MAIN LINE departments.
+  Future<List<String>> getMainLineResourcePicks() async {
+    final val = await getConfig('main_line_resource_picks');
     if (val != null && val.isNotEmpty) {
       try {
         final list = jsonDecode(val) as List;
@@ -1352,8 +1883,75 @@ class DatabaseService implements LogDatabase {
     return [];
   }
 
-  Future<void> setAutoIssueResourceIds(List<String> list) async {
-    await setConfig('auto_issue_resource_ids', jsonEncode(list));
+  Future<void> setMainLineResourcePicks(List<String> list) async {
+    await setConfig('main_line_resource_picks', jsonEncode(list));
+  }
+
+  /// Returns distinct Resource IDs found within MAIN LINE departments.
+  Future<List<String>> getMainLineDistinctResourceIds([String? unitId]) async {
+    final db = await database;
+    final where = unitId != null
+        ? "unit_id = ? AND (UPPER(dept_type) = 'MAIN LINE' OR UPPER(department) LIKE '%MAIN%' OR UPPER(department) LIKE '%MACG%')"
+        : "(UPPER(dept_type) = 'MAIN LINE' OR UPPER(department) LIKE '%MAIN%' OR UPPER(department) LIKE '%MACG%')";
+    final args = unitId != null ? [unitId] : null;
+    final rows = await db.rawQuery("SELECT DISTINCT resource_id FROM picklist_items WHERE $where", args);
+    final set = <String>{};
+    bool hasEmpty = false;
+    for (final r in rows) {
+      final res = r['resource_id']?.toString().trim() ?? '';
+      if (res.isEmpty) {
+        hasEmpty = true;
+      } else {
+        set.add(res);
+      }
+    }
+    final list = set.toList();
+    list.sort((a, b) => a.toLowerCase().compareTo(b.toLowerCase()));
+    if (hasEmpty) {
+      list.add('(Empty / Unassigned)');
+    }
+    return list;
+  }
+
+  /// Returns a map of Resource ID -> view mode ('combined' or 'split_by_dept')
+  Future<Map<String, String>> getMainLineResourceViewOverrides() async {
+    final val = await getConfig('mainline_resource_views');
+    if (val != null && val.isNotEmpty) {
+      try {
+        final decoded = jsonDecode(val) as Map<String, dynamic>;
+        return decoded.map((k, v) => MapEntry(k.toString(), v.toString()));
+      } catch (_) {}
+    }
+    return {};
+  }
+
+  /// Sets the preferred tree view mode for a specific MAIN LINE Resource ID ('combined' or 'split_by_dept').
+  Future<void> setMainLineResourceView(String resId, String viewMode) async {
+    final map = await getMainLineResourceViewOverrides();
+    map[resId] = viewMode;
+    await setConfig('mainline_resource_views', jsonEncode(map));
+  }
+
+  /// Resolves the tree view mode for a specific MAIN LINE Resource ID.
+  /// Checks per-resource override first; falls back to global default ('combined').
+  Future<String> getMainLineResourceView(String resId) async {
+    final map = await getMainLineResourceViewOverrides();
+    if (map.containsKey(resId)) {
+      return map[resId]!;
+    }
+    final globalDef = await getConfig('mainline_resource_default_view');
+    return globalDef ?? 'combined';
+  }
+
+  /// Checks whether Auto-Issue items have already been exported to Excel for this unit.
+  Future<bool> isUnitAutoIssueExported(String unitId) async {
+    final val = await getConfig('auto_issue_exported_$unitId');
+    return val == 'true';
+  }
+
+  /// Records whether Auto-Issue items have been exported to Excel for this unit.
+  Future<void> setUnitAutoIssueExported(String unitId, [bool exported = true]) async {
+    await setConfig('auto_issue_exported_$unitId', exported ? 'true' : 'false');
   }
 
   Future<String?> getLastExportDir() async {
@@ -1395,6 +1993,7 @@ class DatabaseService implements LogDatabase {
 
   // --- SYSTEM LOGS OPERATIONS ---
 
+  @override
   Future<void> insertLog({
     required int timestamp,
     required String level,
@@ -1450,6 +2049,7 @@ class DatabaseService implements LogDatabase {
     );
   }
 
+  @override
   Future<Map<String, dynamic>> getLogsStats() async {
     final db = await database;
     final countRes = await db.rawQuery('SELECT COUNT(*) as cnt FROM app_logs');
@@ -1466,6 +2066,7 @@ class DatabaseService implements LogDatabase {
     };
   }
 
+  @override
   Future<int> pruneOldestLogs(int countToPrune) async {
     final db = await database;
     return await db.rawDelete('''
@@ -1491,6 +2092,7 @@ class DatabaseService implements LogDatabase {
     await db.delete('app_logs');
   }
 
+  @override
   Future<List<Map<String, dynamic>>> getAllLogsForExport() async {
     final db = await database;
     return await db.query(

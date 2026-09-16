@@ -58,6 +58,14 @@ class _AdminScreenState extends State<AdminScreen> with SingleTickerProviderStat
   List<String> _allDistinctResources = [];
   List<String> _blockedResourceIds = [];
   List<String> _autoIssueResourceIds = [];
+  List<String> _mainLineResourcePicks = [];
+  String _mainLineResourceDefaultView = 'combined';
+  List<String> _mainLineDistinctResources = [];
+  Map<String, String> _mainLineResourceViews = {};
+  List<Map<String, dynamic>> _resourcePatternRules = [];
+  final _patternRuleController = TextEditingController();
+  bool _patternRuleAllowPick = true;
+  bool _patternRuleAutoIssue = false;
 
   // Tab 4 — Grouping Presets
   bool _groupByLine = true;
@@ -101,6 +109,7 @@ class _AdminScreenState extends State<AdminScreen> with SingleTickerProviderStat
     _newPickerNameController.dispose();
     _superAdminPinController.dispose();
     _logsSearchController.dispose();
+    _patternRuleController.dispose();
     _tabController.dispose();
     super.dispose();
   }
@@ -164,6 +173,11 @@ class _AdminScreenState extends State<AdminScreen> with SingleTickerProviderStat
     _allDistinctResources = await widget.dbService.getAllDistinctResourceIds();
     _blockedResourceIds = await widget.dbService.getBlockedResourceIds();
     _autoIssueResourceIds = await widget.dbService.getAutoIssueResourceIds();
+    _resourcePatternRules = await widget.dbService.getResourcePatternRules();
+    _mainLineResourcePicks = await widget.dbService.getMainLineResourcePicks();
+    _mainLineResourceDefaultView = (await widget.dbService.getConfig('mainline_resource_default_view')) ?? 'combined';
+    _mainLineDistinctResources = await widget.dbService.getMainLineDistinctResourceIds();
+    _mainLineResourceViews = await widget.dbService.getMainLineResourceViewOverrides();
 
     // Standard Pickers
     _standardPickers = await widget.dbService.getStandardPickers();
@@ -210,43 +224,76 @@ class _AdminScreenState extends State<AdminScreen> with SingleTickerProviderStat
 
   void _showChangePinDialog() {
     final newPinController = TextEditingController();
+    String? inlineError;
+
     showDialog(
       context: context,
-      builder: (ctx) => AlertDialog(
-        backgroundColor: AppTheme.cardDark,
-        title: const Text('Change Admin PIN', style: TextStyle(color: AppTheme.textLight)),
-        content: TextField(
-          controller: newPinController,
-          keyboardType: TextInputType.number,
-          obscureText: true,
-          maxLength: 6,
-          style: const TextStyle(color: AppTheme.textLight, fontSize: 20),
-          decoration: const InputDecoration(
-            hintText: 'Enter new 4–6 digit PIN',
-            hintStyle: TextStyle(color: AppTheme.textMuted),
+      builder: (ctx) => StatefulBuilder(
+        builder: (context, setDialogState) => AlertDialog(
+          backgroundColor: AppTheme.cardDark,
+          shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
+          title: const Row(
+            children: [
+              Icon(Icons.lock_rounded, color: AppTheme.accentCyan, size: 22),
+              SizedBox(width: 8),
+              Text('Change Admin PIN', style: TextStyle(color: AppTheme.textLight, fontSize: 18)),
+            ],
           ),
-        ),
-        actions: [
-          TextButton(onPressed: () => Navigator.of(ctx).pop(), child: const Text('Cancel')),
-          ElevatedButton(
-            onPressed: () async {
-              final newPin = newPinController.text.trim();
-              if (newPin.length >= 4) {
+          content: Column(
+            mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              const Text(
+                'Super Admin Authorization active. Enter new Admin PIN (4–6 digits):',
+                style: TextStyle(color: AppTheme.textMuted, fontSize: 13),
+              ),
+              const SizedBox(height: 12),
+              TextField(
+                controller: newPinController,
+                autofocus: true,
+                keyboardType: TextInputType.number,
+                obscureText: true,
+                maxLength: 6,
+                style: const TextStyle(color: AppTheme.textLight, fontSize: 20),
+                decoration: InputDecoration(
+                  hintText: 'New Admin PIN (4–6 digits)',
+                  hintStyle: const TextStyle(color: AppTheme.textMuted, fontSize: 13),
+                  prefixIcon: const Icon(Icons.password_rounded, color: AppTheme.accentCyan, size: 18),
+                  errorText: inlineError,
+                  border: const OutlineInputBorder(borderRadius: BorderRadius.all(Radius.circular(10))),
+                ),
+              ),
+            ],
+          ),
+          actions: [
+            TextButton(onPressed: () => Navigator.of(ctx).pop(), child: const Text('Cancel')),
+            ElevatedButton(
+              style: ElevatedButton.styleFrom(backgroundColor: AppTheme.primaryBlue),
+              onPressed: () async {
+                final newPin = newPinController.text.trim();
+                if (newPin.length < 4) {
+                  setDialogState(() {
+                    inlineError = 'Admin PIN must be at least 4 digits.';
+                  });
+                  return;
+                }
                 await widget.dbService.setConfig('admin_pin', newPin);
                 _currentPin = newPin;
-                await LogService.admin('Admin PIN was changed');
-                Navigator.of(ctx).pop();
-                ScaffoldMessenger.of(context).showSnackBar(
-                  const SnackBar(
-                    content: Text('Admin PIN successfully updated!'),
-                    backgroundColor: AppTheme.statusComplete,
-                  ),
-                );
-              }
-            },
-            child: const Text('Save PIN'),
-          ),
-        ],
+                await LogService.admin('Admin PIN was changed via Super Admin menu');
+                if (ctx.mounted) Navigator.of(ctx).pop();
+                if (mounted) {
+                  ScaffoldMessenger.of(context).showSnackBar(
+                    const SnackBar(
+                      content: Text('Admin PIN successfully updated!'),
+                      backgroundColor: AppTheme.statusComplete,
+                    ),
+                  );
+                }
+              },
+              child: const Text('Save PIN'),
+            ),
+          ],
+        ),
       ),
     );
   }
@@ -273,14 +320,6 @@ class _AdminScreenState extends State<AdminScreen> with SingleTickerProviderStat
               Text('Admin & Device Configuration'),
             ],
           ),
-          actions: [
-            IconButton(
-              icon: const Icon(Icons.password_rounded),
-              tooltip: 'Change PIN',
-              onPressed: _showChangePinDialog,
-            ),
-            const SizedBox(width: 8),
-          ],
           bottom: TabBar(
             controller: _tabController,
             indicatorColor: AppTheme.accentCyan,
@@ -918,6 +957,168 @@ class _AdminScreenState extends State<AdminScreen> with SingleTickerProviderStat
           ),
         ),
 
+        // ── Pattern Matching Rules (Contains) ───────────────────────────
+        Card(
+          color: AppTheme.bgDark,
+          margin: const EdgeInsets.only(bottom: 16),
+          shape: RoundedRectangleBorder(
+            borderRadius: BorderRadius.circular(10),
+            side: const BorderSide(color: AppTheme.borderDark),
+          ),
+          child: Padding(
+            padding: const EdgeInsets.all(16),
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                const Row(
+                  children: [
+                    Icon(Icons.filter_alt_rounded, color: AppTheme.accentCyan, size: 20),
+                    SizedBox(width: 8),
+                    Text(
+                      'Resource ID Pattern Rules (Contains)',
+                      style: TextStyle(fontSize: 14, fontWeight: FontWeight.bold, color: AppTheme.textLight),
+                    ),
+                  ],
+                ),
+                const SizedBox(height: 4),
+                const Text(
+                  'Automatically match resources whose ID contains specific text (e.g. "intern", "elec", "MACG"). Applies to existing and future picklists.',
+                  style: TextStyle(fontSize: 12, color: AppTheme.textMuted),
+                ),
+                const SizedBox(height: 12),
+                Row(
+                  children: [
+                    Expanded(
+                      flex: 4,
+                      child: TextField(
+                        controller: _patternRuleController,
+                        style: const TextStyle(color: AppTheme.textLight, fontSize: 13),
+                        decoration: InputDecoration(
+                          hintText: 'Substring to match (e.g. "wire", "box")',
+                          hintStyle: const TextStyle(color: AppTheme.textMuted, fontSize: 12),
+                          contentPadding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
+                          filled: true,
+                          fillColor: AppTheme.cardDark,
+                          border: OutlineInputBorder(borderRadius: BorderRadius.circular(8), borderSide: const BorderSide(color: AppTheme.borderDark)),
+                        ),
+                      ),
+                    ),
+                    const SizedBox(width: 12),
+                    Row(
+                      mainAxisSize: MainAxisSize.min,
+                      children: [
+                        Checkbox(
+                          value: _patternRuleAllowPick,
+                          activeColor: AppTheme.accentCyan,
+                          onChanged: (val) {
+                            setState(() {
+                              _patternRuleAllowPick = val ?? true;
+                              if (!_patternRuleAllowPick) {
+                                _patternRuleAutoIssue = false;
+                              }
+                            });
+                          },
+                        ),
+                        const Text('Allow Pick', style: TextStyle(fontSize: 12, color: AppTheme.textLight)),
+                      ],
+                    ),
+                    const SizedBox(width: 8),
+                    Row(
+                      mainAxisSize: MainAxisSize.min,
+                      children: [
+                        Checkbox(
+                          value: _patternRuleAutoIssue,
+                          activeColor: AppTheme.statusComplete,
+                          onChanged: !_patternRuleAllowPick
+                              ? null
+                              : (val) {
+                                  setState(() => _patternRuleAutoIssue = val ?? false);
+                                },
+                        ),
+                        Text(
+                          'Auto-Issue 100%',
+                          style: TextStyle(
+                            fontSize: 12,
+                            color: _patternRuleAllowPick ? AppTheme.statusComplete : AppTheme.textMuted,
+                          ),
+                        ),
+                      ],
+                    ),
+                    const SizedBox(width: 12),
+                    ElevatedButton.icon(
+                      style: ElevatedButton.styleFrom(
+                        backgroundColor: AppTheme.accentCyan,
+                        foregroundColor: AppTheme.bgDark,
+                        padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 12),
+                      ),
+                      icon: const Icon(Icons.add_rounded, size: 18),
+                      label: const Text('Add Rule', style: TextStyle(fontWeight: FontWeight.bold, fontSize: 12)),
+                      onPressed: () async {
+                        final pat = _patternRuleController.text.trim();
+                        if (pat.isEmpty) return;
+                        final newRule = {
+                          'pattern': pat,
+                          'allowPick': _patternRuleAllowPick,
+                          'autoIssue': _patternRuleAutoIssue,
+                        };
+                        final updatedRules = List<Map<String, dynamic>>.from(_resourcePatternRules)
+                          ..removeWhere((r) => r['pattern']?.toString().toLowerCase() == pat.toLowerCase())
+                          ..add(newRule);
+                        await widget.dbService.setResourcePatternRules(updatedRules);
+                        _patternRuleController.clear();
+                        await _loadAdminData();
+                        widget.onDataChanged();
+                      },
+                    ),
+                  ],
+                ),
+                if (_resourcePatternRules.isNotEmpty) ...[
+                  const SizedBox(height: 12),
+                  const Divider(height: 1, color: AppTheme.borderDark),
+                  const SizedBox(height: 10),
+                  Wrap(
+                    spacing: 8,
+                    runSpacing: 8,
+                    children: _resourcePatternRules.map((rule) {
+                      final pat = rule['pattern']?.toString() ?? '';
+                      final allow = rule['allowPick'] == true;
+                      final auto = rule['autoIssue'] == true;
+                      return Chip(
+                        backgroundColor: AppTheme.cardDark,
+                        side: BorderSide(
+                          color: !allow ? AppTheme.statusDanger.withValues(alpha: 0.6) : (auto ? AppTheme.statusComplete.withValues(alpha: 0.6) : AppTheme.accentCyan.withValues(alpha: 0.6)),
+                        ),
+                        label: Row(
+                          mainAxisSize: MainAxisSize.min,
+                          children: [
+                            Text('contains "$pat" → ', style: const TextStyle(fontSize: 12, fontWeight: FontWeight.bold, color: AppTheme.textLight)),
+                            Text(
+                              allow ? 'PICK ALLOWED' : 'BLOCKED',
+                              style: TextStyle(fontSize: 11, fontWeight: FontWeight.bold, color: allow ? AppTheme.accentCyan : AppTheme.statusDanger),
+                            ),
+                            if (auto) ...[
+                              const Text(' • ', style: TextStyle(color: AppTheme.textMuted)),
+                              const Text('AUTO-ISSUE 100%', style: TextStyle(fontSize: 11, fontWeight: FontWeight.bold, color: AppTheme.statusComplete)),
+                            ],
+                          ],
+                        ),
+                        deleteIcon: const Icon(Icons.close_rounded, size: 16),
+                        onDeleted: () async {
+                          final updatedRules = List<Map<String, dynamic>>.from(_resourcePatternRules)
+                            ..remove(rule);
+                          await widget.dbService.setResourcePatternRules(updatedRules);
+                          await _loadAdminData();
+                          widget.onDataChanged();
+                        },
+                      );
+                    }).toList(),
+                  ),
+                ],
+              ],
+            ),
+          ),
+        ),
+
         // ── Consolidated 3-Column Table ───────────────────────────────────
         Card(
           color: AppTheme.bgDark,
@@ -980,6 +1181,14 @@ class _AdminScreenState extends State<AdminScreen> with SingleTickerProviderStat
                   final isAllowed = !_blockedResourceIds.contains(res);
                   final isAuto = _autoIssueResourceIds.contains(res);
                   final isBlankResource = res.trim().isEmpty || res == '(Empty / Unassigned)';
+                  final cleanRes = res.toLowerCase().trim();
+                  final matchingRule = _resourcePatternRules.firstWhere(
+                    (r) {
+                      final pat = (r['pattern']?.toString() ?? '').toLowerCase().trim();
+                      return pat.isNotEmpty && cleanRes.contains(pat);
+                    },
+                    orElse: () => {},
+                  );
 
                   return Container(
                     padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 10),
@@ -1012,14 +1221,36 @@ class _AdminScreenState extends State<AdminScreen> with SingleTickerProviderStat
                                 child: Column(
                                   crossAxisAlignment: CrossAxisAlignment.start,
                                   children: [
-                                    Text(
-                                      res,
-                                      style: TextStyle(
-                                        fontWeight: FontWeight.bold,
-                                        color: isBlankResource ? AppTheme.accentCyan : AppTheme.textLight,
-                                        fontStyle: isBlankResource ? FontStyle.italic : FontStyle.normal,
-                                        fontSize: 14,
-                                      ),
+                                    Row(
+                                      children: [
+                                        Flexible(
+                                          child: Text(
+                                            res,
+                                            style: TextStyle(
+                                              fontWeight: FontWeight.bold,
+                                              color: isBlankResource ? AppTheme.accentCyan : AppTheme.textLight,
+                                              fontStyle: isBlankResource ? FontStyle.italic : FontStyle.normal,
+                                              fontSize: 14,
+                                            ),
+                                            overflow: TextOverflow.ellipsis,
+                                          ),
+                                        ),
+                                        if (matchingRule.isNotEmpty) ...[
+                                          const SizedBox(width: 6),
+                                          Container(
+                                            padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
+                                            decoration: BoxDecoration(
+                                              color: AppTheme.cardDark,
+                                              borderRadius: BorderRadius.circular(4),
+                                              border: Border.all(color: AppTheme.accentCyan.withValues(alpha: 0.5)),
+                                            ),
+                                            child: Text(
+                                              'Rule: "${matchingRule['pattern']}"',
+                                              style: const TextStyle(fontSize: 10, color: AppTheme.accentCyan, fontWeight: FontWeight.bold),
+                                            ),
+                                          ),
+                                        ],
+                                      ],
                                     ),
                                     Text(
                                       !isAllowed
@@ -1414,7 +1645,7 @@ class _AdminScreenState extends State<AdminScreen> with SingleTickerProviderStat
             ),
             const SizedBox(width: 10),
             const Text(
-              'MAIN LINE (DEPARTMENTS & RESOURCE IDs)',
+              'MAIN LINE DEPARTMENTS',
               style: TextStyle(fontSize: 16, fontWeight: FontWeight.bold, color: AppTheme.accentCyan, letterSpacing: 0.5),
             ),
           ],
@@ -1428,10 +1659,10 @@ class _AdminScreenState extends State<AdminScreen> with SingleTickerProviderStat
           ),
           child: Column(
             children: [
-              if (mainLineDepts.isEmpty && _allDistinctResources.isEmpty)
+              if (mainLineDepts.isEmpty)
                 const Padding(
                   padding: EdgeInsets.all(16),
-                  child: Text('No Main Line departments or resources detected in loaded picklists.', style: TextStyle(color: AppTheme.textMuted)),
+                  child: Text('No Main Line departments detected in loaded picklists.', style: TextStyle(color: AppTheme.textMuted)),
                 ),
               ...mainLineDepts.map((dept) {
                 final isEnabled = _deptLineOverrides.containsKey(dept)
@@ -1457,44 +1688,140 @@ class _AdminScreenState extends State<AdminScreen> with SingleTickerProviderStat
                   },
                 );
               }),
-              if (_allDistinctResources.isNotEmpty) ...[
-                const Divider(color: AppTheme.borderDark, height: 1),
-                Padding(
-                  padding: const EdgeInsets.fromLTRB(16, 12, 16, 4),
-                  child: Align(
-                    alignment: Alignment.centerLeft,
-                    child: Text(
-                      'Specific Resource IDs (${_allDistinctResources.length}):',
-                      style: const TextStyle(fontSize: 12, color: AppTheme.textMuted, fontWeight: FontWeight.bold),
-                    ),
+            ],
+          ),
+        ),
+        const SizedBox(height: 24),
+
+        // 3. MAIN LINE WHOLE RESOURCE PICKING (SKIP DEPARTMENT LEVEL)
+        Row(
+          children: [
+            Container(
+              padding: const EdgeInsets.all(6),
+              decoration: BoxDecoration(
+                color: const Color(0xFF0EA5E9).withValues(alpha: 0.15),
+                borderRadius: BorderRadius.circular(8),
+              ),
+              child: const Icon(Icons.merge_type_rounded, color: Color(0xFF0EA5E9), size: 20),
+            ),
+            const SizedBox(width: 10),
+            const Text(
+              'MAIN LINE WHOLE RESOURCE ID (SKIP DEPT LEVEL)',
+              style: TextStyle(fontSize: 16, fontWeight: FontWeight.bold, color: Color(0xFF0EA5E9), letterSpacing: 0.5),
+            ),
+          ],
+        ),
+        const SizedBox(height: 10),
+        Card(
+          color: AppTheme.cardDark,
+          shape: RoundedRectangleBorder(
+            borderRadius: BorderRadius.circular(12),
+            side: const BorderSide(color: AppTheme.borderDark),
+          ),
+          child: Padding(
+            padding: const EdgeInsets.symmetric(vertical: 8),
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                const Padding(
+                  padding: EdgeInsets.fromLTRB(16, 8, 16, 12),
+                  child: Text(
+                    'Make Department optional for selected Resource IDs. When enabled, workers pick the entire Resource ID across all MAIN LINE departments directly at the department level in Picker Flow (showing both WO and destination Department for each item). Unselected resources remain inside standard departments.',
+                    style: TextStyle(fontSize: 12, color: AppTheme.textMuted, height: 1.4),
                   ),
                 ),
-                ..._allDistinctResources.map((resId) {
-                  final isEnabled = _resourceLineOverrides.containsKey(resId)
-                      ? _resourceLineOverrides[resId]!
-                      : _groupByLine;
-                  return SwitchListTile(
-                    secondary: const Icon(Icons.tune_rounded, color: AppTheme.textMuted, size: 18),
-                    title: Text('Resource: $resId', style: const TextStyle(color: AppTheme.textLight, fontSize: 14)),
-                    subtitle: Text(
-                      isEnabled
-                          ? 'Group by Line before Part ID'
-                          : 'Skip Line level for this resource',
-                      style: TextStyle(fontSize: 11, color: isEnabled ? AppTheme.statusComplete : AppTheme.textMuted),
-                    ),
-                    value: isEnabled,
-                    activeColor: AppTheme.accentCyan,
-                    onChanged: (val) async {
-                      await widget.dbService.setLineGroupingResourceOverride(resId, val);
-                      setState(() {
-                        _resourceLineOverrides[resId] = val;
-                      });
-                      widget.onDataChanged();
-                    },
-                  );
-                }),
+                if (_mainLineDistinctResources.isEmpty)
+                  const Padding(
+                    padding: EdgeInsets.all(16),
+                    child: Text('No MAIN LINE Resource IDs detected in loaded picklists.', style: TextStyle(color: AppTheme.textMuted)),
+                  )
+                else
+                  ..._mainLineDistinctResources.map((resId) {
+                    final isBypassed = _mainLineResourcePicks.contains(resId);
+                    final currentResourceView = _mainLineResourceViews[resId] ?? _mainLineResourceDefaultView;
+                    return Container(
+                      decoration: BoxDecoration(
+                        border: Border(
+                          bottom: BorderSide(
+                            color: AppTheme.borderDark.withValues(alpha: 0.5),
+                            width: 0.8,
+                          ),
+                        ),
+                      ),
+                      child: Column(
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        children: [
+                          SwitchListTile(
+                            secondary: Icon(
+                              Icons.precision_manufacturing_rounded,
+                              color: isBypassed ? const Color(0xFF0EA5E9) : AppTheme.textMuted,
+                              size: 20,
+                            ),
+                            title: Text('Resource: $resId', style: const TextStyle(fontWeight: FontWeight.bold, color: AppTheme.textLight, fontSize: 14)),
+                            subtitle: Text(
+                              isBypassed
+                                  ? 'Department level bypassed: Picked directly across ALL Main Line departments'
+                                  : 'Standard hierarchy: Picked inside individual Main Line departments',
+                              style: TextStyle(fontSize: 11, color: isBypassed ? const Color(0xFF0EA5E9) : AppTheme.textMuted),
+                            ),
+                            value: isBypassed,
+                            activeColor: const Color(0xFF0EA5E9),
+                            onChanged: (val) async {
+                              setState(() {
+                                if (val) {
+                                  _mainLineResourcePicks.add(resId);
+                                } else {
+                                  _mainLineResourcePicks.remove(resId);
+                                }
+                              });
+                              await widget.dbService.setMainLineResourcePicks(_mainLineResourcePicks);
+                              widget.onDataChanged();
+                              await LogService.admin('Admin set MAIN LINE whole resource pick for "$resId" to $val');
+                            },
+                          ),
+                          if (isBypassed)
+                            Padding(
+                              padding: const EdgeInsets.fromLTRB(68, 0, 16, 12),
+                              child: Row(
+                                children: [
+                                  const Text(
+                                    'Resource Hierarchy View:',
+                                    style: TextStyle(fontSize: 12, color: AppTheme.textMuted, fontWeight: FontWeight.w600),
+                                  ),
+                                  const SizedBox(width: 12),
+                                  SegmentedButton<String>(
+                                    segments: const [
+                                      ButtonSegment<String>(
+                                        value: 'combined',
+                                        icon: Icon(Icons.merge_type_rounded, size: 14),
+                                        label: Text('Combined', style: TextStyle(fontSize: 11)),
+                                      ),
+                                      ButtonSegment<String>(
+                                        value: 'split_by_dept',
+                                        icon: Icon(Icons.account_tree_rounded, size: 14),
+                                        label: Text('By Dept', style: TextStyle(fontSize: 11)),
+                                      ),
+                                    ],
+                                    selected: {currentResourceView},
+                                    onSelectionChanged: (newSel) async {
+                                      final sel = newSel.first;
+                                      setState(() {
+                                        _mainLineResourceViews[resId] = sel;
+                                      });
+                                      await widget.dbService.setMainLineResourceView(resId, sel);
+                                      widget.onDataChanged();
+                                      await LogService.admin('Admin set MAIN LINE whole resource view for "$resId" to "$sel"');
+                                    },
+                                  ),
+                                ],
+                              ),
+                            ),
+                        ],
+                      ),
+                    );
+                  }),
               ],
-            ],
+            ),
           ),
         ),
       ],
@@ -2036,6 +2363,17 @@ class _AdminScreenState extends State<AdminScreen> with SingleTickerProviderStat
                     label: const Text('Export CSV', style: TextStyle(color: Colors.black, fontWeight: FontWeight.bold)),
                     onPressed: _exportLogsToCsv,
                   ),
+                  const SizedBox(width: 10),
+                  OutlinedButton.icon(
+                    style: OutlinedButton.styleFrom(
+                      side: const BorderSide(color: AppTheme.accentCyan),
+                      foregroundColor: AppTheme.accentCyan,
+                      padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 8),
+                    ),
+                    icon: const Icon(Icons.password_rounded, size: 16),
+                    label: const Text('Change Admin PIN', style: TextStyle(fontSize: 12, fontWeight: FontWeight.bold)),
+                    onPressed: _showChangePinDialog,
+                  ),
                   const SizedBox(width: 8),
                   IconButton(
                     icon: const Icon(Icons.refresh_rounded, color: AppTheme.textLight),
@@ -2043,7 +2381,7 @@ class _AdminScreenState extends State<AdminScreen> with SingleTickerProviderStat
                     onPressed: _loadLogs,
                   ),
                   IconButton(
-                    icon: const Icon(Icons.password_rounded, color: AppTheme.textLight),
+                    icon: const Icon(Icons.security_rounded, color: AppTheme.textLight),
                     tooltip: 'Change Super Admin PIN',
                     onPressed: _showChangeSuperAdminPinDialog,
                   ),

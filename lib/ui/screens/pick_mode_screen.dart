@@ -106,7 +106,9 @@ class _PickModeScreenState extends State<PickModeScreen> with WidgetsBindingObse
   }
 
   Future<void> _loadMissingParts() async {
-    final flags = await widget.dbService.getPartFlags(_unit.id, department: widget.department);
+    final flags = _isResourceScope
+        ? await widget.dbService.getPartFlags(_unit.id)
+        : await widget.dbService.getPartFlags(_unit.id, department: widget.department);
     final missing = flags
         .where((f) => f['flag_type']?.toString().toUpperCase() == 'MISSING')
         .map((f) => f['part_id']?.toString() ?? '')
@@ -142,7 +144,7 @@ class _PickModeScreenState extends State<PickModeScreen> with WidgetsBindingObse
     if (widget.activeSession == null) return;
     try {
       final nowMs = DateTime.now().millisecondsSinceEpoch;
-      final pickedCount = _items.where((i) => i.qtyPicked > 0).length;
+      final pickedCount = _items.where((i) => i.qtyPicked > 0.0001).map((i) => i.partId).toSet().length;
       await widget.dbService.updateSessionProgress(
         widget.activeSession!.id,
         pickedCount,
@@ -151,15 +153,44 @@ class _PickModeScreenState extends State<PickModeScreen> with WidgetsBindingObse
     } catch (_) {}
   }
 
+  bool get _isResourceScope =>
+      widget.department.startsWith('Resource: ') &&
+      widget.department.endsWith(' (MAIN LINE)');
+
+  String get _targetResourceName => _isResourceScope
+      ? widget.department
+          .substring('Resource: '.length, widget.department.length - ' (MAIN LINE)'.length)
+          .trim()
+      : '';
+
+  bool _itemMatchesScope(PicklistItem i) {
+    if (widget.department.isEmpty || widget.department == 'All Departments') return true;
+    if (_isResourceScope) {
+      final isMainLine = i.deptType.toUpperCase() == 'MAIN LINE' ||
+          i.department.toUpperCase().contains('MAIN') ||
+          i.department.toUpperCase().contains('MACG');
+      if (!isMainLine) return false;
+      final res = i.resourceId.trim();
+      final target = _targetResourceName;
+      if (target == '(Empty / Unassigned)') {
+        return res.isEmpty || res == '(Empty / Unassigned)';
+      }
+      return res.toLowerCase() == target.toLowerCase();
+    }
+    return i.department.toLowerCase().trim() == widget.department.toLowerCase().trim();
+  }
+
   double _getCurrentPicked(String partId) {
+    final cleanPartId = partId.toLowerCase().trim();
     return _items
-        .where((i) => i.department == widget.department && i.partId == partId)
+        .where((i) => _itemMatchesScope(i) && i.partId.toLowerCase().trim() == cleanPartId)
         .fold<double>(0.0, (sum, i) => sum + i.qtyPicked);
   }
 
   double _getRequiredQty(String partId) {
+    final cleanPartId = partId.toLowerCase().trim();
     return _items
-        .where((i) => i.department == widget.department && i.partId == partId)
+        .where((i) => _itemMatchesScope(i) && i.partId.toLowerCase().trim() == cleanPartId)
         .fold<double>(0.0, (sum, i) => sum + i.qtyRequired);
   }
 
@@ -209,7 +240,23 @@ class _PickModeScreenState extends State<PickModeScreen> with WidgetsBindingObse
     await widget.dbService.batchUpdateItems(updatedList);
     await widget.dbService.updateUnit(updatedUnit);
     if (widget.activeSession != null) {
-      final pickedCount = updatedList.where((i) => i.qtyPicked > 0).length;
+      if (delta > 0.0001) {
+        final affected = updatedList.where((i) => _itemMatchesScope(i) && i.partId.toLowerCase().trim() == part.partId.toLowerCase().trim());
+        for (final item in affected) {
+          final old = _items.firstWhere((o) => o.id == item.id, orElse: () => item);
+          final itemDelta = item.qtyPicked - old.qtyPicked;
+          if (itemDelta > 0.0001) {
+            await widget.dbService.recordSessionPick(
+              sessionId: widget.activeSession!.id,
+              unitId: _unit.id,
+              itemId: item.id,
+              partId: part.partId,
+              qtyPickedDelta: itemDelta,
+            );
+          }
+        }
+      }
+      final pickedCount = await widget.dbService.getSessionPickedPartCount(widget.activeSession!.id);
       await widget.dbService.updateSessionProgress(
         widget.activeSession!.id,
         pickedCount,
@@ -348,15 +395,14 @@ class _PickModeScreenState extends State<PickModeScreen> with WidgetsBindingObse
         curve: Curves.easeInOut,
       );
     } else {
-      // Reached the end -> "Go Over":
-      // Prune fully picked parts so they don't appear in the loop
-      final remaining = _currentParts.where((p) {
+      // Reached the end -> Smoothly animate back to the first incomplete part!
+      final targetIdx = _currentParts.indexWhere((p) {
         final isMissing = _flaggedMissingParts.contains(p.partId);
         final due = _getDueQty(p.partId);
         return due > 0.0001 || isMissing;
-      }).toList();
+      });
 
-      if (remaining.isEmpty) {
+      if (targetIdx == -1) {
         LogService.picker('PickMode: all parts complete in ${widget.department}');
         ScaffoldMessenger.of(context).showSnackBar(
           const SnackBar(
@@ -373,13 +419,17 @@ class _PickModeScreenState extends State<PickModeScreen> with WidgetsBindingObse
         return;
       }
 
-      LogService.picker('PickMode: Go Over (${remaining.length} pending)');
+      LogService.picker('PickMode: Animate loop to first incomplete part (idx $targetIdx)');
       setState(() {
-        _currentParts = remaining;
-        _currentIndex = 0;
         _inputBuffer = '';
       });
-      _pageController.jumpToPage(0);
+      if (targetIdx != _currentIndex) {
+        _pageController.animateToPage(
+          targetIdx,
+          duration: const Duration(milliseconds: 350),
+          curve: Curves.easeInOut,
+        );
+      }
     }
   }
 
@@ -408,6 +458,7 @@ class _PickModeScreenState extends State<PickModeScreen> with WidgetsBindingObse
     );
 
     LogService.picker('MISSING flagged: ${part.partId}');
+    widget.onItemsUpdated?.call(_items);
 
     if (mounted) {
       ScaffoldMessenger.of(context).showSnackBar(
@@ -548,21 +599,65 @@ class _PickModeScreenState extends State<PickModeScreen> with WidgetsBindingObse
                       style: const TextStyle(fontSize: 36, fontWeight: FontWeight.bold, color: AppTheme.accentCyan, letterSpacing: 1.2),
                       textAlign: TextAlign.center,
                     ),
-                    if (part.description.isNotEmpty) ...[
-                      const SizedBox(height: 8),
-                      Text(
-                        part.description,
-                        style: const TextStyle(fontSize: 14, color: AppTheme.textMuted),
-                        textAlign: TextAlign.center,
-                        maxLines: 2,
-                        overflow: TextOverflow.ellipsis,
-                      ),
-                    ],
+                    Builder(builder: (_) {
+                      String onHandStr = part.onHand;
+                      if (onHandStr.isEmpty) {
+                        final match = _items.firstWhere(
+                          (i) => i.partId == part.partId && i.onHand.isNotEmpty,
+                          orElse: () => PicklistItem(id: '', unitId: '', department: '', line: '', workOrder: '', partId: '', partDescription: '', qtyRequired: 0, qtyDue: 0, qtyPicked: 0, rowOrder: 0),
+                        );
+                        onHandStr = match.onHand;
+                      }
+                      if (part.description.isEmpty && onHandStr.isEmpty) return const SizedBox.shrink();
+                      return Padding(
+                        padding: const EdgeInsets.only(top: 8),
+                        child: Wrap(
+                          alignment: WrapAlignment.center,
+                          crossAxisAlignment: WrapCrossAlignment.center,
+                          spacing: 8,
+                          runSpacing: 4,
+                          children: [
+                            if (part.description.isNotEmpty)
+                              Text(
+                                part.description,
+                                style: const TextStyle(fontSize: 14, color: AppTheme.textMuted),
+                                textAlign: TextAlign.center,
+                                maxLines: 2,
+                                overflow: TextOverflow.ellipsis,
+                              ),
+                            if (onHandStr.isNotEmpty)
+                              Container(
+                                padding: const EdgeInsets.symmetric(horizontal: 7, vertical: 2),
+                                decoration: BoxDecoration(
+                                  color: AppTheme.accentCyan.withValues(alpha: 0.15),
+                                  borderRadius: BorderRadius.circular(5),
+                                  border: Border.all(color: AppTheme.accentCyan.withValues(alpha: 0.4)),
+                                ),
+                                child: Row(
+                                  mainAxisSize: MainAxisSize.min,
+                                  children: [
+                                    const Icon(Icons.location_on_rounded, size: 12, color: AppTheme.accentCyan),
+                                    const SizedBox(width: 3),
+                                    Text(
+                                      'ON-HAND: $onHandStr',
+                                      style: const TextStyle(
+                                        fontSize: 11,
+                                        color: AppTheme.accentCyan,
+                                        fontWeight: FontWeight.bold,
+                                      ),
+                                    ),
+                                  ],
+                                ),
+                              ),
+                          ],
+                        ),
+                      );
+                    }),
                     const SizedBox(height: 14),
                     Builder(builder: (_) {
                       final item = _items.firstWhere(
-                        (i) => i.partId == part.partId && i.department == widget.department,
-                        orElse: () => _items.firstWhere((i) => i.partId == part.partId, orElse: () => PicklistItem(id: '', unitId: '', department: '', line: '', workOrder: '', partId: '', partDescription: '', qtyRequired: 0, qtyDue: 0, qtyPicked: 0, rowOrder: 0)),
+                        (i) => _itemMatchesScope(i) && i.partId.toLowerCase().trim() == part.partId.toLowerCase().trim(),
+                        orElse: () => _items.firstWhere((i) => i.partId.toLowerCase().trim() == part.partId.toLowerCase().trim(), orElse: () => PicklistItem(id: '', unitId: '', department: '', line: '', workOrder: '', partId: '', partDescription: '', qtyRequired: 0, qtyDue: 0, qtyPicked: 0, rowOrder: 0)),
                       );
                       final lineStr = item.line.isNotEmpty ? item.line : (widget.lineLabel ?? 'General');
                       final resStr = item.resourceId.isNotEmpty ? item.resourceId : (part.resourceId.isNotEmpty ? part.resourceId : '');
@@ -572,7 +667,9 @@ class _PickModeScreenState extends State<PickModeScreen> with WidgetsBindingObse
                         runSpacing: 6,
                         children: [
                           _infoChip(Icons.inventory_2_rounded, 'Unit: ${_unit.name}'),
-                          _infoChip(Icons.apartment_rounded, 'Dept: ${widget.department}'),
+                          _infoChip(Icons.apartment_rounded, _isResourceScope ? 'Scope: ${widget.department}' : 'Dept: ${widget.department}'),
+                          if (_isResourceScope && item.department.isNotEmpty)
+                            _infoChip(Icons.domain_rounded, 'Dept: ${item.department}'),
                           if (lineStr.isNotEmpty) _infoChip(Icons.view_week_rounded, 'Line: $lineStr'),
                           if (resStr.isNotEmpty) _infoChip(Icons.account_tree_rounded, 'Resource: $resStr'),
                         ],
@@ -963,7 +1060,7 @@ class _PickModeScreenState extends State<PickModeScreen> with WidgetsBindingObse
 
     // Work Orders info — list per WO with quantities
     final woItems = _items
-        .where((i) => i.department == widget.department && i.partId == part.partId)
+        .where((i) => _itemMatchesScope(i) && i.partId.toLowerCase().trim() == part.partId.toLowerCase().trim())
         .toList()
       ..sort((a, b) => a.rowOrder.compareTo(b.rowOrder));
 
@@ -1035,13 +1132,41 @@ class _PickModeScreenState extends State<PickModeScreen> with WidgetsBindingObse
               part.partId,
               style: const TextStyle(fontSize: 34, fontWeight: FontWeight.bold, letterSpacing: 1.2, color: AppTheme.textLight),
             ),
-            if (part.description.isNotEmpty) ...[
+            if (part.description.isNotEmpty || onHand.isNotEmpty) ...[
               const SizedBox(height: 4),
-              Text(
-                part.description,
-                style: const TextStyle(fontSize: 15, color: AppTheme.textMuted, height: 1.2),
-                maxLines: 2,
-                overflow: TextOverflow.ellipsis,
+              Wrap(
+                crossAxisAlignment: WrapCrossAlignment.center,
+                spacing: 10,
+                runSpacing: 4,
+                children: [
+                  if (part.description.isNotEmpty)
+                    Text(
+                      part.description,
+                      style: const TextStyle(fontSize: 15, color: AppTheme.textMuted, height: 1.2),
+                      maxLines: 2,
+                      overflow: TextOverflow.ellipsis,
+                    ),
+                  if (onHand.isNotEmpty)
+                    Container(
+                      padding: const EdgeInsets.symmetric(horizontal: 7, vertical: 2),
+                      decoration: BoxDecoration(
+                        color: AppTheme.accentCyan.withValues(alpha: 0.15),
+                        borderRadius: BorderRadius.circular(6),
+                        border: Border.all(color: AppTheme.accentCyan.withValues(alpha: 0.5)),
+                      ),
+                      child: Row(
+                        mainAxisSize: MainAxisSize.min,
+                        children: [
+                          const Icon(Icons.location_on_rounded, size: 13, color: AppTheme.accentCyan),
+                          const SizedBox(width: 4),
+                          Text(
+                            'ON-HAND: $onHand',
+                            style: const TextStyle(fontSize: 12, color: AppTheme.accentCyan, fontWeight: FontWeight.bold),
+                          ),
+                        ],
+                      ),
+                    ),
+                ],
               ),
             ],
 
@@ -1120,13 +1245,19 @@ class _PickModeScreenState extends State<PickModeScreen> with WidgetsBindingObse
 
             // Row 4: Work Orders with quantities (per WO)
             if (woItems.isNotEmpty) ...[
-              const Text('Work Orders:', style: TextStyle(fontSize: 11, color: AppTheme.textMuted, fontWeight: FontWeight.bold)),
+              Text(
+                _isResourceScope ? 'Work Orders & Departments:' : 'Work Orders:',
+                style: const TextStyle(fontSize: 11, color: AppTheme.textMuted, fontWeight: FontWeight.bold),
+              ),
               const SizedBox(height: 4),
               Wrap(
                 spacing: 6,
                 runSpacing: 4,
                 children: woItems.map((wo) {
                   final woColor = wo.qtyDue <= 0.0001 ? AppTheme.statusComplete : AppTheme.statusPartial;
+                  final label = _isResourceScope
+                      ? '${wo.workOrder} (${wo.department}): ${PicklistItem.formatQty(wo.qtyPicked)}/${PicklistItem.formatQty(wo.qtyRequired)}'
+                      : '${wo.workOrder}: ${PicklistItem.formatQty(wo.qtyPicked)}/${PicklistItem.formatQty(wo.qtyRequired)}';
                   return Container(
                     padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 3),
                     decoration: BoxDecoration(
@@ -1135,7 +1266,7 @@ class _PickModeScreenState extends State<PickModeScreen> with WidgetsBindingObse
                       border: Border.all(color: woColor.withOpacity(0.5)),
                     ),
                     child: Text(
-                      '${wo.workOrder}: ${PicklistItem.formatQty(wo.qtyPicked)}/${PicklistItem.formatQty(wo.qtyRequired)}',
+                      label,
                       style: TextStyle(fontSize: 11, color: woColor, fontWeight: FontWeight.w600),
                     ),
                   );
@@ -1580,7 +1711,7 @@ class _PickModeScreenState extends State<PickModeScreen> with WidgetsBindingObse
         children: [
           OutlinedButton.icon(
             icon: const Icon(Icons.arrow_back_rounded, size: 16),
-            label: const Text('Previous', style: const TextStyle(fontSize: 15, fontWeight: FontWeight.bold)),
+            label: const Text('Previous', style: TextStyle(fontSize: 15, fontWeight: FontWeight.bold)),
             style: OutlinedButton.styleFrom(padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 14), minimumSize: const Size(120, 52)),
             onPressed: _currentIndex > 0 ? _goToPrevPart : null,
           ),
@@ -1589,7 +1720,7 @@ class _PickModeScreenState extends State<PickModeScreen> with WidgetsBindingObse
           else
             OutlinedButton.icon(
               icon: const Icon(Icons.skip_next_rounded, size: 18),
-              label: const Text('Skip', style: const TextStyle(fontSize: 15, fontWeight: FontWeight.bold)),
+              label: const Text('Skip', style: TextStyle(fontSize: 15, fontWeight: FontWeight.bold)),
               style: OutlinedButton.styleFrom(padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 14), minimumSize: const Size(120, 52)),
               onPressed: _goToNextPart,
             ),

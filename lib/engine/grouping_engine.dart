@@ -7,6 +7,7 @@ class TreeNode {
   final String key;
   final String label;
   final String? partDescription;
+  final String? onHand;
   final double totalRequired;
   final double totalDue;
   final double totalPicked;
@@ -20,6 +21,7 @@ class TreeNode {
     required this.key,
     required this.label,
     this.partDescription,
+    this.onHand,
     required this.totalRequired,
     required this.totalDue,
     required this.totalPicked,
@@ -106,7 +108,10 @@ class GroupingEngine {
       }).length;
 
       final desc = currentLevel == GroupLevel.partId && groupItems.isNotEmpty
-          ? groupItems.first.partDescription
+          ? groupItems.firstWhere((i) => i.partDescription.trim().isNotEmpty, orElse: () => groupItems.first).partDescription.trim()
+          : null;
+      final onHand = currentLevel == GroupLevel.partId && groupItems.isNotEmpty
+          ? groupItems.firstWhere((i) => i.onHand.trim().isNotEmpty, orElse: () => groupItems.first).onHand.trim()
           : null;
 
       if (isFinalLevel) {
@@ -115,6 +120,7 @@ class GroupingEngine {
           key: key,
           label: key,
           partDescription: desc,
+          onHand: onHand,
           totalRequired: totalReq,
           totalDue: totalDue,
           totalPicked: totalPicked,
@@ -130,6 +136,7 @@ class GroupingEngine {
           key: key,
           label: key,
           partDescription: desc,
+          onHand: onHand,
           totalRequired: totalReq,
           totalDue: totalDue,
           totalPicked: totalPicked,
@@ -175,15 +182,40 @@ class GroupingEngine {
   }
 
   /// Automatically resolves whether a department is MAIN LINE or SUBASSEMBLY:
+  /// - If whole resource scope -> never groups by Line. Combined: Unit → Resource ID → Part ID. By Dept: Unit → Resource ID → Dept → Part ID.
   /// - If department contains 'MAIN' or 'MACG' (case-insensitive) -> MAIN LINE mode
   /// - Otherwise -> SUBASSEMBLY mode.
   /// [includeLine]: If true, groups by Line before Part ID; if false, skips Line level.
+  /// [bypassDepartmentLevel]: If true (when picking whole MAIN LINE resource in Combined mode), skips Department level.
   static GroupingPreset getPresetForDepartment(
     String department, {
     bool includeLine = true,
+    bool bypassDepartmentLevel = false,
+    bool isResourceScope = false,
     List<GroupingPreset>? customPresets,
   }) {
     final norm = department.toUpperCase().trim();
+    final isResScope = isResourceScope || (norm.startsWith('RESOURCE: ') && norm.endsWith(' (MAIN LINE)'));
+
+    if (isResScope) {
+      // Whole Resource ID picking: strictly NO Line level!
+      // In Combined view: Unit → Resource ID → Part ID
+      // In By Dept view: Unit → Resource ID → Department → Part ID
+      if (bypassDepartmentLevel) {
+        return GroupingPreset(
+          id: 'preset_main_line_whole_resource_combined',
+          name: 'Main Line Resource Combined (Unit → Resource ID → Part ID)',
+          levels: [GroupLevel.unit, GroupLevel.resourceId, GroupLevel.partId],
+        );
+      } else {
+        return GroupingPreset(
+          id: 'preset_main_line_whole_resource_by_dept',
+          name: 'Main Line Resource by Dept (Unit → Resource ID → Department → Part ID)',
+          levels: [GroupLevel.unit, GroupLevel.resourceId, GroupLevel.department, GroupLevel.partId],
+        );
+      }
+    }
+
     final isMainLine = norm.contains('MAIN') || norm.contains('MACG');
 
     if (isMainLine) {

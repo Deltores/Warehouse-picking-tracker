@@ -66,10 +66,12 @@ void main() async {
   };
 
   // Housekeeping on startup: purge expired soft-deleted units older than 30 days
+  // and issued sessions older than 60 days
   try {
     await dbService.purgeExpiredDeletedUnits(retentionDays: 30);
+    await dbService.purgeExpiredIssuedSessions(retentionDays: 60);
   } catch (e) {
-    LogService.warn('Startup', 'Failed to purge expired deleted units: $e');
+    LogService.warn('Startup', 'Failed housekeeping purge: $e');
   }
 
   LogService.info('AppStartup', 'Pick List Tracker started successfully.');

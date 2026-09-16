@@ -26,7 +26,7 @@ Business and technical glossary. Read this before writing any logic.
 - **Session ID:** Auto-generated unique identifier. Format: `SESS-20260912-JD-342`.
 - **Pick Date:** Calendar date the session was started (`YYYY-MM-DD`).
 - **Start Timestamp / End Timestamp:** Unix millisecond timestamps of session begin/end.
-- **Issued Status:** ERP posting flag. Two states: `Pending` (not yet posted) or `Issued` (posted in ERP).
+- **Issued Status:** ERP posting flag. Two states: `Pending Issue` (not yet posted) or `Issued` (posted in ERP).
 
 ---
 
@@ -85,12 +85,18 @@ Presets are switched live from the header dropdown without reloading data.
 
 ---
 
-## File Handling
+## File Handling & Excel Export
 
 - One Excel file = One Unit.
-- File path is stored in `units.file_path` for in-place overwrite on export.
+- File path is stored in `units.file_path`.
 - Before overwrite: backup created as `[OriginalName]_backup.xlsx` in the same directory.
-- Export appends service columns: `Session ID`, `Worker Name`, `Pick Date`, `Start Time`, `End Time`, `Issued Status`.
+- **Export Filters to Picked / Auto-Issued Rows Only**: Items with `qtyPicked == 0` (and not auto-issued) or blocked items are omitted from the export. The exported Excel contains only items that were physically picked or auto-issued.
+- **One-Time Auto-Issue Export per Unit**: Auto-issue items are exported only once per unit (during its initial batch export). Subsequent batch exports omit auto-issue items to prevent re-issuing or duplicated accounting.
+- **Direct SQLite Source of Truth**: All quantities (`qtyPicked`, `qtyDue`), session states, and returns are fetched directly from SQLite DB.
+- **ON-HAND Display**: ON-HAND location is displayed side-by-side with Part Description across all screens (Grouping Tree, Pick Mode upper panel, and Confirm Pick dialog).
+- **Duration Format**: Session and batch durations are formatted as `X min` or `Xh Ymin` (e.g. `30 min`, `1h 24min`, `< 1 min`) to explicitly denote working time elapsed per session/worker.
+- **Batch Super Export (Tab 1)**: Consolidates all unexported sessions for a unit with 1-click execution (no popup selection dialog), setting ERP status to `Pending Issue`.
+- **MAIN LINE Whole Resource Mode (Admin Tab 5)**: Filtered strictly to MAIN LINE resources. Supports both Combined (All Depts, skipping Department level) and By Department modes, configurable per individual resource ID in Admin Tab 5 and switchable live via worker toggle.
 
 ---
 

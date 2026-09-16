@@ -62,7 +62,7 @@ class _SessionStartDialogState extends State<SessionStartDialog> {
         startTime: now.millisecondsSinceEpoch,
         pickDate: DateFormat('yyyy-MM-dd').format(now),
         status: 'ACTIVE',
-        issuedStatus: 'Pending',
+        issuedStatus: 'Pending Issue',
         totalItemsPicked: 0,
       );
       Navigator.of(context).pop(session);

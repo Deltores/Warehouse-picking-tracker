@@ -26,7 +26,20 @@ class FifoAllocationEngine {
 
     for (int i = 0; i < allItems.length; i++) {
       final item = allItems[i];
-      if (item.department.toLowerCase().trim() == department.toLowerCase().trim() &&
+      final bool matchesScope;
+      if (department.toLowerCase().startsWith('resource:')) {
+        final cleanRes = department
+            .replaceFirst(RegExp(r'resource:\s*', caseSensitive: false), '')
+            .replaceAll(RegExp(r'\s*\(main line\)', caseSensitive: false), '')
+            .trim()
+            .toLowerCase();
+        matchesScope = item.resourceId.toLowerCase().trim() == cleanRes;
+      } else {
+        matchesScope = (department.isEmpty ||
+            department.toLowerCase() == 'all departments' ||
+            item.department.toLowerCase().trim() == department.toLowerCase().trim());
+      }
+      if (matchesScope &&
           item.partId.toLowerCase().trim() == partId.toLowerCase().trim()) {
         targetIndices.add(i);
         targetItems.add(item);

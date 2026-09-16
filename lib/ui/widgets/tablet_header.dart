@@ -174,8 +174,8 @@ class TabletHeader extends StatelessWidget {
                 padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 10),
                 shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(10)),
               ),
-              icon: const Icon(Icons.file_download_done_rounded, size: 18),
-              label: const Text('Export & Close', style: TextStyle(fontSize: 13, fontWeight: FontWeight.bold)),
+              icon: const Icon(Icons.lock_clock_rounded, size: 18),
+              label: const Text('Close Session', style: TextStyle(fontSize: 13, fontWeight: FontWeight.bold)),
               onPressed: onCloseSession,
             ),
           ],
@@ -232,7 +232,7 @@ class TabletHeader extends StatelessWidget {
           ),
           const SizedBox(width: 5),
           Text(
-            '$done / $total parts ($pct%)',
+            'Unit: $done / $total parts ($pct%)',
             style: TextStyle(
               fontSize: 12,
               fontWeight: FontWeight.bold,
