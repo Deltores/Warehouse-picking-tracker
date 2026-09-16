@@ -608,8 +608,11 @@ class _PickerFlowScreenState extends State<PickerFlowScreen> {
       _departments = depts;
       _departmentUrgencies = deptUrgencies;
       _departmentPartProgress = deptProgress;
-      // Pre-select the first active department if only one is active
-      final activeDepts = depts.entries.where((e) => e.value).map((e) => e.key).toList();
+      // Pre-select the first non-zero active department if only one is active
+      final activeDepts = depts.entries
+          .where((e) => e.value && (deptProgress[e.key]?['totalParts'] ?? 0) > 0)
+          .map((e) => e.key)
+          .toList();
       _selectedDepartment = activeDepts.length == 1 ? activeDepts.first : null;
     });
   }
@@ -622,7 +625,12 @@ class _PickerFlowScreenState extends State<PickerFlowScreen> {
     // Check for an existing open session on this unit.
     final existingSession = await widget.dbService.getActiveSession(_selectedUnit!.id);
     if (existingSession != null && mounted) {
-      final isSameWorker = existingSession.workerName.trim().toLowerCase() == _workerName.trim().toLowerCase();
+      final existingPicks = await widget.dbService.getSessionPickedPartCount(existingSession.id);
+      if (existingPicks == 0 && existingSession.totalItemsPicked == 0) {
+        // Abandoned empty session with 0 picks — delete it so it never lingers
+        await widget.dbService.deleteEmptySession(existingSession.id);
+      } else {
+        final isSameWorker = existingSession.workerName.trim().toLowerCase() == _workerName.trim().toLowerCase();
       if (isSameWorker) {
         // Picker is switching departments or returning within active session — reuse it seamlessly!
         final updatedUnit = _selectedUnit!.copyWith(
@@ -748,33 +756,32 @@ class _PickerFlowScreenState extends State<PickerFlowScreen> {
       }
       // choice == 'new': delete if empty, otherwise close/abandon old session, then create a new one below.
       if (choice == 'new') {
-        final unitItems = await widget.dbService.getPicklistItems(existingSession.unitId);
-        final hasPicks = unitItems.any((i) => i.qtyPicked > 0.0001) || existingSession.totalItemsPicked > 0;
-        if (!hasPicks) {
-          // Genuinely empty session with 0 picks made anywhere on this unit
+        final sessionPicks = await widget.dbService.getSessionPickedPartCount(existingSession.id);
+        if (sessionPicks == 0 && existingSession.totalItemsPicked == 0) {
+          // Genuinely empty session with 0 picks made in this session
           await widget.dbService.deleteEmptySession(existingSession.id);
         } else {
-          final count = unitItems.where((i) => i.qtyPicked > 0.0001).length;
+          final count = sessionPicks > 0 ? sessionPicks : existingSession.totalItemsPicked;
           await widget.dbService.closeSession(
             existingSession.id,
             DateTime.now().millisecondsSinceEpoch,
-            existingSession.totalItemsPicked > 0 ? existingSession.totalItemsPicked : count,
+            count,
           );
         }
       }
     }
+  }
 
-    // Create and save new session.
+    // Create pending session template in memory.
+    // It will be officially persisted to SQLite with its monotonic sequence number upon the FIRST pick!
     final now = DateTime.now();
     final uuid = const Uuid().v4();
     final sessionId = uuid;
-
-    final seqNo = await widget.dbService.nextSessionSeqNo(_selectedUnit!.id);
     final tabletId = await widget.dbService.getConfig('tablet_id') ?? 'Tablet 1';
 
     final session = SessionMetadata(
       id: sessionId,
-      sessionSeqNo: seqNo,
+      sessionSeqNo: 0, // 0 indicates pending first pick
       unitId: _selectedUnit!.id,
       workerName: _workerName,
       tabletId: tabletId,
@@ -784,9 +791,6 @@ class _PickerFlowScreenState extends State<PickerFlowScreen> {
       issuedStatus: 'Pending Issue',
       totalItemsPicked: 0,
     );
-
-    await widget.dbService.saveSession(session);
-    LogService.picker('$_workerName → new session #${session.sessionSeqNo} on ${_selectedUnit!.name} / $_selectedDepartment');
 
     // Update last accessed timestamp
     final updatedUnit = _selectedUnit!.copyWith(
@@ -1587,6 +1591,63 @@ class _PickerFlowScreenState extends State<PickerFlowScreen> {
     final activeDepts = _departments.entries.where((e) => e.value).map((e) => e.key).toList();
     final inactiveDepts = _departments.entries.where((e) => !e.value).map((e) => e.key).toList();
 
+    // 1. Exclude departments with 0 parts (e.g. MAIN LINE depts whose parts are handled under Whole Resources)
+    final visibleActiveDepts = activeDepts.where((dept) {
+      final partInfo = _departmentPartProgress[dept];
+      final totalParts = partInfo?['totalParts'] ?? 0;
+      return totalParts > 0;
+    }).toList();
+
+    // 2. Sort: Uncompleted by urgency/due date first, and COMPLETED departments at the very bottom
+    visibleActiveDepts.sort((a, b) {
+      final partInfoA = _departmentPartProgress[a];
+      final totalA = partInfoA?['totalParts'] ?? 0;
+      final compA = partInfoA?['completedParts'] ?? 0;
+      final isDoneA = (totalA > 0 && compA >= totalA) || (_departmentUrgencies[a]?.isAllCompleted == true);
+
+      final partInfoB = _departmentPartProgress[b];
+      final totalB = partInfoB?['totalParts'] ?? 0;
+      final compB = partInfoB?['completedParts'] ?? 0;
+      final isDoneB = (totalB > 0 && compB >= totalB) || (_departmentUrgencies[b]?.isAllCompleted == true);
+
+      // Completed go to bottom
+      if (isDoneA && !isDoneB) return 1;
+      if (!isDoneA && isDoneB) return -1;
+      if (isDoneA && isDoneB) return a.compareTo(b);
+
+      // Uncompleted: sort by urgency status
+      final urgA = _departmentUrgencies[a];
+      final urgB = _departmentUrgencies[b];
+
+      final isPastA = urgA?.status == UnitUrgencyStatus.pastDue;
+      final isPastB = urgB?.status == UnitUrgencyStatus.pastDue;
+      if (isPastA && !isPastB) return -1;
+      if (!isPastA && isPastB) return 1;
+
+      final isSoonA = urgA?.status == UnitUrgencyStatus.dueSoon;
+      final isSoonB = urgB?.status == UnitUrgencyStatus.dueSoon;
+      if (isSoonA && !isSoonB) return -1;
+      if (!isSoonA && isSoonB) return 1;
+
+      final isNormA = urgA?.status == UnitUrgencyStatus.normal;
+      final isNormB = urgB?.status == UnitUrgencyStatus.normal;
+      if (isNormA && !isNormB) return -1;
+      if (!isNormA && isNormB) return 1;
+
+      final dateA = urgA?.earliestPickDate;
+      final dateB = urgB?.earliestPickDate;
+      if (dateA != null && dateB != null) {
+        final cmp = dateA.compareTo(dateB);
+        if (cmp != 0) return cmp;
+      } else if (dateA != null && dateB == null) {
+        return -1;
+      } else if (dateA == null && dateB != null) {
+        return 1;
+      }
+
+      return a.compareTo(b);
+    });
+
     return Column(
       key: const ValueKey('step3'),
       crossAxisAlignment: CrossAxisAlignment.start,
@@ -1608,10 +1669,10 @@ class _PickerFlowScreenState extends State<PickerFlowScreen> {
           ),
         ),
         Expanded(
-          child: activeDepts.isEmpty
+          child: visibleActiveDepts.isEmpty
               ? const Center(
                   child: Text(
-                    'No active departments. Ask admin to enable departments.',
+                    'No active departments with parts. Ask admin to check configuration.',
                     style: TextStyle(color: AppTheme.textMuted, fontSize: 16),
                     textAlign: TextAlign.center,
                   ),
@@ -1621,7 +1682,7 @@ class _PickerFlowScreenState extends State<PickerFlowScreen> {
                   children: [
                     const Text('Available departments:', style: TextStyle(fontSize: 13, color: AppTheme.textMuted)),
                     const SizedBox(height: 10),
-                    ...activeDepts.map((dept) {
+                    ...visibleActiveDepts.map((dept) {
                       final isSelected = _selectedDepartment == dept;
                       final deptUrgency = _departmentUrgencies[dept];
                       final partInfo = _departmentPartProgress[dept];

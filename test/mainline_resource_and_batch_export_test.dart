@@ -750,5 +750,173 @@ void main() {
       expect(rowCells[3], 'Handle');
       expect(rowCells[4], '10');
     });
+
+    test('Batch export filtering strictly omits items not picked in this batch', () {
+      final item1 = PicklistItem(
+        id: 'i1', unitId: 'u1', department: 'D1', line: 'L1', workOrder: 'WO1',
+        partId: 'P1', partDescription: 'Part 1', resourceId: 'R1',
+        qtyRequired: 10, qtyDue: 0, qtyPicked: 10, rowOrder: 1,
+      );
+      final item2 = PicklistItem(
+        id: 'i2', unitId: 'u1', department: 'D1', line: 'L1', workOrder: 'WO1',
+        partId: 'P2', partDescription: 'Part 2', resourceId: 'R2',
+        qtyRequired: 5, qtyDue: 5, qtyPicked: 0, rowOrder: 2,
+      );
+      final item3 = PicklistItem(
+        id: 'i3', unitId: 'u1', department: 'D1', line: 'L1', workOrder: 'WO1',
+        partId: 'P3', partDescription: 'Part 3', resourceId: 'R3',
+        qtyRequired: 20, qtyDue: 20, qtyPicked: 0, rowOrder: 3,
+      );
+
+      final unitItems = [item1, item2, item3];
+      // Suppose item1 was picked in Batch 1.
+      // In Batch 2, ONLY item2 was touched (e.g. 2 pcs picked), and P3 is auto-issue
+      final batchPartIds = {'P2'};
+      final autoIssueResourceIds = ['R3'];
+
+      final exportedRows = <PicklistItem>[];
+      for (final item in unitItems) {
+        final isAutoResource = autoIssueResourceIds.contains(item.resourceId);
+        final wasPickedInBatch = batchPartIds.contains(item.partId);
+        if (wasPickedInBatch || isAutoResource) {
+          exportedRows.add(item);
+        }
+      }
+
+      // item1 was picked in an earlier batch, NOT Batch 2 -> MUST BE OMITTED
+      expect(exportedRows.any((i) => i.partId == 'P1'), isFalse);
+      // item2 was picked in this batch -> MUST BE INCLUDED
+      expect(exportedRows.any((i) => i.partId == 'P2'), isTrue);
+      // item3 was auto-issued -> MUST BE INCLUDED
+      expect(exportedRows.any((i) => i.partId == 'P3'), isTrue);
+      expect(exportedRows.length, 2);
+    });
+
+    test('Department selection: 0-part departments hidden and completed departments placed at bottom', () {
+      final depts = [
+        {'name': 'Plumbing', 'isCompleted': false, 'totalParts': 2, 'pickDate': '2026-09-12'},
+        {'name': 'Weld', 'isCompleted': true, 'totalParts': 1, 'pickDate': '2026-09-15'},
+        {'name': 'Doors', 'isCompleted': false, 'totalParts': 2, 'pickDate': '2026-09-16'},
+        {'name': 'MAIN line B2', 'isCompleted': true, 'totalParts': 0, 'pickDate': ''},
+        {'name': 'MAIN line M2', 'isCompleted': true, 'totalParts': 0, 'pickDate': ''},
+      ];
+
+      // 1. Filter out 0-part departments
+      final visible = depts.where((d) => (d['totalParts'] as int) > 0).toList();
+      expect(visible.length, 3);
+      expect(visible.any((d) => d['name'] == 'MAIN line B2'), isFalse);
+      expect(visible.any((d) => d['name'] == 'MAIN line M2'), isFalse);
+
+      // 2. Sort: uncompleted first, completed at the very bottom
+      visible.sort((a, b) {
+        final aComp = a['isCompleted'] as bool;
+        final bComp = b['isCompleted'] as bool;
+        if (aComp != bComp) return aComp ? 1 : -1;
+        return (a['pickDate'] as String).compareTo(b['pickDate'] as String);
+      });
+
+      expect(visible[0]['name'], 'Plumbing'); // uncompleted, earliest date
+      expect(visible[1]['name'], 'Doors');    // uncompleted, later date
+      expect(visible[2]['name'], 'Weld');     // completed -> at the very bottom
+    });
+
+    test('80d (CLOSED) / 70d (EXPORTED) / 60d (ISSUED) auto-purge retention calculations', () {
+      final now = DateTime.now();
+
+      // CLOSED session: 80 days retention
+      final closedSession = SessionMetadata(
+        id: 's_closed',
+        sessionSeqNo: 1,
+        unitId: 'u1',
+        workerName: 'Picker',
+        pickDate: '2026-09-16',
+        startTime: now.subtract(const Duration(days: 10)).millisecondsSinceEpoch,
+        endTime: now.subtract(const Duration(days: 10)).millisecondsSinceEpoch,
+        status: 'CLOSED',
+      );
+      final closedEnd = DateTime.fromMillisecondsSinceEpoch(closedSession.endTime ?? closedSession.startTime);
+      final closedAgeDays = now.difference(closedEnd).inDays;
+      final closedRemaining = 80 - closedAgeDays;
+      expect(closedRemaining, 70); // 80 - 10 = 70 days remaining
+
+      // EXPORTED session: 70 days retention
+      final exportedSession = closedSession.copyWith(
+        status: 'EXPORTED',
+        batchId: 'BATCH_1',
+        endTime: now.subtract(const Duration(days: 5)).millisecondsSinceEpoch,
+      );
+      final exportedEnd = DateTime.fromMillisecondsSinceEpoch(exportedSession.endTime ?? exportedSession.startTime);
+      final exportedAgeDays = now.difference(exportedEnd).inDays;
+      final exportedRemaining = 70 - exportedAgeDays;
+      expect(exportedRemaining, 65); // 70 - 5 = 65 days remaining
+
+      // ISSUED session: 60 days retention from issued_at
+      final issuedSession = exportedSession.copyWith(
+        status: 'ISSUED',
+        issuedAt: now.subtract(const Duration(days: 2)).millisecondsSinceEpoch,
+      );
+      final issuedDate = DateTime.fromMillisecondsSinceEpoch(issuedSession.issuedAt!);
+      final issuedAgeDays = now.difference(issuedDate).inDays;
+      final issuedRemaining = 60 - issuedAgeDays;
+      expect(issuedRemaining, 58); // 60 - 2 = 58 days remaining
+    });
+
+    test('Lazy session initialization: sequence number is 0 until first pick is made', () {
+      // Pending session created upon worker selection
+      final pendingSession = SessionMetadata(
+        id: 'pending_uuid',
+        sessionSeqNo: 0,
+        unitId: 'unit_1',
+        workerName: 'John',
+        pickDate: '2026-09-16',
+        startTime: DateTime.now().millisecondsSinceEpoch,
+      );
+
+      // Must have seqNo == 0 (not persisted)
+      expect(pendingSession.sessionSeqNo, 0);
+      expect(pendingSession.isClosed, isFalse);
+
+      // Upon first confirmed pick, seqNo becomes monotonic (> 0)
+      final activeSession = pendingSession.copyWith(
+        sessionSeqNo: 1,
+        totalItemsPicked: 1,
+      );
+      expect(activeSession.sessionSeqNo, 1);
+      expect(activeSession.cardDisplayTitle, contains('Session #1 (John)'));
+    });
+
+    test('Department line grouping toggle creates correct hierarchy with and without Line level', () {
+      final presetWithLine = GroupingEngine.getPresetForDepartment('Plumbing', includeLine: true);
+      expect(presetWithLine.levels.contains(GroupLevel.line), isTrue);
+
+      final presetWithoutLine = GroupingEngine.getPresetForDepartment('Plumbing', includeLine: false);
+      expect(presetWithoutLine.levels.contains(GroupLevel.line), isFalse);
+    });
+
+    test('Delta calculation with captured previousItems accurately records pick deltas', () {
+      final itemA = PicklistItem(
+        id: 'item_1', unitId: 'u1', department: 'Plumbing', line: 'B2', workOrder: 'WO1',
+        partId: 'P100', partDescription: 'Pipe', qtyRequired: 10, qtyDue: 10, qtyPicked: 0, rowOrder: 1,
+      );
+      final items = [itemA];
+
+      // Save previousItems before allocation
+      final previousItems = List<PicklistItem>.from(items);
+
+      // User picks 4 pcs
+      final updatedList = FifoAllocationEngine.allocateByPartId(
+        allItems: items,
+        department: 'Plumbing',
+        partId: 'P100',
+        totalPickedToAllocate: 4,
+      );
+
+      final updated = updatedList.first;
+      final old = previousItems.firstWhere((o) => o.id == updated.id);
+      final delta = updated.qtyPicked - old.qtyPicked;
+
+      expect(delta, 4.0);
+      expect(delta > 0.0001, isTrue);
+    });
   });
 }

@@ -65,24 +65,30 @@ lib/
 - **Dynamic Recalculation**: Once the burning department is closed or fully picked, the unit's earliest pick date automatically recalculates to the next earliest incomplete department.
 
 ### 3-Stage Picking Session Lifecycle & Status Workflow
-- **Stage 1 (Pick & Collect)**: Closing a picking session (or exiting to Home) marks the session as **`CLOSED`** directly in SQLite with its exact timestamps and items picked. No individual Excel exports are created upon closing, avoiding premature exports.
-- **Accurate Session-Specific Pick Metrics (`session_picks` Table)**: Picks made in a session are recorded into SQLite `session_picks` (`sessionId`, `unitId`, `itemId`, `partId`, `qtyPickedDelta`, `createdAt`). Session cards and metrics show the exact unique parts picked *in that session* (`session.totalItemsPicked`), not the whole unit's cumulative parts.
-- **Stage 2 (Unified Batch Super Export across All Units)**:
+- **Lazy Session Initialization (Start ONLY on First Pick)**:
+  - Starting a picking session (selecting worker name, unit, and department) prepares an in-memory session template (`sessionSeqNo = 0`) and does **NOT** persist to SQLite or consume a sequence number.
+  - The session officially starts and is saved to SQLite only upon the **first confirmed pick** (`delta > 0`).
+  - If a worker exits or closes the session with 0 picks, the session is discarded completely and never saved or exported.
+- **Accurate Session-Specific Pick Metrics (`session_picks` Table & Delta Calculation)**: Picks made in a session are recorded into SQLite `session_picks` (`sessionId`, `unitId`, `itemId`, `partId`, `qtyPickedDelta`, `createdAt`). To prevent calculation errors when updating local state, `previousItems` is snapshotted before allocating picks so item deltas are strictly calculated against the pre-pick state. Session cards and metrics show the exact unique parts picked *in that session* (`session.totalItemsPicked`), not the whole unit's cumulative parts.
+- **Stage 1 (Pick & Collect — CLOSED: 80-Day Retention)**: Closing a picking session marks the session as **`CLOSED`** directly in SQLite with its exact timestamps and items picked. Closed sessions have an **80-day retention** countdown: `⏳ X days remaining until auto-purge (80d retention)`. No individual Excel exports are created upon closing, avoiding premature exports.
+- **Stage 2 (Unified Batch Super Export across All Units — EXPORTED: 70-Day Retention)**:
   - In Tab 1 ("Closed") of `SessionExportScreen`, closed sessions across all units collect for review.
-  - Tapping `⚡ Export All Unexported (Batch Super Export)` prompts a **confirmation dialog** before consolidating.
+  - Tapping `⚡ Export All Unexported (Batch Super Export)` prompts a confirmation dialog before consolidating.
   - All closed sessions across ALL units are consolidated into **ONE single Super Session** with a single `batchId` (`BATCH_SUPER_{TabletId}_{MinSeq}_to_{MaxSeq}_{Timestamp}`) and exported into **ONE consolidated Excel file** combining picked and auto-issued rows from all units, transitioning their status to **`EXPORTED`** (Tab 2).
+  - Status transition resets the countdown to **70-day retention**: `⏳ X days remaining until auto-purge (70d retention)`.
   - **First Column "File Name" in Consolidated Super Session**: The consolidated Excel workbook reserves Column 0 (Column A) for `File Name` (e.g. `unit_56.xlsx`), populated for each exported row to clearly distinguish source units. All original picklist columns and ERP service audit columns are shifted to the right by 1 index.
   - **LIFO Sorting (Newest First)**: Super Session batch cards on Exported and Issued tabs are always sorted latest-first so new work remains immediately accessible on top.
   - **Only Picked / Auto-Issued Rows Exported**: Untouched / unpicked items (`qtyPicked == 0` and not auto-issued) or blocked items are **omitted** from the exported Excel file. Only picked (`qtyPicked > 0.0001`) or auto-issued items are written.
   - **Direct SQLite Source of Truth**: All quantities (`qtyPicked`, `qtyDue`) and session states are taken directly from the SQLite database.
   - **Cumulative Quantity Summing**: When items for a Work Order are picked across multiple sessions, quantities are summed into the item's row (`qtyPicked`, `qtyDue`), while the ERP audit column details session contributions with separators (e.g. `Batch: #1, #2 [#1 (Alex: 10 parts, 45 min) | #2 (Maria: 5 parts, 30 min)]`).
   - ERP default issued status: `Pending Issue`.
-- **Stage 3 (Mark as ISSUED — PIN Free & Batch-Atomic)**:
+- **Stage 3 (Mark as ISSUED — PIN Free & Batch-Atomic — ISSUED: 60-Day Retention)**:
   - In Tab 2 ("Exported"), sessions are grouped by `batchId` into cohesive Super Session cards. Users transition entire batches to **`ISSUED`** (Tab 3) via the batch-level `✓ Mark as ISSUED` button.
+  - Status transition resets the countdown to **60-day retention from issued_at**: `⏳ X days remaining until auto-purge (60d retention)`.
   - Child session cards are embedded directly within their parent Super Session (under an expandable list) and do not have individual status transition buttons, preventing batch fragmentation across tabs.
   - On marking as ISSUED, the screen remains on Tab 2 and shows a SnackBar with a `[View in Issued]` action, eliminating disorienting tab jumps.
-  - **Auto-Purge Countdown on ISSUED Cards**: Each ISSUED Super Session card displays `⏳ X days remaining until auto-purge (60d retention)`.
-  - **No Manual Deletion & Simplified 60-Day Auto-Purge**: Manual delete (trash) buttons have been completely removed from `SessionExportScreen` to prevent accidental manual purges. When marked as `ISSUED`, sessions record an `issued_at` timestamp. SQLite automatically purges `ISSUED` sessions older than 60 days via `DatabaseService.purgeExpiredIssuedSessions(retentionDays: 60)` during app launch and export hub loading. Soft-deleted unit expiration purges only the unit and its picklist items, **never deleting sessions**.
+  - **No Manual Deletion & Simplified 60-Day Auto-Purge**: Manual delete (trash) buttons have been completely removed from `SessionExportScreen`. SQLite automatically purges `CLOSED` (> 80d), `EXPORTED` (> 70d), and `ISSUED` (> 60d) sessions via `DatabaseService.purgeExpiredSessionsLifecycle()` during app launch and export hub loading.
+  - **50 MB Storage Cap FIFO Auto-Purge**: If SQLite DB + logs reach 50 MB, the system automatically deletes oldest sessions (FIFO: ISSUED first, then EXPORTED, then CLOSED) and oldest logs until storage is back under the 50 MB threshold. Soft-deleted unit expiration purges only the unit and its picklist items, **never deleting sessions**.
   - **Super Session Integrity**: Each batch/super session remains an immutable, unique entity throughout its entire lifecycle. Sessions are not merged or lumped across batches.
   - **Strict Part-ID Metrics (No pcs)**: Super Session headers and individual cards display strictly unique Part ID metrics: `X / Y parts` (e.g. partially or fully picked Part IDs across all units) and `X parts`. Piece counts (`pcs`) are omitted from export hub displays.
   - Live session duration (`formattedDuration`, e.g. `1h 24min`, `45 min`, `< 1 min`) and cumulative batch duration are displayed prominently across all cards and headers.
@@ -128,13 +134,21 @@ lib/
   - **Dual-Mode Hierarchy Support (No Line Level)**:
     - **Combined Mode (All Depts)**: Merges all parts under `Unit → Resource ID → Part ID`, completely omitting the Line and Department levels. Leaf parts display destination department badges (`Dept: {Name}`). Stationed header renders `[⚡ Pick Mode]`.
     - **By Department Mode**: Retains collapsible department containers `Unit → Resource ID → Department → Part ID` (using `ExpansionTile`). In this mode, `[⚡ Pick Mode]` is suppressed on Resource ID and only rendered on Department tiles.
-    - **Live Toggle**: Workers can switch modes dynamically via the banner button in `PickingScreen`.
+    - **Live Dual Toggles with 2-Minute Admin PIN Lock**:
+      - **Whole Resources**: `Combined (All Depts)` vs `By Department`.
+      - **Departments**: `Combined (No Line)` vs `By Line`.
+      - Toggling in `PickingScreen` displays a micro lock icon and requires entering the Admin PIN (default 1234). Once unlocked, it grants a 2-minute window to switch modes without re-entering PIN. The choice is persistently saved per Resource ID (`mainline_resource_views`) or per Department (`line_grouping_dept_overrides`).
+    - **2-Row Sub-Banner Layout**: To prevent clipping and horizontal scrolling on tablets, the sub-banner displays:
+      - **Row 1**: Scope icon, dept/resource type badge, title, part progress badge, pick date, and prod date.
+      - **Row 2**: Label `View Mode:` + the interactive live toggle (`_buildResourceToggle` or `_buildDepartmentLineToggle`) with 2-minute unlock countdown badge.
+    - **Step 3 Department Filtering & Completed Sorting**: In `PickerFlowScreen` Step 3, departments with `0 / 0 parts` (e.g. when all component resources are picked via Whole Resource mode) are completely hidden. Completed departments are sorted to the very bottom of the list, keeping incomplete departments prioritized by urgency at top.
     - **Per-Resource Admin Configuration**: Each MAIN LINE resource is configured individually with its own default view (`Combined` vs `By Dept`) directly on its card in Admin Tab 5 (the redundant global toggle was removed).
 - **ON-HAND Location Display**: Displayed side-by-side with Part Description across all picking views (Grouping Tree leaves, Pick Mode console/header, and Confirm Pick dialog), resolved using the first non-empty value for that Part ID.
 - **Dependency Rule**: If a Component Resource ID is blocked from picking on this tablet, its Auto-Issue setting is **disabled and inactive**.
 - **(Empty / Unassigned) Support**: Parts with missing/blank Resource IDs are explicitly listed as `(Empty / Unassigned)` in Component Resources with both picking permission and auto-issue support.
 - **During Picking**: Parts belonging to blocked or Auto-Issue Resource IDs are completely hidden from the tree view and Pick Mode, and excluded from pending pick metrics.
-- **On Export (One-Time Auto-Issue per Unit)**: All Auto-Issue items (including empty resource IDs if configured) are automatically written as 100% picked (`qtyPicked = qtyRequired, qtyDue = 0`) in the exported Excel workbook and ERP columns on the unit's **first batch export only**. Once exported (`auto_issue_exported_{unitId}` set to true), subsequent batch exports for that unit omit auto-issue items to prevent re-issuing. Untouched non-auto-issued rows (`qtyPicked == 0`) are omitted from all exports.
+- **On Export (One-Time Auto-Issue per Unit & Batch Pick Isolation)**: All Auto-Issue items (including empty resource IDs if configured) are automatically written as 100% picked (`qtyPicked = qtyRequired, qtyDue = 0`) in the exported Excel workbook and ERP columns on the unit's **first batch export only**. Once exported (`auto_issue_exported_{unitId}` set to true), subsequent batch exports for that unit omit auto-issue items to prevent re-issuing.
+- **Strict Batch Pick Filtering**: Super Session Batch export only writes items whose Part IDs were actually picked in the batch's closed sessions (`unitBatchPickedPartIds`) plus eligible auto-issued items. Unpicked rows or rows from past batches are strictly omitted. If all closed sessions in a batch have 0 picks and no auto-issue parts are pending, empty batch export is blocked.
 
 ### Tree Hierarchy Specification (Grouping Presets)
 The complete hierarchy evaluated by the Grouping Engine:

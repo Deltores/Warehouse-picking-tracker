@@ -138,11 +138,8 @@ class _AdminScreenState extends State<AdminScreen> with SingleTickerProviderStat
     if (_lastAdminAuthTime == null ||
         DateTime.now().difference(_lastAdminAuthTime!) >= _adminSessionTimeout) {
       _authInactivityTimer?.cancel();
+      _lastAdminAuthTime = null;
       if (mounted) {
-        setState(() {
-          _isAuthenticated = false;
-          _lastAdminAuthTime = null;
-        });
         ScaffoldMessenger.of(context).showSnackBar(
           const SnackBar(
             content: Text('Admin session expired (15-minute timeout). Returning to Home.'),
@@ -2321,19 +2318,22 @@ class _AdminScreenState extends State<AdminScreen> with SingleTickerProviderStat
           color: AppTheme.cardDark,
           child: Column(
             children: [
-              Row(
-                children: [
-                  Expanded(
-                    child: Column(
+              LayoutBuilder(
+                builder: (context, constraints) {
+                  final isNarrow = constraints.maxWidth < 900;
+                  if (isNarrow) {
+                    return Column(
                       crossAxisAlignment: CrossAxisAlignment.start,
                       children: [
                         Row(
                           children: [
                             const Icon(Icons.analytics_rounded, size: 20, color: AppTheme.accentCyan),
                             const SizedBox(width: 8),
-                            Text(
-                              '$count log entries  •  ${sizeMb.toStringAsFixed(2)} / 49.00 MB used (${(usagePercent * 100).toStringAsFixed(1)}%)',
-                              style: const TextStyle(fontWeight: FontWeight.bold, color: AppTheme.textLight),
+                            Expanded(
+                              child: Text(
+                                '$count log entries  •  ${sizeMb.toStringAsFixed(2)} / 49.00 MB used (${(usagePercent * 100).toStringAsFixed(1)}%)',
+                                style: const TextStyle(fontWeight: FontWeight.bold, color: AppTheme.textLight),
+                              ),
                             ),
                           ],
                         ),
@@ -2353,44 +2353,121 @@ class _AdminScreenState extends State<AdminScreen> with SingleTickerProviderStat
                             minHeight: 6,
                           ),
                         ),
+                        const SizedBox(height: 12),
+                        Wrap(
+                          spacing: 8,
+                          runSpacing: 8,
+                          crossAxisAlignment: WrapCrossAlignment.center,
+                          children: [
+                            ElevatedButton.icon(
+                              style: ElevatedButton.styleFrom(backgroundColor: AppTheme.accentCyan),
+                              icon: const Icon(Icons.file_download_rounded, color: Colors.black, size: 18),
+                              label: const Text('Export CSV', style: TextStyle(color: Colors.black, fontWeight: FontWeight.bold)),
+                              onPressed: _exportLogsToCsv,
+                            ),
+                            OutlinedButton.icon(
+                              style: OutlinedButton.styleFrom(
+                                side: const BorderSide(color: AppTheme.accentCyan),
+                                foregroundColor: AppTheme.accentCyan,
+                                padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 8),
+                              ),
+                              icon: const Icon(Icons.password_rounded, size: 16),
+                              label: const Text('Change Admin PIN', style: TextStyle(fontSize: 12, fontWeight: FontWeight.bold)),
+                              onPressed: _showChangePinDialog,
+                            ),
+                            IconButton(
+                              icon: const Icon(Icons.refresh_rounded, color: AppTheme.textLight),
+                              tooltip: 'Refresh Logs',
+                              onPressed: _loadLogs,
+                            ),
+                            IconButton(
+                              icon: const Icon(Icons.security_rounded, color: AppTheme.textLight),
+                              tooltip: 'Change Super Admin PIN',
+                              onPressed: _showChangeSuperAdminPinDialog,
+                            ),
+                            IconButton(
+                              icon: const Icon(Icons.auto_delete_rounded, color: AppTheme.accentCyan),
+                              tooltip: 'Delete Logs Older Than 30 Days',
+                              onPressed: _purgeOldLogs,
+                            ),
+                          ],
+                        ),
                       ],
-                    ),
-                  ),
-                  const SizedBox(width: 16),
-                  ElevatedButton.icon(
-                    style: ElevatedButton.styleFrom(backgroundColor: AppTheme.accentCyan),
-                    icon: const Icon(Icons.file_download_rounded, color: Colors.black, size: 18),
-                    label: const Text('Export CSV', style: TextStyle(color: Colors.black, fontWeight: FontWeight.bold)),
-                    onPressed: _exportLogsToCsv,
-                  ),
-                  const SizedBox(width: 10),
-                  OutlinedButton.icon(
-                    style: OutlinedButton.styleFrom(
-                      side: const BorderSide(color: AppTheme.accentCyan),
-                      foregroundColor: AppTheme.accentCyan,
-                      padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 8),
-                    ),
-                    icon: const Icon(Icons.password_rounded, size: 16),
-                    label: const Text('Change Admin PIN', style: TextStyle(fontSize: 12, fontWeight: FontWeight.bold)),
-                    onPressed: _showChangePinDialog,
-                  ),
-                  const SizedBox(width: 8),
-                  IconButton(
-                    icon: const Icon(Icons.refresh_rounded, color: AppTheme.textLight),
-                    tooltip: 'Refresh Logs',
-                    onPressed: _loadLogs,
-                  ),
-                  IconButton(
-                    icon: const Icon(Icons.security_rounded, color: AppTheme.textLight),
-                    tooltip: 'Change Super Admin PIN',
-                    onPressed: _showChangeSuperAdminPinDialog,
-                  ),
-                  IconButton(
-                    icon: const Icon(Icons.auto_delete_rounded, color: AppTheme.accentCyan),
-                    tooltip: 'Delete Logs Older Than 30 Days',
-                    onPressed: _purgeOldLogs,
-                  ),
-                ],
+                    );
+                  }
+
+                  return Row(
+                    children: [
+                      Expanded(
+                        child: Column(
+                          crossAxisAlignment: CrossAxisAlignment.start,
+                          children: [
+                            Row(
+                              children: [
+                                const Icon(Icons.analytics_rounded, size: 20, color: AppTheme.accentCyan),
+                                const SizedBox(width: 8),
+                                Text(
+                                  '$count log entries  •  ${sizeMb.toStringAsFixed(2)} / 49.00 MB used (${(usagePercent * 100).toStringAsFixed(1)}%)',
+                                  style: const TextStyle(fontWeight: FontWeight.bold, color: AppTheme.textLight),
+                                ),
+                              ],
+                            ),
+                            const SizedBox(height: 6),
+                            ClipRRect(
+                              borderRadius: BorderRadius.circular(4),
+                              child: LinearProgressIndicator(
+                                value: usagePercent,
+                                backgroundColor: AppTheme.bgDark,
+                                valueColor: AlwaysStoppedAnimation<Color>(
+                                  usagePercent > 0.9
+                                      ? AppTheme.statusDanger
+                                      : usagePercent > 0.7
+                                          ? AppTheme.statusPartial
+                                          : AppTheme.accentCyan,
+                                ),
+                                minHeight: 6,
+                              ),
+                            ),
+                          ],
+                        ),
+                      ),
+                      const SizedBox(width: 16),
+                      ElevatedButton.icon(
+                        style: ElevatedButton.styleFrom(backgroundColor: AppTheme.accentCyan),
+                        icon: const Icon(Icons.file_download_rounded, color: Colors.black, size: 18),
+                        label: const Text('Export CSV', style: TextStyle(color: Colors.black, fontWeight: FontWeight.bold)),
+                        onPressed: _exportLogsToCsv,
+                      ),
+                      const SizedBox(width: 10),
+                      OutlinedButton.icon(
+                        style: OutlinedButton.styleFrom(
+                          side: const BorderSide(color: AppTheme.accentCyan),
+                          foregroundColor: AppTheme.accentCyan,
+                          padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 8),
+                        ),
+                        icon: const Icon(Icons.password_rounded, size: 16),
+                        label: const Text('Change Admin PIN', style: TextStyle(fontSize: 12, fontWeight: FontWeight.bold)),
+                        onPressed: _showChangePinDialog,
+                      ),
+                      const SizedBox(width: 8),
+                      IconButton(
+                        icon: const Icon(Icons.refresh_rounded, color: AppTheme.textLight),
+                        tooltip: 'Refresh Logs',
+                        onPressed: _loadLogs,
+                      ),
+                      IconButton(
+                        icon: const Icon(Icons.security_rounded, color: AppTheme.textLight),
+                        tooltip: 'Change Super Admin PIN',
+                        onPressed: _showChangeSuperAdminPinDialog,
+                      ),
+                      IconButton(
+                        icon: const Icon(Icons.auto_delete_rounded, color: AppTheme.accentCyan),
+                        tooltip: 'Delete Logs Older Than 30 Days',
+                        onPressed: _purgeOldLogs,
+                      ),
+                    ],
+                  );
+                },
               ),
               const SizedBox(height: 12),
               // Search & filter row

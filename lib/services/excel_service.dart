@@ -484,6 +484,7 @@ class ExcelService {
     required Map<String, Map<String, List<String>>> unitReturnComments, // unitId -> partId -> comments
     required String outputPath,
     Map<String, List<String>> unitAutoIssueResourceIds = const {},
+    Map<String, Set<String>> unitBatchPickedPartIds = const {}, // unitId -> set of picked partIds in this batch
     String issuedStatus = 'Pending Issue',
   }) async {
     if (sessions.isEmpty || unitOriginalFiles.isEmpty) {
@@ -732,7 +733,12 @@ class ExcelService {
             ? autoIssueResourceIds.any((r) => r.trim().isEmpty || r == '(Empty / Unassigned)')
             : autoIssueResourceIds.any((r) => r.trim().toLowerCase() == item.resourceId.trim().toLowerCase());
 
-        final shouldExport = item.qtyPicked > 0.0001 || isAutoResource;
+        final batchPartIds = unitBatchPickedPartIds[unitId] ?? <String>{};
+        final wasPickedInBatch = unitBatchPickedPartIds.containsKey(unitId)
+            ? batchPartIds.contains(item.partId)
+            : item.qtyPicked > 0.0001;
+
+        final shouldExport = wasPickedInBatch || isAutoResource;
         if (!shouldExport) continue;
 
         // Write source File Name in Column 0

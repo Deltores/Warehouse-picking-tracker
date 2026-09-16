@@ -72,6 +72,7 @@ class _SessionExportScreenState extends State<SessionExportScreen>
   List<SessionMetadata> _sessions = [];
   Map<String, UnitRecord> _units = {};
   Map<String, Map<String, num>> _unitPickStats = {};
+  Map<String, Set<String>> _sessionPartIdsMap = {};
   String? _customExportDir;
   bool _isLoading = true;
 
@@ -113,16 +114,25 @@ class _SessionExportScreenState extends State<SessionExportScreen>
       statsMap[u.id] = await widget.dbService.getUnitPartPickStats(u.id);
     }
 
-    // Auto-purge sessions marked as ISSUED older than 60 days
-    await widget.dbService.purgeExpiredIssuedSessions(retentionDays: 60);
+    // Auto-purge sessions according to lifecycle (CLOSED: 80d, EXPORTED: 70d, ISSUED: 60d) and 50MB cap
+    await widget.dbService.purgeExpiredSessionsLifecycle();
+
+    // Synchronize session picked counts from session_picks to heal legacy/corrupted counts
+    await widget.dbService.syncSessionPicksCounts();
 
     final sessions = await widget.dbService.getAllExportableSessions();
     // LIFO sorting: newest sessions (by end time or start time) at top
     sessions.sort((a, b) => (b.endTime ?? b.startTime).compareTo(a.endTime ?? a.startTime));
 
+    final sessionPartIdsMap = <String, Set<String>>{};
+    for (final s in sessions) {
+      sessionPartIdsMap[s.id] = await widget.dbService.getSessionPickedPartIds(s.id);
+    }
+
     if (mounted) {
       setState(() {
         _sessions = sessions;
+        _sessionPartIdsMap = sessionPartIdsMap;
         _unitPickStats = statsMap;
         _isLoading = false;
       });
@@ -249,6 +259,68 @@ class _SessionExportScreenState extends State<SessionExportScreen>
         throw Exception('No unit files found for closed sessions.');
       }
 
+      final unitBatchPickedPartIds = <String, Set<String>>{};
+      final sessionIds = sessionsToExport.map((s) => s.id).toList();
+      int totalPickedInBatch = 0;
+      for (final uid in allUnitIds) {
+        final pickedPartIds = await widget.dbService.getBatchPickedPartIdsForUnit(sessionIds, uid);
+        unitBatchPickedPartIds[uid] = pickedPartIds;
+        totalPickedInBatch += pickedPartIds.length;
+      }
+
+      // Check if there are any auto-issue items pending
+      bool hasPendingAutoIssue = false;
+      for (final uid in allUnitIds) {
+        final autoRes = unitAutoIssueResourceIds[uid] ?? [];
+        if (autoRes.isNotEmpty) {
+          final items = unitItems[uid] ?? [];
+          if (items.any((i) => i.resourceId.trim().isEmpty
+              ? autoRes.any((r) => r.trim().isEmpty || r == '(Empty / Unassigned)')
+              : autoRes.any((r) => r.trim().toLowerCase() == i.resourceId.trim().toLowerCase()))) {
+            hasPendingAutoIssue = true;
+            break;
+          }
+        }
+      }
+
+      if (totalPickedInBatch == 0 && !hasPendingAutoIssue) {
+        setState(() => _isLoading = false);
+        if (mounted) {
+          showDialog(
+            context: context,
+            builder: (ctx) => AlertDialog(
+              backgroundColor: AppTheme.cardDark,
+              shape: RoundedRectangleBorder(
+                borderRadius: BorderRadius.circular(16),
+                side: const BorderSide(color: AppTheme.borderDark),
+              ),
+              title: const Row(
+                children: [
+                  Icon(Icons.info_outline_rounded, color: AppTheme.statusPartial, size: 24),
+                  SizedBox(width: 8),
+                  Text('No Parts Picked', style: TextStyle(color: AppTheme.textLight, fontSize: 16)),
+                ],
+              ),
+              content: const Text(
+                'None of the selected closed sessions contain picked parts, and there are no auto-issue parts pending.\n\nCannot export an empty Super Session.',
+                style: TextStyle(color: AppTheme.textMuted, fontSize: 13, height: 1.4),
+              ),
+              actions: [
+                ElevatedButton(
+                  style: ElevatedButton.styleFrom(
+                    backgroundColor: AppTheme.primaryBlue,
+                    foregroundColor: Colors.white,
+                  ),
+                  onPressed: () => Navigator.pop(ctx),
+                  child: const Text('OK'),
+                ),
+              ],
+            ),
+          );
+        }
+        return;
+      }
+
       final seqNos = sessionsToExport.map((s) => s.sessionSeqNo).where((n) => n > 0).toList()..sort();
       final minSeq = seqNos.isNotEmpty ? seqNos.first : 1;
       final maxSeq = seqNos.isNotEmpty ? seqNos.last : 1;
@@ -281,6 +353,7 @@ class _SessionExportScreenState extends State<SessionExportScreen>
         unitReturnComments: unitReturnComments,
         outputPath: outputPath,
         unitAutoIssueResourceIds: unitAutoIssueResourceIds,
+        unitBatchPickedPartIds: unitBatchPickedPartIds,
         issuedStatus: issuedStatus,
       );
 
@@ -679,16 +752,19 @@ class _SessionExportScreenState extends State<SessionExportScreen>
     final endStr = DateFormat('yyyy-MM-dd HH:mm').format(DateTime.fromMillisecondsSinceEpoch(latestEnd));
 
     final closedUnitIds = _closedSessions.map((s) => s.unitId).toSet();
-    int totalPickedParts = 0;
     int totalUnitParts = 0;
     for (final uid in closedUnitIds) {
-      totalPickedParts += _unitPickStats[uid]?['picked_parts']?.toInt() ?? 0;
       totalUnitParts += _unitPickStats[uid]?['total_parts']?.toInt() ?? 0;
     }
 
+    final batchPartIds = _closedSessions.expand((s) => _sessionPartIdsMap[s.id] ?? <String>{}).toSet();
+    final pickedCount = batchPartIds.isNotEmpty
+        ? batchPartIds.length
+        : _closedSessions.fold<int>(0, (sum, s) => sum + s.totalItemsPicked);
+
     final partsDisplay = totalUnitParts > 0
-        ? '$totalPickedParts / $totalUnitParts parts'
-        : '$totalPickedParts parts';
+        ? '$pickedCount / $totalUnitParts parts'
+        : '$pickedCount parts';
 
     return Container(
       margin: const EdgeInsets.only(bottom: 16),
@@ -758,28 +834,36 @@ class _SessionExportScreenState extends State<SessionExportScreen>
     final startStr = DateFormat('yyyy-MM-dd HH:mm').format(DateTime.fromMillisecondsSinceEpoch(batch.earliestStart));
     final endStr = DateFormat('yyyy-MM-dd HH:mm').format(DateTime.fromMillisecondsSinceEpoch(batch.latestEnd));
 
-    int totalPickedParts = 0;
     int totalUnitParts = 0;
     for (final uid in batch.unitIds) {
       final s = _unitPickStats[uid];
       if (s != null) {
-        totalPickedParts += s['picked_parts']?.toInt() ?? 0;
         totalUnitParts += s['total_parts']?.toInt() ?? 0;
       }
     }
-    final partsDisplay = totalUnitParts > 0
-        ? '$totalPickedParts / $totalUnitParts parts'
-        : '${batch.totalItemsPicked} parts';
 
-    int daysUntilPurge = 60;
-    if (!isExportedTab) {
+    final batchPartIds = batch.sessions.expand((s) => _sessionPartIdsMap[s.id] ?? <String>{}).toSet();
+    final pickedCount = batchPartIds.isNotEmpty
+        ? batchPartIds.length
+        : batch.totalItemsPicked;
+
+    final partsDisplay = totalUnitParts > 0
+        ? '$pickedCount / $totalUnitParts parts'
+        : '$pickedCount parts';
+
+    int daysUntilPurge;
+    final int retentionPeriodDays = isExportedTab ? 70 : 60;
+    if (isExportedTab) {
+      final expiryTime = batch.latestEnd + const Duration(days: 70).inMilliseconds;
+      final msLeft = expiryTime - DateTime.now().millisecondsSinceEpoch;
+      daysUntilPurge = (msLeft / (1000 * 60 * 60 * 24)).ceil().clamp(0, 70);
+    } else {
       final issuedTimes = batch.sessions.map((s) => s.issuedAt).whereType<int>().toList();
       final latestIssuedAt = issuedTimes.isNotEmpty
           ? issuedTimes.reduce((a, b) => a > b ? a : b)
           : batch.latestEnd;
       final expiryTime = latestIssuedAt + const Duration(days: 60).inMilliseconds;
-      final nowMs = DateTime.now().millisecondsSinceEpoch;
-      final msLeft = expiryTime - nowMs;
+      final msLeft = expiryTime - DateTime.now().millisecondsSinceEpoch;
       daysUntilPurge = (msLeft / (1000 * 60 * 60 * 24)).ceil().clamp(0, 60);
     }
 
@@ -829,32 +913,30 @@ class _SessionExportScreenState extends State<SessionExportScreen>
                       'Start: $startStr • End: $endStr',
                       style: const TextStyle(fontSize: 11, color: AppTheme.textMuted, fontWeight: FontWeight.w500),
                     ),
-                    if (!isExportedTab) ...[
-                      const SizedBox(height: 4),
-                      Row(
-                        children: [
-                          Container(
-                            padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 3),
-                            decoration: BoxDecoration(
-                              color: Colors.amber.withValues(alpha: 0.12),
-                              borderRadius: BorderRadius.circular(6),
-                              border: Border.all(color: Colors.amber.withValues(alpha: 0.4)),
-                            ),
-                            child: Row(
-                              mainAxisSize: MainAxisSize.min,
-                              children: [
-                                const Icon(Icons.hourglass_bottom_rounded, size: 12, color: Colors.amber),
-                                const SizedBox(width: 4),
-                                Text(
-                                  '⏳ $daysUntilPurge days remaining until auto-purge (60d retention)',
-                                  style: const TextStyle(fontSize: 10, color: Colors.amber, fontWeight: FontWeight.bold),
-                                ),
-                              ],
-                            ),
+                    const SizedBox(height: 4),
+                    Row(
+                      children: [
+                        Container(
+                          padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 3),
+                          decoration: BoxDecoration(
+                            color: Colors.amber.withValues(alpha: 0.12),
+                            borderRadius: BorderRadius.circular(6),
+                            border: Border.all(color: Colors.amber.withValues(alpha: 0.4)),
                           ),
-                        ],
-                      ),
-                    ],
+                          child: Row(
+                            mainAxisSize: MainAxisSize.min,
+                            children: [
+                              const Icon(Icons.hourglass_bottom_rounded, size: 12, color: Colors.amber),
+                              const SizedBox(width: 4),
+                              Text(
+                                '⏳ $daysUntilPurge days remaining until auto-purge (${retentionPeriodDays}d retention)',
+                                style: const TextStyle(fontSize: 10, color: Colors.amber, fontWeight: FontWeight.bold),
+                              ),
+                            ],
+                          ),
+                        ),
+                      ],
+                    ),
                   ],
                 ),
               ),
@@ -1075,6 +1157,11 @@ class _SessionExportScreenState extends State<SessionExportScreen>
         ? DateFormat('yyyy-MM-dd HH:mm').format(DateTime.fromMillisecondsSinceEpoch(session.endTime!))
         : 'In progress';
 
+    final sessionEndTime = session.endTime ?? session.startTime;
+    final expiryTime = sessionEndTime + const Duration(days: 80).inMilliseconds;
+    final msLeft = expiryTime - DateTime.now().millisecondsSinceEpoch;
+    final daysUntilPurge = (msLeft / (1000 * 60 * 60 * 24)).ceil().clamp(0, 80);
+
     return Card(
       margin: const EdgeInsets.only(bottom: 12),
       shape: RoundedRectangleBorder(
@@ -1134,6 +1221,26 @@ class _SessionExportScreenState extends State<SessionExportScreen>
                 _metaChip(Icons.timer_outlined, session.formattedDuration),
                 _metaChip(Icons.check_box_rounded, '${session.totalItemsPicked} parts'),
               ],
+            ),
+            const SizedBox(height: 8),
+            Container(
+              padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 3),
+              decoration: BoxDecoration(
+                color: Colors.amber.withValues(alpha: 0.12),
+                borderRadius: BorderRadius.circular(6),
+                border: Border.all(color: Colors.amber.withValues(alpha: 0.4)),
+              ),
+              child: Row(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  const Icon(Icons.hourglass_bottom_rounded, size: 12, color: Colors.amber),
+                  const SizedBox(width: 4),
+                  Text(
+                    '⏳ $daysUntilPurge days remaining until auto-purge (80d retention)',
+                    style: const TextStyle(fontSize: 10, color: Colors.amber, fontWeight: FontWeight.bold),
+                  ),
+                ],
+              ),
             ),
             const SizedBox(height: 14),
             Container(

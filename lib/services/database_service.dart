@@ -581,15 +581,85 @@ class DatabaseService implements LogDatabase {
     return purgedCount;
   }
 
-  /// Permanently removes sessions marked as ISSUED older than [retentionDays] days (default 60 days).
+  /// Permanently removes sessions according to the lifecycle retention policy:
+  /// - CLOSED sessions older than 80 days
+  /// - EXPORTED sessions older than 70 days
+  /// - ISSUED sessions older than 60 days
+  /// Also enforces 50 MB total storage cap.
   Future<int> purgeExpiredIssuedSessions({int retentionDays = 60}) async {
+    return await purgeExpiredSessionsLifecycle(issuedRetentionDays: retentionDays);
+  }
+
+  Future<int> purgeExpiredSessionsLifecycle({
+    int closedRetentionDays = 80,
+    int exportedRetentionDays = 70,
+    int issuedRetentionDays = 60,
+  }) async {
     final db = await database;
-    final cutoff = DateTime.now().subtract(Duration(days: retentionDays)).millisecondsSinceEpoch;
-    return await db.delete(
+    final now = DateTime.now().millisecondsSinceEpoch;
+    final closedCutoff = now - Duration(days: closedRetentionDays).inMilliseconds;
+    final exportedCutoff = now - Duration(days: exportedRetentionDays).inMilliseconds;
+    final issuedCutoff = now - Duration(days: issuedRetentionDays).inMilliseconds;
+
+    int purgedCount = 0;
+
+    // 1. Purge CLOSED older than 80 days
+    purgedCount += await db.delete(
       'sessions',
-      where: "status = 'ISSUED' AND ((issued_at IS NOT NULL AND issued_at < ?) OR (issued_at IS NULL AND end_time IS NOT NULL AND end_time < ?))",
-      whereArgs: [cutoff, cutoff],
+      where: "status = 'CLOSED' AND ((end_time IS NOT NULL AND end_time < ?) OR (end_time IS NULL AND start_time < ?))",
+      whereArgs: [closedCutoff, closedCutoff],
     );
+
+    // 2. Purge EXPORTED older than 70 days
+    purgedCount += await db.delete(
+      'sessions',
+      where: "(status = 'EXPORTED' OR status = 'FINISHED') AND ((end_time IS NOT NULL AND end_time < ?) OR (end_time IS NULL AND start_time < ?))",
+      whereArgs: [exportedCutoff, exportedCutoff],
+    );
+
+    // 3. Purge ISSUED older than 60 days
+    purgedCount += await db.delete(
+      'sessions',
+      where: "status = 'ISSUED' AND ((issued_at IS NOT NULL AND issued_at < ?) OR (issued_at IS NULL AND end_time IS NOT NULL AND end_time < ?) OR (issued_at IS NULL AND start_time < ?))",
+      whereArgs: [issuedCutoff, issuedCutoff, issuedCutoff],
+    );
+
+    // 4. Enforce 50 MB storage limit
+    await enforce50MbStorageCap();
+
+    return purgedCount;
+  }
+
+  /// Checks total database file size and purges oldest records if approaching 50 MB.
+  Future<void> enforce50MbStorageCap() async {
+    try {
+      final db = await database;
+      final dbPath = db.path;
+      final file = File(dbPath);
+      if (!await file.exists()) return;
+      final sizeBytes = await file.length();
+      const capBytes = 50 * 1024 * 1024; // 50 MB
+      if (sizeBytes >= capBytes) {
+        // Purge oldest sessions in FIFO order: ISSUED first, then EXPORTED, then CLOSED
+        final oldestSessions = await db.query(
+          'sessions',
+          columns: ['id'],
+          orderBy: "CASE status WHEN 'ISSUED' THEN 1 WHEN 'EXPORTED' THEN 2 ELSE 3 END ASC, start_time ASC",
+          limit: 20,
+        );
+        for (final s in oldestSessions) {
+          final sid = s['id'] as String;
+          await db.delete('session_picks', where: 'session_id = ?', whereArgs: [sid]);
+          await db.delete('sessions', where: 'id = ?', whereArgs: [sid]);
+        }
+        // Also prune oldest app_logs if DB is large
+        await db.rawDelete('''
+          DELETE FROM app_logs WHERE id IN (
+            SELECT id FROM app_logs ORDER BY timestamp ASC LIMIT 500
+          )
+        ''');
+      }
+    } catch (_) {}
   }
 
   Future<void> clearAllData() async {
@@ -1869,6 +1939,44 @@ class DatabaseService implements LogDatabase {
       [sessionId],
     );
     return (rows.first['cnt'] as num?)?.toInt() ?? 0;
+  }
+
+  /// Returns all distinct Part IDs picked across a given list of sessions.
+  Future<Set<String>> getBatchPickedPartIds(List<String> sessionIds) async {
+    if (sessionIds.isEmpty) return {};
+    final db = await database;
+    final placeholders = List.filled(sessionIds.length, '?').join(',');
+    final rows = await db.rawQuery(
+      'SELECT DISTINCT part_id FROM session_picks WHERE session_id IN ($placeholders) AND qty_picked > 0.0001',
+      sessionIds,
+    );
+    return rows.map((r) => r['part_id'].toString()).where((s) => s.isNotEmpty).toSet();
+  }
+
+  /// Returns distinct Part IDs picked across a given list of sessions for a specific unit.
+  Future<Set<String>> getBatchPickedPartIdsForUnit(List<String> sessionIds, String unitId) async {
+    if (sessionIds.isEmpty) return {};
+    final db = await database;
+    final placeholders = List.filled(sessionIds.length, '?').join(',');
+    final rows = await db.rawQuery(
+      'SELECT DISTINCT part_id FROM session_picks WHERE session_id IN ($placeholders) AND unit_id = ? AND qty_picked > 0.0001',
+      [...sessionIds, unitId],
+    );
+    return rows.map((r) => r['part_id'].toString()).where((s) => s.isNotEmpty).toSet();
+  }
+
+  /// Synchronizes total_items_picked in sessions table with actual session_picks count.
+  /// Fixes any sessions where unit-wide total was accidentally assigned.
+  Future<void> syncSessionPicksCounts() async {
+    final db = await database;
+    await db.rawUpdate('''
+      UPDATE sessions
+      SET total_items_picked = (
+        SELECT COUNT(DISTINCT part_id)
+        FROM session_picks
+        WHERE session_picks.session_id = sessions.id AND session_picks.qty_picked > 0.0001
+      )
+    ''');
   }
 
   /// List of Resource IDs configured to be picked across all MAIN LINE departments.

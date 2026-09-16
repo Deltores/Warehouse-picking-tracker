@@ -132,6 +132,11 @@ class TabletHeader extends StatelessWidget {
                         Text(
                           'Session #${session.sessionSeqNo}',
                           style: const TextStyle(fontSize: 11, color: AppTheme.textMuted, fontWeight: FontWeight.w500),
+                        )
+                      else
+                        const Text(
+                          'New Session',
+                          style: TextStyle(fontSize: 11, color: AppTheme.accentCyan, fontWeight: FontWeight.w500),
                         ),
                       // Tablet ID
                       if (tabletId.isNotEmpty)

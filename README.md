@@ -98,36 +98,41 @@ Units and departments dynamically evaluate incomplete pick dates across active d
 - **MAIN LINE Whole Resource ID Destination (Admin Tab 5)**:
   - Pick entire MAIN LINE resources across departments directly from Step 3 of the Picker Flow.
   - **Mutual Exclusion**: When active as a Whole Resource, items are strictly excluded from standard department picking to prevent double-counting.
-  - **Dual-Mode Hierarchy Support**:
-    - **Combined Mode (All Depts)**: Merges parts under `Unit ➔ Resource ID ➔ Part ID` (omits Line and Dept levels).
-    - **By Department Mode**: Retains collapsible department containers (`ExpansionTile`).
+- **Live Dual Toggles with 2-Minute Admin PIN Lock & 2-Row Sub-Banner**:
+  - **Whole Resources**: Live toggle between `Combined (All Depts)` (merges all parts under `Unit ➔ Resource ID ➔ Part ID`) and `By Department` (collapsible department containers).
+  - **Departments**: Live toggle between `Combined (No Line)` and `By Line`.
+  - Protected with a micro lock icon requiring Admin PIN (default `1234`), providing a 2-minute unlock window.
+  - **2-Row Sub-Banner**: Eliminates horizontal scroll and clipping on tablet screens:
+    - **Row 1**: Scope icon, badge, title, Part ID progress badge, and Pick/Prod dates.
+    - **Row 2**: `View Mode:` label + interactive live toggle.
 - **One-Time Auto-Issue on Export**: Auto-issue items are written as 100% picked on the unit's first batch export only (`auto_issue_exported_{unitId}`), preventing duplicated issues on subsequent exports.
 
 ### 7. 3-Stage Session Lifecycle & Unified Multi-Unit Super Sessions
-The dedicated `SessionExportScreen` manages sessions through a 3-stage lifecycle:
-1. **Stage 1 (Pick & Collect — Closed Sessions)**:
-   - Closing a session marks it as **`CLOSED`** in SQLite. No premature individual exports are generated.
-   - Closed sessions across all units collect in Tab 1 ("Closed") for review.
-2. **Stage 2 (Unified Batch Super Export across All Units)**:
+The dedicated `SessionExportScreen` manages sessions through an automated 3-stage lifecycle:
+1. **Lazy Session Start (First Pick Only)**:
+   - Selecting a picker name, unit, and department sets up a pending in-memory session (`sessionSeqNo = 0`).
+   - The session is persisted to SQLite and consumes a sequence number **only upon the first confirmed pick** (`delta > 0`).
+   - Exiting or closing a session with 0 picks discards it completely; 0-pick sessions are never saved or exported.
+2. **Stage 1 (Pick & Collect — CLOSED: 80-Day Retention)**:
+   - Closing a session marks it as **`CLOSED`** in SQLite.
+   - Shows countdown: `⏳ X days remaining until auto-purge (80d retention)`. No premature individual exports are generated.
+   - Closed sessions across all units collect in Tab 1 ("Closed") for batch consolidation.
+3. **Stage 2 (Unified Batch Super Export across All Units — EXPORTED: 70-Day Retention)**:
    - Tapping `⚡ Export All Unexported (Batch Super Export)` prompts a confirmation modal.
    - Closed sessions across **ALL units** are consolidated into **ONE single Super Session** with a unique `batchId` (`BATCH_SUPER_{TabletId}_{MinSeq}_to_{MaxSeq}_{Timestamp}`) and exported into **ONE consolidated Excel file**, transitioning to **`EXPORTED`** (Tab 2).
+   - Status transition resets the retention timer to **70 days**: `⏳ X days remaining until auto-purge (70d retention)`.
    - **Column 0 "File Name"**: Column 0 (Column A) is reserved for the source file name (e.g. `unit_56.xlsx`) to clearly distinguish items from different units. All original picklist columns and ERP service audit columns are shifted right by 1 index.
-   - **Only Picked / Auto-Issued Rows Exported**: Untouched rows (`qtyPicked == 0` and not auto-issued) are omitted. Only touched rows are written.
-   - **Accurate Session-Specific Pick Metrics (`session_picks` Table)**: Each pick delta is tracked in SQLite `session_picks`. Session cards show the exact unique parts picked *during that session*, not unit-wide cumulative metrics.
-3. **Stage 3 (Mark as ISSUED — PIN-Free & Batch-Atomic)**:
+   - **Only Picked / Auto-Issued Rows Exported**: Untouched rows (`qtyPicked == 0` and not auto-issued) are omitted.
+   - **Accurate Session-Specific Pick Metrics (`session_picks` Table)**: Each pick delta is tracked using pre-allocation snapshots. Session cards show exact unique parts picked *during that session*.
+4. **Stage 3 (Mark as ISSUED — PIN-Free & Batch-Atomic — ISSUED: 60-Day Retention)**:
    - Exported sessions are grouped by `batchId` into cohesive Super Session cards.
    - Transitioning to **`ISSUED`** (Tab 3) is performed via the batch-level `✓ Mark as ISSUED` button, keeping all sessions within the batch atomic.
-   - Stays on Tab 2 with a SnackBar `[View in Issued]` action, eliminating disorienting tab switches.
-   - **Auto-Purge Countdown on ISSUED Cards**: Displays `⏳ X days remaining until auto-purge (60d retention)`.
-   - **LIFO Sorting (Newest First)**: Super Session cards on Exported and Issued tabs are always sorted latest-first so new work remains immediately on top.
-   - **Strict Part-ID Metrics**: Displays unique Part IDs (`X / Y parts`, `X parts`); raw piece counts (`pcs`) are omitted from export displays.
+   - Status transition resets the countdown to **60 days**: `⏳ X days remaining until auto-purge (60d retention)`.
+   - **LIFO Sorting (Newest First)**: Super Session cards on Exported and Issued tabs are always sorted latest-first.
+   - **50 MB Storage Cap FIFO Auto-Purge**: If DB + logs reach 50 MB, oldest sessions (FIFO: ISSUED, then EXPORTED, then CLOSED) and oldest logs are pruned automatically.
 
-### 8. 40-Unit Memory Buffer, Simplified 60-Day Retention & Accidental Deletion Recovery
+### 8. 40-Unit Memory Buffer, Auto-Purge & Accidental Deletion Recovery
 - **40-Unit Device Buffer**: Local storage maintains a maximum capacity of 40 active units. Importing unit #41 automatically auto-prunes the oldest completed unit.
-- **Simplified 60-Day Session Retention (No Cascade on Unit Deletion)**:
-  - When a unit is deleted (by admin or auto-pruned), it is soft-deleted (`deleted_at = timestamp`).
-  - Soft-deleting hides the unit and its picklist items from picking views, but **NEVER deletes its sessions**.
-  - Sessions are strictly auto-purged **60 days after entering `ISSUED` status** (`purgeExpiredIssuedSessions(retentionDays: 60)`).
 - **Accidental Unit Deletion Recovery on Re-Import**:
   - If a unit was deleted and the worker re-imports the `.xlsx` picklist with the same unit name or file name, `DatabaseService.findUnitHistory` detects past sessions, workers, and picked parts.
   - A recovery modal is shown: `Recover Unit Picking History?`.
@@ -268,16 +273,19 @@ flutter test test/run_tests.dart
 flutter test test/mainline_resource_and_batch_export_test.dart
 ```
 
-### Key Verification Cases Passed (30/30 Tests Passing):
+### Key Verification Cases Passed (36/36 Tests Passing):
 - ✅ **FIFO Work Order Cascade**: Accurate distribution of piece quantities across work orders.
 - ✅ **Strict Department Isolation**: Verification that identical Part IDs in other departments are untouched.
 - ✅ **Dynamic Column Mapper**: Robust parsing of varied Excel headers (e.g., `Part #`, `Component`, `Due Qty`).
 - ✅ **Grouping Engine**: Hierarchy projection for both `MAIN LINE` and `SUBASSEMBLY` workflows.
 - ✅ **Monotonic Sequencing**: Sequential session numbering (`1..9999`) with high-water mark retention.
+- ✅ **Lazy Session Initialization**: Verification that sessions start only on first pick and 0-pick sessions are discarded.
+- ✅ **80d / 70d / 60d Lifecycle Retention**: Countdown verification across CLOSED, EXPORTED, and ISSUED tabs.
+- ✅ **Department Line Grouping Live Toggle**: Verification of hierarchy projection with and without Line level.
+- ✅ **Snapshot Delta Calculation**: Verification that `previousItems` snapshot ensures 100% accurate pick delta recording.
 - ✅ **Multi-Unit Super Sessions**: Batch consolidation across multiple units into a single workbook.
 - ✅ **Consolidated Excel Column 0**: Reserved `File Name` in Column 0 with clean `+1` index shifting for original and ERP columns.
 - ✅ **Accidental Unit Deletion Recovery**: Accurate allocation of historical pick deltas onto re-imported picklist items in FIFO order.
-- ✅ **60-Day Retention & LIFO Sorting**: Countdown verification and latest-first sorting on ISSUED and EXPORTED tabs.
 - ✅ **Log Export RFC 4180 Compliance**: Accurate escaping of delimiters, newlines, and quotes in CSV output.
 
 ---

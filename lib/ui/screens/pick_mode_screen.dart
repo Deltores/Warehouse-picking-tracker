@@ -86,10 +86,13 @@ class _PickModeScreenState extends State<PickModeScreen> with WidgetsBindingObse
   bool _showFullyPickedBanner = false;
   String _fullyPickedPartId = '';
 
+  SessionMetadata? _session;
+
   @override
   void initState() {
     super.initState();
     WidgetsBinding.instance.addObserver(this);
+    _session = widget.activeSession;
     _currentParts = List.from(widget.partSummaries);
     _currentIndex = widget.startIndex.clamp(
         0, _currentParts.isEmpty ? 0 : _currentParts.length - 1);
@@ -140,13 +143,35 @@ class _PickModeScreenState extends State<PickModeScreen> with WidgetsBindingObse
     }
   }
 
+  /// Ensure session is persisted to SQLite ONLY upon first pick.
+  Future<void> _ensureSessionPersisted() async {
+    if (_session == null) return;
+    if (_session!.sessionSeqNo == 0) {
+      final seqNo = await widget.dbService.nextSessionSeqNo(_unit.id);
+      final nowMs = DateTime.now().millisecondsSinceEpoch;
+      final persisted = _session!.copyWith(
+        sessionSeqNo: seqNo,
+        startTime: nowMs,
+      );
+      await widget.dbService.saveSession(persisted);
+      if (mounted) {
+        setState(() {
+          _session = persisted;
+        });
+      } else {
+        _session = persisted;
+      }
+      LogService.picker('Session #$seqNo started upon first pick for ${_session!.workerName} on unit "${_unit.name}"');
+    }
+  }
+
   Future<void> _flushSession() async {
-    if (widget.activeSession == null) return;
+    if (_session == null || _session!.sessionSeqNo == 0) return;
     try {
       final nowMs = DateTime.now().millisecondsSinceEpoch;
-      final pickedCount = _items.where((i) => i.qtyPicked > 0.0001).map((i) => i.partId).toSet().length;
+      final pickedCount = await widget.dbService.getSessionPickedPartCount(_session!.id);
       await widget.dbService.updateSessionProgress(
-        widget.activeSession!.id,
+        _session!.id,
         pickedCount,
         endTime: nowMs,
       );
@@ -207,6 +232,8 @@ class _PickModeScreenState extends State<PickModeScreen> with WidgetsBindingObse
     final requiredQty = _getRequiredQty(part.partId);
     final isNowFullyPicked = newTotal >= requiredQty - 0.0001 && requiredQty > 0;
 
+    final previousItems = List<PicklistItem>.from(_items);
+
     final updatedList = FifoAllocationEngine.allocateByPartId(
       allItems: _items,
       department: widget.department,
@@ -239,15 +266,18 @@ class _PickModeScreenState extends State<PickModeScreen> with WidgetsBindingObse
 
     await widget.dbService.batchUpdateItems(updatedList);
     await widget.dbService.updateUnit(updatedUnit);
-    if (widget.activeSession != null) {
+    if (_session != null) {
+      if (_session!.sessionSeqNo == 0) {
+        await _ensureSessionPersisted();
+      }
       if (delta > 0.0001) {
         final affected = updatedList.where((i) => _itemMatchesScope(i) && i.partId.toLowerCase().trim() == part.partId.toLowerCase().trim());
         for (final item in affected) {
-          final old = _items.firstWhere((o) => o.id == item.id, orElse: () => item);
+          final old = previousItems.firstWhere((o) => o.id == item.id, orElse: () => item);
           final itemDelta = item.qtyPicked - old.qtyPicked;
           if (itemDelta > 0.0001) {
             await widget.dbService.recordSessionPick(
-              sessionId: widget.activeSession!.id,
+              sessionId: _session!.id,
               unitId: _unit.id,
               itemId: item.id,
               partId: part.partId,
@@ -256,12 +286,20 @@ class _PickModeScreenState extends State<PickModeScreen> with WidgetsBindingObse
           }
         }
       }
-      final pickedCount = await widget.dbService.getSessionPickedPartCount(widget.activeSession!.id);
+      final pickedCount = await widget.dbService.getSessionPickedPartCount(_session!.id);
       await widget.dbService.updateSessionProgress(
-        widget.activeSession!.id,
+        _session!.id,
         pickedCount,
         endTime: nowMs,
       );
+      if (mounted) {
+        setState(() {
+          _session = _session!.copyWith(
+            totalItemsPicked: pickedCount,
+            endTime: nowMs,
+          );
+        });
+      }
     }
     widget.onItemsUpdated?.call(updatedList);
 
@@ -751,7 +789,7 @@ class _PickModeScreenState extends State<PickModeScreen> with WidgetsBindingObse
   }
 
   Widget _buildHeader(int totalCount) {
-    final session = widget.activeSession;
+    final session = _session ?? widget.activeSession;
     final isAtEnd = _currentIndex == _currentParts.length - 1;
     return Container(
       padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 10),

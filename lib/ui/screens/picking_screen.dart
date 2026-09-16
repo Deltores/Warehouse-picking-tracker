@@ -1,6 +1,4 @@
-import 'package:file_picker/file_picker.dart';
 import 'package:flutter/material.dart';
-import 'package:path/path.dart' as p;
 
 import '../../engine/column_mapper.dart';
 import '../../engine/fifo_allocation_engine.dart';
@@ -62,6 +60,8 @@ class _PickingScreenState extends State<PickingScreen> with WidgetsBindingObserv
   late GroupingPreset _selectedPreset;
   bool _combineDepartments = true;
 
+  bool _groupByLine = true;
+
   String? _activeDepartment;
   String _tabletId = '';
   Map<String, Map<String, dynamic>> _partFlags = {};
@@ -78,7 +78,7 @@ class _PickingScreenState extends State<PickingScreen> with WidgetsBindingObserv
     _selectedPreset = GroupingEngine.getPresetForDepartment(
       _activeDepartment ?? '',
       customPresets: _presets,
-      includeLine: !_isResourceScope,
+      includeLine: !_isResourceScope && _groupByLine,
       bypassDepartmentLevel: _isResourceScope && _combineDepartments,
       isResourceScope: _isResourceScope,
     );
@@ -107,18 +107,41 @@ class _PickingScreenState extends State<PickingScreen> with WidgetsBindingObserv
     }
   }
 
+  /// Ensure session is persisted to SQLite ONLY upon first pick.
+  Future<void> _ensureSessionPersisted() async {
+    if (_activeSession == null || _activeUnit == null) return;
+    if (_activeSession!.sessionSeqNo == 0) {
+      final seqNo = await widget.dbService.nextSessionSeqNo(_activeUnit!.id);
+      final nowMs = DateTime.now().millisecondsSinceEpoch;
+      final persisted = _activeSession!.copyWith(
+        sessionSeqNo: seqNo,
+        startTime: nowMs,
+      );
+      await widget.dbService.saveSession(persisted);
+      if (mounted) {
+        setState(() {
+          _activeSession = persisted;
+        });
+      } else {
+        _activeSession = persisted;
+      }
+      LogService.picker('Session #$seqNo started upon first pick for ${_activeSession!.workerName} on unit "${_activeUnit!.name}"');
+    }
+  }
+
   Future<void> _flushActiveSessionState() async {
     if (_activeSession == null || _activeUnit == null) return;
+    if (_activeSession!.sessionSeqNo == 0) return;
     try {
       final nowMs = DateTime.now().millisecondsSinceEpoch;
-      final pickedPartsCount = _items.where((i) => i.qtyPicked > 0.0001).map((i) => i.partId).toSet().length;
+      final sessionPicks = await widget.dbService.getSessionPickedPartCount(_activeSession!.id);
       await widget.dbService.updateSessionProgress(
         _activeSession!.id,
-        pickedPartsCount,
+        sessionPicks,
         endTime: nowMs,
       );
       _activeSession = _activeSession!.copyWith(
-        totalItemsPicked: pickedPartsCount,
+        totalItemsPicked: sessionPicks,
         endTime: nowMs,
       );
     } catch (_) {}
@@ -146,20 +169,19 @@ class _PickingScreenState extends State<PickingScreen> with WidgetsBindingObserv
     SessionMetadata? session = _activeSession;
     session ??= await widget.dbService.getActiveSession(unit.id);
 
-    final includeLine = _isResourceScope
-        ? false
-        : await widget.dbService.shouldGroupByLineForDept(_activeDepartment ?? '');
     if (_isResourceScope) {
+      _groupByLine = false;
       final viewMode = await widget.dbService.getMainLineResourceView(_targetResourceName);
       _combineDepartments = (viewMode != 'split_by_dept');
     } else {
+      _groupByLine = await widget.dbService.shouldGroupByLineForDept(_activeDepartment ?? '');
       final defCombine = (await widget.dbService.getConfig('mainline_resource_default_view')) != 'split_by_dept';
       _combineDepartments = defCombine;
     }
     final autoPreset = GroupingEngine.getPresetForDepartment(
       _activeDepartment ?? '',
       customPresets: _presets,
-      includeLine: includeLine,
+      includeLine: !_isResourceScope && _groupByLine,
       bypassDepartmentLevel: _isResourceScope && _combineDepartments,
       isResourceScope: _isResourceScope,
     );
@@ -220,6 +242,16 @@ class _PickingScreenState extends State<PickingScreen> with WidgetsBindingObserv
   Future<void> _handlePartQuantityChange(String department, String partId, double newPickedTotal) async {
     if (_activeUnit == null) return;
 
+    final oldItems = _items.where((i) => i.partId == partId).toList();
+    final oldPickedSum = oldItems.fold<double>(0.0, (s, i) => s + i.qtyPicked);
+    final deltaPicked = newPickedTotal - oldPickedSum;
+
+    if (deltaPicked > 0.0001 && _activeSession != null && _activeSession!.sessionSeqNo == 0) {
+      await _ensureSessionPersisted();
+    }
+
+    final previousItems = List<PicklistItem>.from(_items);
+
     final updatedList = FifoAllocationEngine.allocateByPartId(
       allItems: _items,
       department: department,
@@ -262,11 +294,9 @@ class _PickingScreenState extends State<PickingScreen> with WidgetsBindingObserv
     LogService.picker('PICK: $partId (Allocated: $newPickedTotal) → Unit: ${_activeUnit?.name}, Dept: $department');
 
     if (_activeSession != null) {
-      final oldItems = _items.where((i) => i.partId == partId).toList();
-      final oldPickedSum = oldItems.fold<double>(0.0, (s, i) => s + i.qtyPicked);
-      if (newPickedTotal > oldPickedSum) {
+      if (deltaPicked > 0.0001) {
         for (final item in updatedList.where((i) => i.partId == partId)) {
-          final old = oldItems.firstWhere((o) => o.id == item.id, orElse: () => item);
+          final old = previousItems.firstWhere((o) => o.id == item.id, orElse: () => item);
           final delta = item.qtyPicked - old.qtyPicked;
           if (delta > 0.0001) {
             await widget.dbService.recordSessionPick(
@@ -295,6 +325,12 @@ class _PickingScreenState extends State<PickingScreen> with WidgetsBindingObserv
   Future<void> _handleSingleItemOverride(PicklistItem item, double newPickedQty) async {
     if (_activeUnit == null) return;
 
+    final oldPicked = item.qtyPicked;
+    final delta = newPickedQty - oldPicked;
+    if (delta > 0.0001 && _activeSession != null && _activeSession!.sessionSeqNo == 0) {
+      await _ensureSessionPersisted();
+    }
+
     final updated = FifoAllocationEngine.updateSingleItem(item, newPickedQty);
     final idx = _items.indexWhere((i) => i.id == item.id);
     if (idx == -1) return;
@@ -321,7 +357,6 @@ class _PickingScreenState extends State<PickingScreen> with WidgetsBindingObserv
     LogService.picker('PICK: ${updated.partId} (Override: $newPickedQty) → Unit: ${_activeUnit?.name}, Line: ${updated.line}');
 
     if (_activeSession != null) {
-      final delta = updated.qtyPicked - item.qtyPicked;
       if (delta > 0.0001) {
         await widget.dbService.recordSessionPick(
           sessionId: _activeSession!.id,
@@ -355,19 +390,130 @@ class _PickingScreenState extends State<PickingScreen> with WidgetsBindingObserv
           .trim()
       : '';
 
-  void _toggleCombineDepartments(bool combine) {
+  static DateTime? _toggleUnlockExpiresAt;
+
+  Future<bool> _ensureAdminUnlocked({required String reason}) async {
+    final now = DateTime.now();
+    final isUnlocked = _toggleUnlockExpiresAt != null && now.isBefore(_toggleUnlockExpiresAt!);
+    if (isUnlocked) return true;
+
+    final pinController = TextEditingController();
+    String? errorText;
+
+    final success = await showDialog<bool>(
+      context: context,
+      builder: (ctx) => StatefulBuilder(
+        builder: (context, setDialogState) => AlertDialog(
+          backgroundColor: AppTheme.cardDark,
+          shape: RoundedRectangleBorder(
+            borderRadius: BorderRadius.circular(16),
+            side: const BorderSide(color: AppTheme.borderDark),
+          ),
+          title: const Row(
+            children: [
+              Icon(Icons.lock_rounded, color: AppTheme.accentCyan, size: 22),
+              SizedBox(width: 8),
+              Text('Admin Authorization', style: TextStyle(color: AppTheme.textLight, fontSize: 18)),
+            ],
+          ),
+          content: Column(
+            mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Text(
+                'Enter Admin PIN to switch $reason.\nIt will remain unlocked for 2 minutes.',
+                style: const TextStyle(color: AppTheme.textMuted, fontSize: 13, height: 1.4),
+              ),
+              const SizedBox(height: 12),
+              TextField(
+                controller: pinController,
+                autofocus: true,
+                keyboardType: TextInputType.number,
+                obscureText: true,
+                maxLength: 6,
+                style: const TextStyle(color: AppTheme.textLight, fontSize: 20),
+                decoration: InputDecoration(
+                  hintText: 'Admin PIN (default 1234)',
+                  hintStyle: const TextStyle(color: AppTheme.textMuted, fontSize: 13),
+                  errorText: errorText,
+                  prefixIcon: const Icon(Icons.password_rounded, color: AppTheme.accentCyan, size: 18),
+                  border: const OutlineInputBorder(borderRadius: BorderRadius.all(Radius.circular(10))),
+                ),
+              ),
+            ],
+          ),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.of(ctx).pop(false),
+              child: const Text('Cancel'),
+            ),
+            ElevatedButton(
+              style: ElevatedButton.styleFrom(backgroundColor: AppTheme.accentCyan),
+              onPressed: () async {
+                final entered = pinController.text.trim();
+                final currentPin = await widget.dbService.getConfig('admin_pin') ?? '1234';
+                if (entered == currentPin) {
+                  if (ctx.mounted) Navigator.of(ctx).pop(true);
+                } else {
+                  setDialogState(() => errorText = 'Invalid PIN. Try again.');
+                }
+              },
+              child: const Text('Unlock', style: TextStyle(color: Colors.black, fontWeight: FontWeight.bold)),
+            ),
+          ],
+        ),
+      ),
+    );
+
+    if (success == true) {
+      setState(() {
+        _toggleUnlockExpiresAt = DateTime.now().add(const Duration(minutes: 2));
+      });
+      return true;
+    }
+    return false;
+  }
+
+  Future<void> _handleToggleCombineDepartments(bool combine) async {
     if (_combineDepartments == combine) return;
+    final ok = await _ensureAdminUnlocked(reason: 'Whole Resource view mode');
+    if (!ok) return;
+
     setState(() {
       _combineDepartments = combine;
-      final includeLine = _isResourceScope ? false : _selectedPreset.levels.contains(GroupLevel.line);
       _selectedPreset = GroupingEngine.getPresetForDepartment(
         _activeDepartment ?? '',
         customPresets: _presets,
-        includeLine: includeLine,
-        bypassDepartmentLevel: _isResourceScope && _combineDepartments,
-        isResourceScope: _isResourceScope,
+        includeLine: false,
+        bypassDepartmentLevel: _combineDepartments,
+        isResourceScope: true,
       );
     });
+
+    if (_isResourceScope) {
+      await widget.dbService.setMainLineResourceView(_targetResourceName, combine ? 'combined' : 'split_by_dept');
+    }
+  }
+
+  Future<void> _handleToggleGroupByLine(bool groupByLine) async {
+    if (_groupByLine == groupByLine) return;
+    final ok = await _ensureAdminUnlocked(reason: 'Department line grouping mode');
+    if (!ok) return;
+
+    setState(() {
+      _groupByLine = groupByLine;
+      _selectedPreset = GroupingEngine.getPresetForDepartment(
+        _activeDepartment ?? '',
+        customPresets: _presets,
+        includeLine: _groupByLine,
+        bypassDepartmentLevel: false,
+        isResourceScope: false,
+      );
+    });
+
+    if (_activeDepartment != null && _activeDepartment!.isNotEmpty) {
+      await widget.dbService.setLineGroupingDeptOverride(_activeDepartment!, groupByLine);
+    }
   }
 
   bool _itemMatchesActiveScope(PicklistItem i) {
@@ -660,14 +806,45 @@ class _PickingScreenState extends State<PickingScreen> with WidgetsBindingObserv
   /// Calmly return back to PickerFlowScreen (Department / Unit selection) without requiring a PIN.
   Future<void> _handleBack() async {
     if (!mounted) return;
+    if (_activeSession != null && _activeSession!.sessionSeqNo != 0) {
+      final sessionPickCount = await widget.dbService.getSessionPickedPartCount(_activeSession!.id);
+      if (sessionPickCount == 0) {
+        await widget.dbService.deleteEmptySession(_activeSession!.id);
+      }
+    }
     LogService.picker('${_activeSession?.workerName ?? "Worker"} returned from picking to department selection');
+    if (!mounted) return;
     Navigator.of(context).pop();
   }
 
   /// Close Session: marks session as CLOSED in SQLite (ready for Batch Super Export in Export Hub).
+  /// If 0 picks were made, the session is not saved at all!
   Future<void> _handleCloseSession() async {
     if (_activeSession == null || _activeUnit == null) return;
 
+    final sessionPickCount = _activeSession!.sessionSeqNo == 0
+        ? 0
+        : await widget.dbService.getSessionPickedPartCount(_activeSession!.id);
+
+    if (_activeSession!.sessionSeqNo == 0 || sessionPickCount == 0) {
+      if (_activeSession!.sessionSeqNo != 0) {
+        await widget.dbService.deleteEmptySession(_activeSession!.id);
+      }
+      LogService.picker('Session discarded for "${_activeSession!.workerName}" because 0 items were picked');
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(
+            content: Text('No parts were picked. Session not saved.'),
+            backgroundColor: AppTheme.cardDark,
+            duration: Duration(seconds: 3),
+          ),
+        );
+        Navigator.of(context).popUntil((route) => route.isFirst);
+      }
+      return;
+    }
+
+    if (!mounted) return;
     final confirmed = await showDialog<bool>(
       context: context,
       builder: (ctx) => AlertDialog(
@@ -706,8 +883,7 @@ class _PickingScreenState extends State<PickingScreen> with WidgetsBindingObserv
     if (confirmed != true || !mounted) return;
 
     final now = DateTime.now().millisecondsSinceEpoch;
-    final sessionPickCount = await widget.dbService.getSessionPickedPartCount(_activeSession!.id);
-    final effectivePicks = sessionPickCount > 0 ? sessionPickCount : (_activeSession?.totalItemsPicked ?? 0);
+    final effectivePicks = sessionPickCount;
     final unitTotalQty = _items.fold<double>(0.0, (sum, i) => sum + i.qtyPicked).round();
 
     final allPartIds = _items.map((i) => i.partId).toSet();
@@ -847,177 +1023,155 @@ class _PickingScreenState extends State<PickingScreen> with WidgetsBindingObserv
                   final pickDate = UnitPickDateUrgency.formatShortDate(pickDateRaw);
                   final prodDate = UnitPickDateUrgency.formatShortDate(prodDateRaw);
 
-                  // Dept strip: wrapped in scrollable row to prevent overflow
+                  final isUnlocked = _toggleUnlockExpiresAt != null && DateTime.now().isBefore(_toggleUnlockExpiresAt!);
+
                   return Container(
                     width: double.infinity,
-                    padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 7),
-                    color: AppTheme.primaryBlue.withValues(alpha: 0.12),
-                    child: SingleChildScrollView(
-                      scrollDirection: Axis.horizontal,
-                      child: Row(
-                        children: [
-                          Icon(
-                            _isResourceScope ? Icons.precision_manufacturing_rounded : Icons.apartment_rounded,
-                            size: 16,
-                            color: AppTheme.accentCyan,
-                          ),
-                          const SizedBox(width: 8),
-                          // Dept type badge (MAIN LINE / SUBASSEMBLY)
-                          Container(
-                            padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
-                            decoration: BoxDecoration(
-                              color: (_isResourceScope || autoType == 'MAIN LINE')
-                                  ? const Color(0xFF0EA5E9).withValues(alpha: 0.15)
-                                  : const Color(0xFFF97316).withValues(alpha: 0.15),
-                              borderRadius: BorderRadius.circular(4),
-                              border: Border.all(
-                                color: (_isResourceScope || autoType == 'MAIN LINE')
-                                    ? const Color(0xFF0EA5E9).withValues(alpha: 0.5)
-                                    : const Color(0xFFF97316).withValues(alpha: 0.5),
-                              ),
-                            ),
-                            child: Text(
-                              autoType.isNotEmpty ? autoType : 'DEPT',
-                              style: TextStyle(
-                                fontSize: 9,
-                                fontWeight: FontWeight.bold,
-                                color: (_isResourceScope || autoType == 'MAIN LINE')
-                                    ? const Color(0xFF0EA5E9)
-                                    : const Color(0xFFF97316),
-                              ),
-                            ),
-                          ),
-                          const SizedBox(width: 8),
-                          Text(
-                            _isResourceScope
-                                ? 'Resource: $_targetResourceName (MAIN LINE)'
-                                : 'Department: $_activeDepartment',
-                            style: const TextStyle(
-                              fontSize: 13,
-                              fontWeight: FontWeight.bold,
+                    padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
+                    decoration: BoxDecoration(
+                      color: AppTheme.primaryBlue.withValues(alpha: 0.10),
+                      border: const Border(
+                        bottom: BorderSide(color: AppTheme.borderDark, width: 1),
+                      ),
+                    ),
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      mainAxisSize: MainAxisSize.min,
+                      children: [
+                        // Row 1: Icon, Type Badge, Title, Progress Badge, Pick Date, Prod Date
+                        Row(
+                          children: [
+                            Icon(
+                              _isResourceScope ? Icons.precision_manufacturing_rounded : Icons.apartment_rounded,
+                              size: 16,
                               color: AppTheme.accentCyan,
                             ),
-                          ),
-                          const SizedBox(width: 12),
-                          // Department Part-ID Progress Badge
-                          Container(
-                            padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 3),
-                            decoration: BoxDecoration(
-                              color: AppTheme.cardDark,
-                              borderRadius: BorderRadius.circular(6),
-                              border: Border.all(
-                                color: deptCompletedParts >= deptTotalParts && deptTotalParts > 0
-                                    ? AppTheme.statusComplete
-                                    : AppTheme.borderDark,
-                              ),
-                            ),
-                            child: Text(
-                              '${_isResourceScope ? "Resource" : "Dept"}: $deptCompletedParts / $deptTotalParts parts ($deptPct%)',
-                              style: TextStyle(
-                                fontSize: 11,
-                                fontWeight: FontWeight.bold,
-                                color: deptCompletedParts >= deptTotalParts && deptTotalParts > 0
-                                    ? AppTheme.statusComplete
-                                    : AppTheme.accentCyan,
-                              ),
-                            ),
-                          ),
-                          if (_isResourceScope) ...[
-                            const SizedBox(width: 12),
+                            const SizedBox(width: 8),
+                            // Dept type badge (MAIN LINE / SUBASSEMBLY)
                             Container(
+                              padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
+                              decoration: BoxDecoration(
+                                color: (_isResourceScope || autoType == 'MAIN LINE')
+                                    ? const Color(0xFF0EA5E9).withValues(alpha: 0.15)
+                                    : const Color(0xFFF97316).withValues(alpha: 0.15),
+                                borderRadius: BorderRadius.circular(4),
+                                border: Border.all(
+                                  color: (_isResourceScope || autoType == 'MAIN LINE')
+                                      ? const Color(0xFF0EA5E9).withValues(alpha: 0.5)
+                                      : const Color(0xFFF97316).withValues(alpha: 0.5),
+                                ),
+                              ),
+                              child: Text(
+                                autoType.isNotEmpty ? autoType : 'DEPT',
+                                style: TextStyle(
+                                  fontSize: 9,
+                                  fontWeight: FontWeight.bold,
+                                  color: (_isResourceScope || autoType == 'MAIN LINE')
+                                      ? const Color(0xFF0EA5E9)
+                                      : const Color(0xFFF97316),
+                                ),
+                              ),
+                            ),
+                            const SizedBox(width: 8),
+                            Flexible(
+                              child: Text(
+                                _isResourceScope
+                                    ? 'Resource: $_targetResourceName (MAIN LINE)'
+                                    : 'Department: $_activeDepartment',
+                                style: const TextStyle(
+                                  fontSize: 13,
+                                  fontWeight: FontWeight.bold,
+                                  color: AppTheme.accentCyan,
+                                ),
+                                overflow: TextOverflow.ellipsis,
+                              ),
+                            ),
+                            const SizedBox(width: 10),
+                            // Department Part-ID Progress Badge
+                            Container(
+                              padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 3),
                               decoration: BoxDecoration(
                                 color: AppTheme.cardDark,
-                                borderRadius: BorderRadius.circular(8),
-                                border: Border.all(color: AppTheme.borderDark),
+                                borderRadius: BorderRadius.circular(6),
+                                border: Border.all(
+                                  color: deptCompletedParts >= deptTotalParts && deptTotalParts > 0
+                                      ? AppTheme.statusComplete
+                                      : AppTheme.borderDark,
+                                ),
                               ),
-                              padding: const EdgeInsets.all(2),
-                              child: Row(
-                                mainAxisSize: MainAxisSize.min,
-                                children: [
-                                  InkWell(
-                                    onTap: () => _toggleCombineDepartments(true),
-                                    borderRadius: BorderRadius.circular(6),
-                                    child: Container(
-                                      padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
-                                      decoration: BoxDecoration(
-                                        color: _combineDepartments ? AppTheme.primaryBlue : Colors.transparent,
-                                        borderRadius: BorderRadius.circular(6),
-                                      ),
-                                      child: Row(
-                                        mainAxisSize: MainAxisSize.min,
-                                        children: [
-                                          Icon(
-                                            Icons.merge_type_rounded,
-                                            size: 13,
-                                            color: _combineDepartments ? AppTheme.textLight : AppTheme.textMuted,
-                                          ),
-                                          const SizedBox(width: 4),
-                                          Text(
-                                            'Combined (All Depts)',
-                                            style: TextStyle(
-                                              fontSize: 11,
-                                              fontWeight: _combineDepartments ? FontWeight.bold : FontWeight.normal,
-                                              color: _combineDepartments ? AppTheme.textLight : AppTheme.textMuted,
-                                            ),
-                                          ),
-                                        ],
-                                      ),
-                                    ),
-                                  ),
-                                  InkWell(
-                                    onTap: () => _toggleCombineDepartments(false),
-                                    borderRadius: BorderRadius.circular(6),
-                                    child: Container(
-                                      padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
-                                      decoration: BoxDecoration(
-                                        color: !_combineDepartments ? AppTheme.primaryBlue : Colors.transparent,
-                                        borderRadius: BorderRadius.circular(6),
-                                      ),
-                                      child: Row(
-                                        mainAxisSize: MainAxisSize.min,
-                                        children: [
-                                          Icon(
-                                            Icons.account_tree_rounded,
-                                            size: 13,
-                                            color: !_combineDepartments ? AppTheme.textLight : AppTheme.textMuted,
-                                          ),
-                                          const SizedBox(width: 4),
-                                          Text(
-                                            'By Department',
-                                            style: TextStyle(
-                                              fontSize: 11,
-                                              fontWeight: !_combineDepartments ? FontWeight.bold : FontWeight.normal,
-                                              color: !_combineDepartments ? AppTheme.textLight : AppTheme.textMuted,
-                                            ),
-                                          ),
-                                        ],
-                                      ),
-                                    ),
-                                  ),
-                                ],
+                              child: Text(
+                                '${_isResourceScope ? "Resource" : "Dept"}: $deptCompletedParts / $deptTotalParts parts ($deptPct%)',
+                                style: TextStyle(
+                                  fontSize: 11,
+                                  fontWeight: FontWeight.bold,
+                                  color: deptCompletedParts >= deptTotalParts && deptTotalParts > 0
+                                      ? AppTheme.statusComplete
+                                      : AppTheme.accentCyan,
+                                ),
                               ),
                             ),
+                            const Spacer(),
+                            if (pickDate.isNotEmpty) ...[
+                              const Icon(Icons.event_available_rounded, size: 14, color: AppTheme.statusPartial),
+                              const SizedBox(width: 4),
+                              Text(
+                                'Pick: $pickDate',
+                                style: const TextStyle(fontSize: 11, color: AppTheme.textLight, fontWeight: FontWeight.w500),
+                              ),
+                            ],
+                            if (prodDate.isNotEmpty) ...[
+                              const SizedBox(width: 12),
+                              const Icon(Icons.precision_manufacturing_rounded, size: 14, color: AppTheme.textMuted),
+                              const SizedBox(width: 4),
+                              Text(
+                                'Prod: $prodDate',
+                                style: const TextStyle(fontSize: 11, color: AppTheme.textMuted),
+                              ),
+                            ],
                           ],
-                          if (pickDate.isNotEmpty) ...[
-                            const SizedBox(width: 16),
-                            const Icon(Icons.event_available_rounded, size: 15, color: AppTheme.statusPartial),
-                            const SizedBox(width: 5),
-                            Text(
-                              'Pick: $pickDate',
-                              style: const TextStyle(fontSize: 11, color: AppTheme.textLight, fontWeight: FontWeight.w500),
+                        ),
+                        const SizedBox(height: 8),
+                        // Row 2: View Mode Label + Toggle (Whole Resource or Department Line)
+                        Row(
+                          children: [
+                            const Text(
+                              'View Mode:',
+                              style: TextStyle(
+                                fontSize: 11,
+                                fontWeight: FontWeight.w600,
+                                color: AppTheme.textMuted,
+                              ),
                             ),
+                            const SizedBox(width: 8),
+                            if (_isResourceScope)
+                              _buildResourceToggle(isUnlocked)
+                            else
+                              _buildDepartmentLineToggle(isUnlocked),
+                            if (isUnlocked) ...[
+                              const SizedBox(width: 10),
+                              Container(
+                                padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
+                                decoration: BoxDecoration(
+                                  color: AppTheme.statusComplete.withValues(alpha: 0.12),
+                                  borderRadius: BorderRadius.circular(4),
+                                  border: Border.all(color: AppTheme.statusComplete.withValues(alpha: 0.4)),
+                                ),
+                                child: const Row(
+                                  mainAxisSize: MainAxisSize.min,
+                                  children: [
+                                    Icon(Icons.timer_outlined, size: 11, color: AppTheme.statusComplete),
+                                    SizedBox(width: 3),
+                                    Text(
+                                      '2m Admin PIN active',
+                                      style: TextStyle(fontSize: 10, color: AppTheme.statusComplete, fontWeight: FontWeight.w500),
+                                    ),
+                                  ],
+                                ),
+                              ),
+                            ],
                           ],
-                          if (prodDate.isNotEmpty) ...[
-                            const SizedBox(width: 12),
-                            const Icon(Icons.precision_manufacturing_rounded, size: 15, color: AppTheme.textMuted),
-                            const SizedBox(width: 5),
-                            Text(
-                              'Prod: $prodDate',
-                              style: const TextStyle(fontSize: 11, color: AppTheme.textMuted),
-                            ),
-                          ],
-                        ],
-                      ),
+                        ),
+                      ],
                     ),
                   );
                 },
@@ -1050,6 +1204,184 @@ class _PickingScreenState extends State<PickingScreen> with WidgetsBindingObserv
             ),
           ],
         ),
+      ),
+    );
+  }
+
+  Widget _buildResourceToggle(bool isUnlocked) {
+    return Container(
+      decoration: BoxDecoration(
+        color: AppTheme.cardDark,
+        borderRadius: BorderRadius.circular(8),
+        border: Border.all(
+          color: isUnlocked ? AppTheme.statusComplete.withValues(alpha: 0.6) : AppTheme.borderDark,
+        ),
+      ),
+      padding: const EdgeInsets.all(2),
+      child: Row(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          Padding(
+            padding: const EdgeInsets.symmetric(horizontal: 5),
+            child: Tooltip(
+              message: isUnlocked ? 'Unlocked (Admin)' : 'Admin PIN required to toggle',
+              child: Icon(
+                isUnlocked ? Icons.lock_open_rounded : Icons.lock_outline_rounded,
+                size: 13,
+                color: isUnlocked ? AppTheme.statusComplete : AppTheme.textMuted,
+              ),
+            ),
+          ),
+          InkWell(
+            onTap: () => _handleToggleCombineDepartments(true),
+            borderRadius: BorderRadius.circular(6),
+            child: Container(
+              padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+              decoration: BoxDecoration(
+                color: _combineDepartments ? AppTheme.primaryBlue : Colors.transparent,
+                borderRadius: BorderRadius.circular(6),
+              ),
+              child: Row(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  Icon(
+                    Icons.merge_type_rounded,
+                    size: 13,
+                    color: _combineDepartments ? AppTheme.textLight : AppTheme.textMuted,
+                  ),
+                  const SizedBox(width: 4),
+                  Text(
+                    'Combined (All Depts)',
+                    style: TextStyle(
+                      fontSize: 11,
+                      fontWeight: _combineDepartments ? FontWeight.bold : FontWeight.normal,
+                      color: _combineDepartments ? AppTheme.textLight : AppTheme.textMuted,
+                    ),
+                  ),
+                ],
+              ),
+            ),
+          ),
+          InkWell(
+            onTap: () => _handleToggleCombineDepartments(false),
+            borderRadius: BorderRadius.circular(6),
+            child: Container(
+              padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+              decoration: BoxDecoration(
+                color: !_combineDepartments ? AppTheme.primaryBlue : Colors.transparent,
+                borderRadius: BorderRadius.circular(6),
+              ),
+              child: Row(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  Icon(
+                    Icons.account_tree_rounded,
+                    size: 13,
+                    color: !_combineDepartments ? AppTheme.textLight : AppTheme.textMuted,
+                  ),
+                  const SizedBox(width: 4),
+                  Text(
+                    'By Department',
+                    style: TextStyle(
+                      fontSize: 11,
+                      fontWeight: !_combineDepartments ? FontWeight.bold : FontWeight.normal,
+                      color: !_combineDepartments ? AppTheme.textLight : AppTheme.textMuted,
+                    ),
+                  ),
+                ],
+              ),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildDepartmentLineToggle(bool isUnlocked) {
+    return Container(
+      decoration: BoxDecoration(
+        color: AppTheme.cardDark,
+        borderRadius: BorderRadius.circular(8),
+        border: Border.all(
+          color: isUnlocked ? AppTheme.statusComplete.withValues(alpha: 0.6) : AppTheme.borderDark,
+        ),
+      ),
+      padding: const EdgeInsets.all(2),
+      child: Row(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          Padding(
+            padding: const EdgeInsets.symmetric(horizontal: 5),
+            child: Tooltip(
+              message: isUnlocked ? 'Unlocked (Admin)' : 'Admin PIN required to toggle',
+              child: Icon(
+                isUnlocked ? Icons.lock_open_rounded : Icons.lock_outline_rounded,
+                size: 13,
+                color: isUnlocked ? AppTheme.statusComplete : AppTheme.textMuted,
+              ),
+            ),
+          ),
+          InkWell(
+            onTap: () => _handleToggleGroupByLine(false),
+            borderRadius: BorderRadius.circular(6),
+            child: Container(
+              padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+              decoration: BoxDecoration(
+                color: !_groupByLine ? AppTheme.primaryBlue : Colors.transparent,
+                borderRadius: BorderRadius.circular(6),
+              ),
+              child: Row(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  Icon(
+                    Icons.view_headline_rounded,
+                    size: 13,
+                    color: !_groupByLine ? AppTheme.textLight : AppTheme.textMuted,
+                  ),
+                  const SizedBox(width: 4),
+                  Text(
+                    'Combined (No Line)',
+                    style: TextStyle(
+                      fontSize: 11,
+                      fontWeight: !_groupByLine ? FontWeight.bold : FontWeight.normal,
+                      color: !_groupByLine ? AppTheme.textLight : AppTheme.textMuted,
+                    ),
+                  ),
+                ],
+              ),
+            ),
+          ),
+          InkWell(
+            onTap: () => _handleToggleGroupByLine(true),
+            borderRadius: BorderRadius.circular(6),
+            child: Container(
+              padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+              decoration: BoxDecoration(
+                color: _groupByLine ? AppTheme.primaryBlue : Colors.transparent,
+                borderRadius: BorderRadius.circular(6),
+              ),
+              child: Row(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  Icon(
+                    Icons.format_line_spacing_rounded,
+                    size: 13,
+                    color: _groupByLine ? AppTheme.textLight : AppTheme.textMuted,
+                  ),
+                  const SizedBox(width: 4),
+                  Text(
+                    'By Line',
+                    style: TextStyle(
+                      fontSize: 11,
+                      fontWeight: _groupByLine ? FontWeight.bold : FontWeight.normal,
+                      color: _groupByLine ? AppTheme.textLight : AppTheme.textMuted,
+                    ),
+                  ),
+                ],
+              ),
+            ),
+          ),
+        ],
       ),
     );
   }
