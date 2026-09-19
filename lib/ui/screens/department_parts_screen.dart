@@ -144,15 +144,54 @@ class DepartmentPartsView extends StatelessWidget {
                       part.partId,
                       style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 16, color: AppTheme.textLight),
                     ),
-                    if (part.description.isNotEmpty) ...[
-                      const SizedBox(height: 2),
-                      Text(
-                        part.description,
-                        style: const TextStyle(fontSize: 13, color: AppTheme.textMuted),
-                        maxLines: 1,
-                        overflow: TextOverflow.ellipsis,
-                      ),
-                    ],
+                    const SizedBox(height: 2),
+                    Wrap(
+                      crossAxisAlignment: WrapCrossAlignment.center,
+                      spacing: 8,
+                      runSpacing: 4,
+                      children: [
+                        if (part.description.isNotEmpty)
+                          Text(
+                            part.description,
+                            style: const TextStyle(fontSize: 13, color: AppTheme.textMuted),
+                            maxLines: 1,
+                            overflow: TextOverflow.ellipsis,
+                          ),
+                        Container(
+                          padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
+                          decoration: BoxDecoration(
+                            color: part.onHand.isNotEmpty
+                                ? AppTheme.accentCyan.withOpacity(0.12)
+                                : AppTheme.cardDark.withOpacity(0.5),
+                            borderRadius: BorderRadius.circular(4),
+                            border: Border.all(
+                              color: part.onHand.isNotEmpty
+                                  ? AppTheme.accentCyan.withOpacity(0.4)
+                                  : AppTheme.borderDark,
+                            ),
+                          ),
+                          child: Row(
+                            mainAxisSize: MainAxisSize.min,
+                            children: [
+                              Icon(
+                                Icons.location_on_rounded,
+                                size: 11,
+                                color: part.onHand.isNotEmpty ? AppTheme.accentCyan : AppTheme.textMuted,
+                              ),
+                              const SizedBox(width: 3),
+                              Text(
+                                part.onHand.isNotEmpty ? 'ON-HAND: ${part.onHand}' : 'ON-HAND: —',
+                                style: TextStyle(
+                                  fontSize: 10,
+                                  color: part.onHand.isNotEmpty ? AppTheme.accentCyan : AppTheme.textMuted,
+                                  fontWeight: part.onHand.isNotEmpty ? FontWeight.bold : FontWeight.w500,
+                                ),
+                              ),
+                            ],
+                          ),
+                        ),
+                      ],
+                    ),
                     const SizedBox(height: 6),
                     LinearProgressIndicator(
                       value: progress,

@@ -1,5 +1,6 @@
 import 'package:flutter/material.dart';
 import 'package:intl/intl.dart';
+import '../../engine/column_mapper.dart';
 import '../../engine/grouping_engine.dart';
 import '../../models/grouping_preset.dart';
 import '../../models/picklist_item.dart';
@@ -495,7 +496,32 @@ class _TreeNodeWidgetState extends State<_TreeNodeWidget> {
       (i) => i.onHand.trim().isNotEmpty,
       orElse: () => firstItem ?? PicklistItem(id: '', unitId: '', department: '', line: '', workOrder: '', partId: '', partDescription: '', qtyRequired: 0, qtyDue: 0, qtyPicked: 0, rowOrder: 0),
     );
-    final onHandInfo = onHandItem.onHand.trim();
+    var onHandInfo = onHandItem.onHand.trim();
+    if (onHandInfo.isEmpty) {
+      for (final it in widget.node.leafItems) {
+        if (it.rawColumns.isNotEmpty) {
+          for (final entry in it.rawColumns.entries) {
+            final norm = ColumnMapper.normalize(entry.key);
+            if (norm == 'ON HAND' ||
+                norm.contains('ON HAND') ||
+                norm.contains('ONHAND') ||
+                norm.contains('LOCATION') ||
+                norm.contains('BIN') ||
+                norm.contains('STOCK') ||
+                norm.contains('INVENTORY') ||
+                norm == 'LOC' ||
+                norm == 'OH') {
+              final val = entry.value?.toString().trim() ?? '';
+              if (val.isNotEmpty && val.toLowerCase() != 'null') {
+                onHandInfo = val;
+                break;
+              }
+            }
+          }
+        }
+        if (onHandInfo.isNotEmpty) break;
+      }
+    }
 
     return Card(
       margin: EdgeInsets.only(
@@ -582,47 +608,54 @@ class _TreeNodeWidgetState extends State<_TreeNodeWidget> {
                         );
                       }),
                     ],
-                    if ((widget.node.partDescription != null && widget.node.partDescription!.isNotEmpty) || onHandInfo.isNotEmpty) ...[
-                      const SizedBox(height: 3),
-                      Wrap(
-                        crossAxisAlignment: WrapCrossAlignment.center,
-                        spacing: 8,
-                        runSpacing: 4,
-                        children: [
-                          if (widget.node.partDescription != null && widget.node.partDescription!.isNotEmpty)
-                            Text(
-                              widget.node.partDescription!,
-                              style: const TextStyle(fontSize: 13, color: AppTheme.textMuted),
-                              maxLines: 2,
-                              overflow: TextOverflow.ellipsis,
+                    const SizedBox(height: 3),
+                    Wrap(
+                      crossAxisAlignment: WrapCrossAlignment.center,
+                      spacing: 8,
+                      runSpacing: 4,
+                      children: [
+                        if (widget.node.partDescription != null && widget.node.partDescription!.isNotEmpty)
+                          Text(
+                            widget.node.partDescription!,
+                            style: const TextStyle(fontSize: 13, color: AppTheme.textMuted),
+                            maxLines: 2,
+                            overflow: TextOverflow.ellipsis,
+                          ),
+                        Container(
+                          padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
+                          decoration: BoxDecoration(
+                            color: onHandInfo.isNotEmpty
+                                ? AppTheme.accentCyan.withOpacity(0.12)
+                                : AppTheme.cardDark.withOpacity(0.5),
+                            borderRadius: BorderRadius.circular(4),
+                            border: Border.all(
+                              color: onHandInfo.isNotEmpty
+                                  ? AppTheme.accentCyan.withOpacity(0.4)
+                                  : AppTheme.borderDark,
                             ),
-                          if (onHandInfo.isNotEmpty)
-                            Container(
-                              padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
-                              decoration: BoxDecoration(
-                                color: AppTheme.accentCyan.withValues(alpha: 0.12),
-                                borderRadius: BorderRadius.circular(4),
-                                border: Border.all(color: AppTheme.accentCyan.withValues(alpha: 0.4)),
+                          ),
+                          child: Row(
+                            mainAxisSize: MainAxisSize.min,
+                            children: [
+                              Icon(
+                                Icons.location_on_rounded,
+                                size: 12,
+                                color: onHandInfo.isNotEmpty ? AppTheme.accentCyan : AppTheme.textMuted,
                               ),
-                              child: Row(
-                                mainAxisSize: MainAxisSize.min,
-                                children: [
-                                  const Icon(Icons.location_on_rounded, size: 12, color: AppTheme.accentCyan),
-                                  const SizedBox(width: 3),
-                                  Text(
-                                    'ON-HAND: $onHandInfo',
-                                    style: const TextStyle(
-                                      fontSize: 11,
-                                      color: AppTheme.accentCyan,
-                                      fontWeight: FontWeight.bold,
-                                    ),
-                                  ),
-                                ],
+                              const SizedBox(width: 3),
+                              Text(
+                                onHandInfo.isNotEmpty ? 'ON-HAND: $onHandInfo' : 'ON-HAND: —',
+                                style: TextStyle(
+                                  fontSize: 11,
+                                  color: onHandInfo.isNotEmpty ? AppTheme.accentCyan : AppTheme.textMuted,
+                                  fontWeight: onHandInfo.isNotEmpty ? FontWeight.bold : FontWeight.w500,
+                                ),
                               ),
-                            ),
-                        ],
-                      ),
-                    ],
+                            ],
+                          ),
+                        ),
+                      ],
+                    ),
                     Builder(builder: (_) {
                       final depts = widget.node.leafItems
                           .map((i) => i.department.trim())

@@ -1,7 +1,10 @@
 import 'dart:async';
+import 'dart:convert';
+import 'dart:io';
 import 'package:file_picker/file_picker.dart';
 import 'package:flutter/material.dart';
 import 'package:intl/intl.dart';
+import 'package:path/path.dart' as p;
 import '../../engine/column_mapper.dart';
 import '../../models/unit_record.dart';
 import '../../services/database_service.dart';
@@ -156,6 +159,13 @@ class _AdminScreenState extends State<AdminScreen> with SingleTickerProviderStat
 
   Future<void> _loadAdminData() async {
     setState(() => _isLoading = true);
+
+    try {
+      await widget.dbService.syncAllKnownCatalogs(widget.columnMapper);
+    } catch (e) {
+      LogService.warn('AdminScreen', 'Failed to sync catalogs: $e');
+    }
+
     // General Settings
     final tabletId = await widget.dbService.getConfig('tablet_id');
     if (tabletId != null) {
@@ -167,7 +177,7 @@ class _AdminScreenState extends State<AdminScreen> with SingleTickerProviderStat
     _groupByLine = await widget.dbService.getGroupByLine();
     _deptLineOverrides = await widget.dbService.getLineGroupingDeptOverrides();
     _resourceLineOverrides = await widget.dbService.getLineGroupingResourceOverrides();
-    _allDistinctResources = await widget.dbService.getAllDistinctResourceIds();
+    _allDistinctResources = await widget.dbService.getAllDistinctComponentResourceIds();
     _blockedResourceIds = await widget.dbService.getBlockedResourceIds();
     _autoIssueResourceIds = await widget.dbService.getAutoIssueResourceIds();
     _resourcePatternRules = await widget.dbService.getResourcePatternRules();
@@ -317,6 +327,19 @@ class _AdminScreenState extends State<AdminScreen> with SingleTickerProviderStat
               Text('Admin & Device Configuration'),
             ],
           ),
+          actions: [
+            IconButton(
+              icon: const Icon(Icons.file_upload_rounded, color: AppTheme.accentCyan),
+              tooltip: 'Export Settings (JSON)',
+              onPressed: _exportConfigurationToFile,
+            ),
+            IconButton(
+              icon: const Icon(Icons.file_download_rounded, color: AppTheme.statusComplete),
+              tooltip: 'Import Settings (JSON)',
+              onPressed: _importConfigurationFromFile,
+            ),
+            const SizedBox(width: 8),
+          ],
           bottom: TabBar(
             controller: _tabController,
             indicatorColor: AppTheme.accentCyan,
@@ -551,6 +574,63 @@ class _AdminScreenState extends State<AdminScreen> with SingleTickerProviderStat
             ),
           ),
         ),
+        const SizedBox(height: 24),
+        Card(
+          color: AppTheme.bgDark,
+          shape: RoundedRectangleBorder(
+            borderRadius: BorderRadius.circular(12),
+            side: const BorderSide(color: AppTheme.borderDark),
+          ),
+          child: Padding(
+            padding: const EdgeInsets.all(20),
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                const Row(
+                  children: [
+                    Icon(Icons.sync_rounded, color: AppTheme.accentCyan, size: 20),
+                    SizedBox(width: 8),
+                    Text(
+                      'Configuration Backup & Multi-Tablet Sync',
+                      style: TextStyle(fontSize: 16, fontWeight: FontWeight.bold, color: AppTheme.accentCyan),
+                    ),
+                  ],
+                ),
+                const SizedBox(height: 6),
+                const Text(
+                  'Export all tablet settings (Departments, Component Resources, Column Mappings, Presets, Pattern Rules, Pickers) to a portable JSON file, or clone settings from another tablet in seconds.',
+                  style: TextStyle(color: AppTheme.textMuted, fontSize: 13, height: 1.4),
+                ),
+                const SizedBox(height: 18),
+                Wrap(
+                  spacing: 12,
+                  runSpacing: 10,
+                  children: [
+                    ElevatedButton.icon(
+                      style: ElevatedButton.styleFrom(
+                        backgroundColor: AppTheme.accentCyan,
+                        padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
+                      ),
+                      icon: const Icon(Icons.file_upload_rounded, size: 18, color: Colors.black),
+                      label: const Text('Export Settings (JSON)', style: TextStyle(color: Colors.black, fontWeight: FontWeight.bold)),
+                      onPressed: _exportConfigurationToFile,
+                    ),
+                    OutlinedButton.icon(
+                      style: OutlinedButton.styleFrom(
+                        foregroundColor: AppTheme.statusComplete,
+                        side: const BorderSide(color: AppTheme.statusComplete),
+                        padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
+                      ),
+                      icon: const Icon(Icons.file_download_rounded, size: 18),
+                      label: const Text('Import Settings (JSON)', style: TextStyle(fontWeight: FontWeight.bold)),
+                      onPressed: _importConfigurationFromFile,
+                    ),
+                  ],
+                ),
+              ],
+            ),
+          ),
+        ),
       ],
     );
   }
@@ -579,7 +659,7 @@ class _AdminScreenState extends State<AdminScreen> with SingleTickerProviderStat
                 style: TextStyle(fontSize: 22, fontWeight: FontWeight.bold, color: AppTheme.textLight),
               ),
               const SizedBox(height: 8),
-              const Text('Default PIN is 1234', style: TextStyle(fontSize: 13, color: AppTheme.textMuted)),
+              const Text('Enter authorized PIN to proceed', style: TextStyle(fontSize: 13, color: AppTheme.textMuted)),
               const SizedBox(height: 20),
               TextField(
                 controller: _pinController,
@@ -2115,6 +2195,349 @@ class _AdminScreenState extends State<AdminScreen> with SingleTickerProviderStat
         );
       }
     }
+  }
+
+  Future<void> _exportConfigurationToFile() async {
+    if (!_ensureAdminSessionValid()) return;
+
+    try {
+      String? targetDir = await widget.dbService.getLastExportDir();
+      final pickedDir = await FilePicker.getDirectoryPath();
+      if (pickedDir != null && pickedDir.isNotEmpty) {
+        targetDir = pickedDir;
+        await widget.dbService.setLastExportDir(targetDir);
+      }
+
+      if (targetDir == null || targetDir.isEmpty) {
+        if (mounted) {
+          ScaffoldMessenger.of(context).showSnackBar(
+            const SnackBar(
+              content: Text('No destination folder selected for configuration export.'),
+              backgroundColor: AppTheme.statusPartial,
+            ),
+          );
+        }
+        return;
+      }
+
+      final configData = await widget.dbService.exportFullConfiguration(
+        includePins: true,
+        columnMapperJson: widget.columnMapper.toJson(),
+      );
+
+      final rawTabletId = (await widget.dbService.getConfig('tablet_id')) ?? 'Tablet';
+      final safeTabletId = rawTabletId.replaceAll(RegExp(r'[^\w\-]'), '_');
+      final timestamp = DateFormat('yyyyMMdd_HHmmss').format(DateTime.now());
+      final fileName = 'picklist_tracker_config_${safeTabletId}_$timestamp.json';
+      final filePath = p.join(targetDir, fileName);
+
+      final file = File(filePath);
+      final jsonStr = const JsonEncoder.withIndent('  ').convert(configData);
+      await file.writeAsString(jsonStr);
+
+      await LogService.admin('Full configuration exported to: $filePath');
+
+      if (mounted) {
+        showDialog(
+          context: context,
+          builder: (ctx) => AlertDialog(
+            backgroundColor: AppTheme.cardDark,
+            title: const Row(
+              children: [
+                Icon(Icons.check_circle_rounded, color: AppTheme.statusComplete),
+                SizedBox(width: 8),
+                Text('Configuration Exported', style: TextStyle(color: AppTheme.textLight)),
+              ],
+            ),
+            content: Column(
+              mainAxisSize: MainAxisSize.min,
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                const Text(
+                  'All tablet settings, rules, column mappings, and permissions have been exported to JSON.',
+                  style: TextStyle(color: AppTheme.textLight, height: 1.4),
+                ),
+                const SizedBox(height: 16),
+                Container(
+                  padding: const EdgeInsets.all(12),
+                  decoration: BoxDecoration(
+                    color: AppTheme.bgDark,
+                    borderRadius: BorderRadius.circular(8),
+                    border: Border.all(color: AppTheme.borderDark),
+                  ),
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      Text('File: $fileName', style: const TextStyle(color: AppTheme.accentCyan, fontWeight: FontWeight.bold)),
+                      const SizedBox(height: 6),
+                      SelectableText(
+                        filePath,
+                        style: const TextStyle(fontFamily: 'monospace', color: AppTheme.textMuted, fontSize: 12),
+                      ),
+                    ],
+                  ),
+                ),
+              ],
+            ),
+            actions: [
+              ElevatedButton(
+                style: ElevatedButton.styleFrom(backgroundColor: AppTheme.accentCyan),
+                onPressed: () => Navigator.of(ctx).pop(),
+                child: const Text('Done', style: TextStyle(color: Colors.black)),
+              ),
+            ],
+          ),
+        );
+      }
+    } catch (e, st) {
+      await LogService.error('Admin', 'Failed to export configuration: $e', stackTrace: st);
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text('Failed to export configuration: $e'),
+            backgroundColor: AppTheme.statusDanger,
+          ),
+        );
+      }
+    }
+  }
+
+  Future<void> _importConfigurationFromFile() async {
+    if (!_ensureAdminSessionValid()) return;
+
+    try {
+      final result = await FilePicker.pickFile(
+        type: FileType.custom,
+        allowedExtensions: ['json'],
+      );
+
+      if (result == null || result.path == null) {
+        return;
+      }
+
+      final filePath = result.path!;
+      final file = File(filePath);
+      if (!await file.exists()) {
+        if (mounted) {
+          ScaffoldMessenger.of(context).showSnackBar(
+            const SnackBar(content: Text('Configuration file does not exist.'), backgroundColor: AppTheme.statusDanger),
+          );
+        }
+        return;
+      }
+
+      final content = await file.readAsString();
+      final dynamic decoded = jsonDecode(content);
+      if (decoded is! Map<String, dynamic>) {
+        if (mounted) {
+          ScaffoldMessenger.of(context).showSnackBar(
+            const SnackBar(content: Text('Invalid configuration format (expected JSON object).'), backgroundColor: AppTheme.statusDanger),
+          );
+        }
+        return;
+      }
+
+      final configData = decoded;
+      final settings = (configData['settings'] is Map)
+          ? Map<String, dynamic>.from(configData['settings'] as Map)
+          : configData;
+      final fileTabletId = (settings['tablet_id'] as String?) ?? (configData['source_tablet_id'] as String?) ?? 'Unknown';
+      String fileTimestamp = 'Unknown';
+      if (configData['exported_at'] is num) {
+        fileTimestamp = DateFormat('yyyy-MM-dd HH:mm').format(
+          DateTime.fromMillisecondsSinceEpoch((configData['exported_at'] as num).toInt()),
+        );
+      } else if (configData['exported_at'] is String) {
+        fileTimestamp = configData['exported_at'] as String;
+      }
+      final fileDepts = (settings['global_departments'] is Map)
+          ? (settings['global_departments'] as Map).length
+          : 0;
+      final fileBlocked = (settings['blocked_resource_ids'] is List)
+          ? (settings['blocked_resource_ids'] as List).length
+          : (settings['blocked_component_resources'] is List ? (settings['blocked_component_resources'] as List).length : 0);
+      final fileAutoIssue = (settings['auto_issue_resource_ids'] is List)
+          ? (settings['auto_issue_resource_ids'] as List).length
+          : (settings['auto_issue_component_resources'] is List ? (settings['auto_issue_component_resources'] as List).length : 0);
+      final fileRules = (settings['component_resource_pattern_rules'] is List)
+          ? (settings['component_resource_pattern_rules'] as List).length
+          : (settings['component_resource_rules'] is List ? (settings['component_resource_rules'] as List).length : 0);
+      final filePickers = (settings['standard_pickers'] is List)
+          ? (settings['standard_pickers'] as List).length
+          : 0;
+      final hasMapper = settings.containsKey('column_mapper_config');
+
+      bool keepCurrentTabletId = true;
+      bool keepCurrentPins = true;
+
+      if (!mounted) return;
+
+      final confirmed = await showDialog<bool>(
+        context: context,
+        builder: (ctx) => StatefulBuilder(
+          builder: (dialogCtx, setDialogState) => AlertDialog(
+            backgroundColor: AppTheme.cardDark,
+            title: const Row(
+              children: [
+                Icon(Icons.settings_backup_restore_rounded, color: AppTheme.accentCyan),
+                SizedBox(width: 8),
+                Text('Import Configuration', style: TextStyle(color: AppTheme.textLight)),
+              ],
+            ),
+            content: SizedBox(
+              width: 480,
+              child: SingleChildScrollView(
+                child: Column(
+                  mainAxisSize: MainAxisSize.min,
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Text(
+                      'Apply settings from "${p.basename(filePath)}"?',
+                      style: const TextStyle(fontWeight: FontWeight.bold, color: AppTheme.textLight),
+                    ),
+                    const SizedBox(height: 12),
+                    Container(
+                      padding: const EdgeInsets.all(12),
+                      decoration: BoxDecoration(
+                        color: AppTheme.bgDark,
+                        borderRadius: BorderRadius.circular(8),
+                        border: Border.all(color: AppTheme.borderDark),
+                      ),
+                      child: Column(
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        children: [
+                          _buildConfigSummaryRow('Source Tablet ID:', fileTabletId),
+                          _buildConfigSummaryRow('Exported At:', fileTimestamp),
+                          _buildConfigSummaryRow('Departments:', '$fileDepts configured'),
+                          _buildConfigSummaryRow('Blocked Resources:', '$fileBlocked'),
+                          _buildConfigSummaryRow('Auto-Issue Resources:', '$fileAutoIssue'),
+                          _buildConfigSummaryRow('Pattern Rules:', '$fileRules'),
+                          _buildConfigSummaryRow('Column Mappings:', hasMapper ? 'Customized' : 'Standard'),
+                          _buildConfigSummaryRow('Standard Pickers:', '$filePickers'),
+                        ],
+                      ),
+                    ),
+                    const SizedBox(height: 16),
+                    CheckboxListTile(
+                      contentPadding: EdgeInsets.zero,
+                      value: keepCurrentTabletId,
+                      activeColor: AppTheme.accentCyan,
+                      title: Text(
+                        'Keep this tablet\'s ID ("$_tabletId")',
+                        style: const TextStyle(fontSize: 13, fontWeight: FontWeight.bold, color: AppTheme.textLight),
+                      ),
+                      subtitle: const Text(
+                        'Prevents duplicate Tablet IDs when setting up fleet devices',
+                        style: TextStyle(fontSize: 11, color: AppTheme.textMuted),
+                      ),
+                      onChanged: (val) {
+                        setDialogState(() => keepCurrentTabletId = val ?? true);
+                      },
+                    ),
+                    CheckboxListTile(
+                      contentPadding: EdgeInsets.zero,
+                      value: keepCurrentPins,
+                      activeColor: AppTheme.accentCyan,
+                      title: const Text(
+                        'Keep this tablet\'s existing PINs',
+                        style: TextStyle(fontSize: 13, fontWeight: FontWeight.bold, color: AppTheme.textLight),
+                      ),
+                      subtitle: const Text(
+                        'Do not overwrite Admin and Super Admin PINs with file values',
+                        style: TextStyle(fontSize: 11, color: AppTheme.textMuted),
+                      ),
+                      onChanged: (val) {
+                        setDialogState(() => keepCurrentPins = val ?? true);
+                      },
+                    ),
+                  ],
+                ),
+              ),
+            ),
+            actions: [
+              TextButton(
+                onPressed: () => Navigator.of(ctx).pop(false),
+                child: const Text('Cancel', style: TextStyle(color: AppTheme.textMuted)),
+              ),
+              ElevatedButton.icon(
+                style: ElevatedButton.styleFrom(backgroundColor: AppTheme.statusComplete),
+                icon: const Icon(Icons.check_rounded, size: 18, color: Colors.black),
+                label: const Text('Apply Configuration', style: TextStyle(color: Colors.black, fontWeight: FontWeight.bold)),
+                onPressed: () => Navigator.of(ctx).pop(true),
+              ),
+            ],
+          ),
+        ),
+      );
+
+      if (confirmed != true) return;
+
+      // Import configuration to DB
+      await widget.dbService.importFullConfiguration(
+        configData,
+        overwriteTabletId: !keepCurrentTabletId,
+        overwritePins: !keepCurrentPins,
+      );
+
+      // In-place update of ColumnMapper
+      if (settings.containsKey('column_mapper_config') || configData.containsKey('column_mapper_config')) {
+        try {
+          final mapperRaw = settings['column_mapper_config'] ?? configData['column_mapper_config'];
+          final Map<String, dynamic> mapperMap = mapperRaw is String
+              ? jsonDecode(mapperRaw)
+              : Map<String, dynamic>.from(mapperRaw);
+          widget.columnMapper.aliases.clear();
+          for (final e in mapperMap.entries) {
+            widget.columnMapper.aliases[e.key] = (e.value as List).map((i) => i.toString()).toList();
+          }
+          // Ensure all default canonical keys are present
+          for (final defEntry in ColumnMapper.defaultAliases.entries) {
+            if (!widget.columnMapper.aliases.containsKey(defEntry.key)) {
+              widget.columnMapper.aliases[defEntry.key] = List<String>.from(defEntry.value);
+            }
+          }
+        } catch (e) {
+          LogService.warn('Admin', 'Failed to update in-memory column mapper: $e');
+        }
+      }
+
+      await LogService.admin('Imported configuration from ${p.basename(filePath)} (Keep Tablet ID: $keepCurrentTabletId, Keep PINs: $keepCurrentPins)');
+      await _loadAdminData();
+      widget.onDataChanged();
+
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text('Configuration from "${p.basename(filePath)}" applied successfully!'),
+            backgroundColor: AppTheme.statusComplete,
+            duration: const Duration(seconds: 4),
+          ),
+        );
+      }
+    } catch (e, st) {
+      await LogService.error('Admin', 'Failed to import configuration: $e', stackTrace: st);
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text('Failed to import configuration: $e'),
+            backgroundColor: AppTheme.statusDanger,
+          ),
+        );
+      }
+    }
+  }
+
+  Widget _buildConfigSummaryRow(String label, String value) {
+    return Padding(
+      padding: const EdgeInsets.symmetric(vertical: 2),
+      child: Row(
+        mainAxisAlignment: MainAxisAlignment.spaceBetween,
+        children: [
+          Text(label, style: const TextStyle(color: AppTheme.textMuted, fontSize: 12)),
+          Text(value, style: const TextStyle(color: AppTheme.textLight, fontSize: 12, fontWeight: FontWeight.bold)),
+        ],
+      ),
+    );
   }
 
   Future<void> _purgeOldLogs() async {

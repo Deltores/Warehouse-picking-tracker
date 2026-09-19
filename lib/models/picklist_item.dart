@@ -1,8 +1,13 @@
+import 'dart:convert';
+
 /// Core picklist row model.
 ///
 /// All quantity fields use [double] to support measurement units (m, ft, kg, etc.).
 /// [deptType]: populated from an optional Excel column (e.g. "DEPT TYPE", "LINE TYPE");
 ///             expected values: 'MAIN LINE', 'SUBASSEMBLY', or '' (auto-detected when blank).
+/// [resourceId]: Destination / assembly resource ID (where parts are assembled).
+/// [componentResourceId]: Component resource ID / part source (where parts originate).
+/// [rawColumns]: Raw original column values from the Excel row for dynamic preservation on export.
 class PicklistItem {
   final String id;
   final String unitId;
@@ -19,8 +24,10 @@ class PicklistItem {
   final String prodDate;
   final String subUnit;
   final String resourceId;
+  final String componentResourceId;
   final String onHand;
   final String deptType; // 'MAIN LINE' | 'SUBASSEMBLY' | ''
+  final Map<String, dynamic> rawColumns;
 
   PicklistItem({
     required this.id,
@@ -38,8 +45,10 @@ class PicklistItem {
     this.prodDate = '',
     this.subUnit = '',
     this.resourceId = '',
+    this.componentResourceId = '',
     this.onHand = '',
     this.deptType = '',
+    this.rawColumns = const {},
   });
 
   static String formatQty(double val) {
@@ -71,8 +80,10 @@ class PicklistItem {
     String? prodDate,
     String? subUnit,
     String? resourceId,
+    String? componentResourceId,
     String? onHand,
     String? deptType,
+    Map<String, dynamic>? rawColumns,
   }) {
     return PicklistItem(
       id: id ?? this.id,
@@ -90,8 +101,10 @@ class PicklistItem {
       prodDate: prodDate ?? this.prodDate,
       subUnit: subUnit ?? this.subUnit,
       resourceId: resourceId ?? this.resourceId,
+      componentResourceId: componentResourceId ?? this.componentResourceId,
       onHand: onHand ?? this.onHand,
       deptType: deptType ?? this.deptType,
+      rawColumns: rawColumns ?? this.rawColumns,
     );
   }
 
@@ -112,12 +125,24 @@ class PicklistItem {
       'prod_date': prodDate,
       'sub_unit': subUnit,
       'resource_id': resourceId,
+      'component_resource_id': componentResourceId,
       'on_hand': onHand,
       'dept_type': deptType,
+      'raw_columns': jsonEncode(rawColumns),
     };
   }
 
   factory PicklistItem.fromMap(Map<String, dynamic> map) {
+    Map<String, dynamic> parsedRaw = {};
+    if (map['raw_columns'] != null && map['raw_columns'] is String) {
+      final str = (map['raw_columns'] as String).trim();
+      if (str.isNotEmpty) {
+        try {
+          parsedRaw = jsonDecode(str) as Map<String, dynamic>;
+        } catch (_) {}
+      }
+    }
+
     return PicklistItem(
       id: map['id'] as String,
       unitId: map['unit_id'] as String,
@@ -134,8 +159,10 @@ class PicklistItem {
       prodDate: (map['prod_date'] ?? '') as String,
       subUnit: (map['sub_unit'] ?? '') as String,
       resourceId: (map['resource_id'] ?? '') as String,
+      componentResourceId: (map['component_resource_id'] ?? '') as String,
       onHand: (map['on_hand'] ?? '') as String,
       deptType: (map['dept_type'] ?? '') as String,
+      rawColumns: parsedRaw,
     );
   }
 }

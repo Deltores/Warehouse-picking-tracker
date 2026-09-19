@@ -1,3 +1,5 @@
+import 'dart:convert';
+
 class UnitRecord {
   final String id;
   final String name;
@@ -9,6 +11,7 @@ class UnitRecord {
   final int? completedAt;
   final int lastAccessedAt;
   final int? deletedAt; // Non-null if soft-deleted (30-day grace period)
+  final List<String> originalHeaders;
 
   UnitRecord({
     required this.id,
@@ -21,6 +24,7 @@ class UnitRecord {
     this.completedAt,
     required this.lastAccessedAt,
     this.deletedAt,
+    this.originalHeaders = const [],
   });
 
   bool get isCompleted =>
@@ -42,6 +46,7 @@ class UnitRecord {
     int? lastAccessedAt,
     int? deletedAt,
     bool clearDeletedAt = false,
+    List<String>? originalHeaders,
   }) {
     return UnitRecord(
       id: id ?? this.id,
@@ -54,6 +59,7 @@ class UnitRecord {
       completedAt: completedAt ?? this.completedAt,
       lastAccessedAt: lastAccessedAt ?? this.lastAccessedAt,
       deletedAt: clearDeletedAt ? null : (deletedAt ?? this.deletedAt),
+      originalHeaders: originalHeaders ?? this.originalHeaders,
     );
   }
 
@@ -69,10 +75,21 @@ class UnitRecord {
       'completed_at': completedAt,
       'last_accessed_at': lastAccessedAt,
       'deleted_at': deletedAt,
+      'original_headers': jsonEncode(originalHeaders),
     };
   }
 
   factory UnitRecord.fromMap(Map<String, dynamic> map) {
+    List<String> parsedHeaders = [];
+    if (map['original_headers'] != null && map['original_headers'] is String) {
+      try {
+        final list = jsonDecode(map['original_headers'] as String);
+        if (list is List) {
+          parsedHeaders = list.map((e) => e.toString()).toList();
+        }
+      } catch (_) {}
+    }
+
     return UnitRecord(
       id: map['id'] as String,
       name: (map['name'] ?? '') as String,
@@ -84,6 +101,7 @@ class UnitRecord {
       completedAt: (map['completed_at'] as num?)?.toInt(),
       lastAccessedAt: (map['last_accessed_at'] as num?)?.toInt() ?? DateTime.now().millisecondsSinceEpoch,
       deletedAt: (map['deleted_at'] as num?)?.toInt(),
+      originalHeaders: parsedHeaders,
     );
   }
 }

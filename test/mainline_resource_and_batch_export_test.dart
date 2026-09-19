@@ -5,6 +5,7 @@ import 'package:picklist_tracker/models/grouping_preset.dart';
 import 'package:picklist_tracker/models/picklist_item.dart';
 import 'package:picklist_tracker/models/session_metadata.dart';
 import 'package:picklist_tracker/models/unit_record.dart';
+import 'package:picklist_tracker/services/excel_service.dart';
 import 'package:picklist_tracker/ui/screens/session_export_screen.dart';
 
 void main() {
@@ -577,14 +578,14 @@ void main() {
         return resId.toLowerCase().contains(pattern.toLowerCase());
       }
 
-      final res1 = 'SMALL_BOX_ASSEMBLY';
-      final res2 = 'SPOT_WELDING_1';
-      final res3 = 'PAINT_BOOTH';
+      const res1 = 'SMALL_BOX_ASSEMBLY';
+      const res2 = 'SPOT_WELDING_1';
+      const res3 = 'PAINT_BOOTH';
 
-      expect(matchesPattern(res1, 'BOX'), isTrue);
-      expect(matchesPattern(res2, 'weld'), isTrue);
-      expect(matchesPattern(res3, 'BOX'), isFalse);
-      expect(matchesPattern(res3, 'weld'), isFalse);
+      expect(matchesPattern(res1, rules[0]['pattern'] as String), isTrue);
+      expect(matchesPattern(res2, rules[1]['pattern'] as String), isTrue);
+      expect(matchesPattern(res3, rules[0]['pattern'] as String), isFalse);
+      expect(matchesPattern(res3, rules[1]['pattern'] as String), isFalse);
     });
 
     test('Historical picking recovery logic accurately allocates past picks onto re-imported picklist items', () {
@@ -917,6 +918,56 @@ void main() {
 
       expect(delta, 4.0);
       expect(delta > 0.0001, isTrue);
+    });
+
+    test('ExcelService.orderHeadersWithQtyPicked positions Qty Picked between Qty Required and Qty Due and preserves other columns', () {
+      final inputHeaders = ['Unit', 'WO', 'Part ID', 'Description', 'Qty Required', 'Qty Due', 'Component Resource id', 'Resource id', 'Custom Bin', 'Vendor'];
+      final ordered = ExcelService.orderHeadersWithQtyPicked(inputHeaders);
+
+      final reqIdx = ordered.indexOf('Qty Required');
+      final pickedIdx = ordered.indexOf('Qty Picked');
+      final dueIdx = ordered.indexOf('Qty Due');
+
+      expect(reqIdx, isNot(equals(-1)));
+      expect(pickedIdx, equals(reqIdx + 1));
+      expect(dueIdx, equals(pickedIdx + 1));
+      expect(ordered.contains('Custom Bin'), isTrue);
+      expect(ordered.contains('Vendor'), isTrue);
+      expect(ordered.contains('Component Resource id'), isTrue);
+      expect(ordered.contains('Resource id'), isTrue);
+    });
+
+    test('PicklistItem serializes and deserializes componentResourceId and rawColumns correctly', () {
+      final item = PicklistItem(
+        id: 'item_raw_1',
+        unitId: 'u1',
+        department: 'Plumbing',
+        line: 'B2',
+        workOrder: 'WO1',
+        partId: 'P100',
+        partDescription: 'Pipe',
+        resourceId: '2 ge plumb',
+        componentResourceId: 'prima',
+        qtyRequired: 10,
+        qtyDue: 10,
+        qtyPicked: 0,
+        rowOrder: 1,
+        rawColumns: {
+          'Vendor': 'Acme Corp',
+          'Bin Location': 'A-12',
+          'Cost': 15.5,
+        },
+      );
+
+      final map = item.toMap();
+      expect(map['component_resource_id'], 'prima');
+      expect(map['raw_columns'], isNotNull);
+
+      final fromMap = PicklistItem.fromMap(map);
+      expect(fromMap.componentResourceId, 'prima');
+      expect(fromMap.rawColumns['Vendor'], 'Acme Corp');
+      expect(fromMap.rawColumns['Bin Location'], 'A-12');
+      expect(fromMap.rawColumns['Cost'], 15.5);
     });
   });
 }

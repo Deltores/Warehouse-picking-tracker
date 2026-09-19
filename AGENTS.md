@@ -122,9 +122,17 @@ lib/
 
 ### Departments vs Component Resource IDs vs Grouping Presets
 - **Departments (Assembly Destinations)**: Represent the destination work areas where parts are assembled. On the tablet, departments only have "Allowed for Pick" permissions (Allow / Block). Auto-issue is **NEVER** applied to departments.
-- **Component Resource IDs / Component Departments (Part Sources)**: Represent where parts originate. On the tablet, component resources have:
+- **Component Resource IDs / Component Departments (Part Sources)**: Represent where parts originate (source specification / component resources, Column `Component Resource id`). On the tablet, component resources have:
   1. "Allowed for Pick" (Allow / Block picking on this device).
   2. "Auto-Issue 100%" (auto-marks 100% picked on export and hides from picking).
+- **Destination Resource IDs (`Resource id`)**: Represent destination assembly work centers (e.g. `2 ge plumb`, `housing`, `internals`). Distinct from `Component Resource id` (e.g. `prima`, `Weld`, `Doors`).
+- **Complete Exclusion of Blocked Items**: If a Department or Component Resource is blocked from picking on this tablet, all matching parts are completely hidden from picking views, and unit/department metrics (unique Part ID counts, `totalParts`, `completedParts`, and urgency glow) strictly calculate as if the blocked items do not exist at all.
+- **Original & Arbitrary Column Preservation**: When importing picklists, all original columns from Excel are preserved in memory and in SQLite (`raw_columns` / `original_headers`). On export, all original and extra columns are exported for picked/auto-issued rows.
+- **Automatic Discovery & Catalog Replenishment on Import**:
+  - Whenever an Excel picklist is imported, `DatabaseService.registerDiscoveredPicklistItems` dynamically detects any new **Departments**, **Component Resources**, or **MAIN LINE Destination Resources** not previously recorded in the tablet's database.
+  - **Persistent Discovery Catalogs**: Newly detected items are automatically persisted into `known_departments`, `known_component_resources`, and `known_main_line_resources`, ensuring that even if units are pruned or soft-deleted, the tablet permanently retains all discovered categories in Admin menus (Tab 2, Tab 3, Tab 5).
+  - **Default Status (ENABLED)**: All newly discovered items are enabled for picking by default (`Allowed for Pick = true`, not blocked, not auto-issue) unless an Admin pattern matching rule automatically applies.
+  - **On-Screen Alert Dialog**: If an imported file introduces new categories, an interactive modal dialog displays a clear breakdown of the newly discovered items with direct options to `[Continue to Picking]` or `[Review in Admin]`.
 - **Component Resource Pattern Matching Rules (Tab 3)**:
   - Admins can configure substring "contains" pattern rules (e.g. if Resource ID contains `BOX`, set Allow/Block and Auto-Issue 100%).
   - Pattern rules automatically apply to all current and future matching Component Resources across units.
@@ -170,6 +178,22 @@ Unit (file)
 ### Export Destination Folder
 - Admin/Picker can select any export destination folder via directory picker.
 - The selected folder is persisted in `admin_config` (`last_export_dir`). Defaults to the source picklist folder if unconfigured.
+
+### Portable Admin Configuration Backup & Fleet Sync (JSON)
+- **Full Configuration Export (`exportFullConfiguration`)**:
+  - Exports all tablet and admin configurations into a structured `.json` file (`picklist_tracker_config_{TabletId}_{Timestamp}.json`).
+  - Included settings: Column Mapper custom aliases (`column_mapper_config`), global departments permission map (`global_departments`), blocked and 100% auto-issued component resources (`blocked_resource_ids`, `auto_issue_resource_ids`), component resource pattern matching rules (`component_resource_pattern_rules`), MAIN LINE whole resource picks and view modes (`main_line_resource_picks`, `mainline_resource_default_view`, `mainline_resource_views`), Line grouping toggle and department/resource overrides (`group_by_line`, `line_grouping_dept_overrides`), Pick Mode auto-advance toggle, Standard Pickers list, and export destination folder.
+  - Option to include/exclude PINs.
+- **Atomic Configuration Import (`importFullConfiguration`)**:
+  - Allows cloning the full setup to any other tablet in a multi-tablet fleet.
+  - Interactive preview dialog inspects the JSON file and presents statistics (departments count, blocked/auto-issue resources count, pattern rules count, standard pickers count, and column mapper status).
+  - **Fleet Tablet ID & PIN Protection**:
+    - By default, `Keep this tablet's ID` is checked (`overwriteTabletId: false`), preventing duplicate Tablet IDs when provisioning multiple tablets.
+    - By default, `Keep this tablet's existing PINs` is checked (`overwritePins: false`), protecting local device authorization codes.
+  - In-place reload immediately refreshes `ColumnMapper.aliases`, SQLite configurations, and active UI states.
+  - Quick action buttons in AppBar (`[Export JSON]`, `[Import JSON]`) and dedicated `Configuration Backup & Multi-Tablet Sync` card in Tab 1 (General Settings).
+- **Default PIN Hints Suppressed from UI**:
+  - All UI labels and hints revealing default PIN values (e.g. `1234` or `9999`) have been removed from authentication prompts and dialogs. All credentials remain configurable via Super Admin.
 
 ### Simplified 60-Day Session Retention (No Cascade on Unit Deletion)
 - When a unit is deleted (by admin or auto-pruned at the 40-unit capacity limit), the unit is soft-deleted (`deleted_at = now`).

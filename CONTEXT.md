@@ -1,4 +1,4 @@
-# Domain Context — Pick List Tracker
+т# Domain Context — Pick List Tracker
 
 Business and technical glossary. Read this before writing any logic.
 

@@ -199,6 +199,7 @@ class _PickingScreenState extends State<PickingScreen> with WidgetsBindingObserv
       }
     }
 
+    final blockedDepts = await widget.dbService.getBlockedDepartmentSet();
     final blockedRes = await widget.dbService.getBlockedResourceIds();
     final isBlockedEmpty = blockedRes.any((r) => r.trim().isEmpty || r == '(Empty / Unassigned)');
     final blockedSet = blockedRes
@@ -214,7 +215,8 @@ class _PickingScreenState extends State<PickingScreen> with WidgetsBindingObserv
         .toSet();
 
     final visibleItems = items.where((i) {
-      final r = i.resourceId.trim().toLowerCase();
+      if (blockedDepts.contains(i.department.trim())) return false;
+      final r = i.componentResourceId.trim().toLowerCase();
       final isEmpty = r.isEmpty;
       if (isEmpty) {
         if (isBlockedEmpty || isAutoEmpty) return false;
@@ -433,7 +435,7 @@ class _PickingScreenState extends State<PickingScreen> with WidgetsBindingObserv
                 maxLength: 6,
                 style: const TextStyle(color: AppTheme.textLight, fontSize: 20),
                 decoration: InputDecoration(
-                  hintText: 'Admin PIN (default 1234)',
+                  hintText: 'Enter Admin PIN',
                   hintStyle: const TextStyle(color: AppTheme.textMuted, fontSize: 13),
                   errorText: errorText,
                   prefixIcon: const Icon(Icons.password_rounded, color: AppTheme.accentCyan, size: 18),
@@ -718,7 +720,8 @@ class _PickingScreenState extends State<PickingScreen> with WidgetsBindingObserv
                   final totalDue = itemsForPart.fold<double>(0.0, (s, i) => s + i.qtyDue);
                   return totalDue <= 0.0001;
                 });
-                final isUnitComplete = allPartsDone || (newTotalPicked >= _activeUnit!.totalRequired && _activeUnit!.totalRequired > 0);
+                final totalVisibleReq = _items.fold<double>(0.0, (sum, i) => sum + i.qtyRequired).round();
+                final isUnitComplete = allPartsDone || (newTotalPicked >= totalVisibleReq && totalVisibleReq > 0);
                 _activeUnit = _activeUnit!.copyWith(
                   totalPicked: newTotalPicked,
                   status: isUnitComplete ? 'FULLY_PICKED' : 'IN_PROGRESS',
@@ -750,6 +753,7 @@ class _PickingScreenState extends State<PickingScreen> with WidgetsBindingObserv
         }
       }
       final freshItems = await widget.dbService.getPicklistItems(_activeUnit!.id);
+      final blockedDepts = await widget.dbService.getBlockedDepartmentSet();
       final blockedRes = await widget.dbService.getBlockedResourceIds();
       final isBlockedEmpty = blockedRes.any((r) => r.trim().isEmpty || r == '(Empty / Unassigned)');
       final blockedSet = blockedRes
@@ -765,7 +769,8 @@ class _PickingScreenState extends State<PickingScreen> with WidgetsBindingObserv
           .toSet();
 
       final visibleItems = freshItems.where((i) {
-        final r = i.resourceId.trim().toLowerCase();
+        if (blockedDepts.contains(i.department.trim())) return false;
+        final r = i.componentResourceId.trim().toLowerCase();
         final isEmpty = r.isEmpty;
         if (isEmpty) {
           if (isBlockedEmpty || isAutoEmpty) return false;
@@ -782,7 +787,8 @@ class _PickingScreenState extends State<PickingScreen> with WidgetsBindingObserv
         final totalDue = itemsForPart.fold<double>(0.0, (s, i) => s + i.qtyDue);
         return totalDue <= 0.0001;
       });
-      final isUnitComplete = allPartsDone || (newTotalPicked >= _activeUnit!.totalRequired && _activeUnit!.totalRequired > 0);
+      final totalVisibleReq = visibleItems.fold<double>(0.0, (sum, i) => sum + i.qtyRequired).round();
+      final isUnitComplete = allPartsDone || (newTotalPicked >= totalVisibleReq && totalVisibleReq > 0);
       final sessionPickCount = _activeSession != null
           ? await widget.dbService.getSessionPickedPartCount(_activeSession!.id)
           : 0;

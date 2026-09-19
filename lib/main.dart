@@ -32,6 +32,18 @@ void main() async {
       ? ColumnMapper.fromJson(savedAliasesJson)
       : ColumnMapper();
 
+  // If column_mapper_config in SQLite was missing keyComponentResourceId, persist updated JSON
+  if (savedAliasesJson == null || !savedAliasesJson.contains(ColumnMapper.keyComponentResourceId)) {
+    await dbService.setConfig('column_mapper_config', columnMapper.toJson());
+  }
+
+  // Sync all known catalogs and backfill any missing component_resource_id from raw_columns
+  try {
+    await dbService.syncAllKnownCatalogs(columnMapper);
+  } catch (e) {
+    LogService.warn('Startup', 'Failed to sync catalogs: $e');
+  }
+
   final storageManager = StorageManager(dbService);
   final excelService = ExcelService(mapper: columnMapper);
 

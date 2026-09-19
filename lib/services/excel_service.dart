@@ -58,10 +58,12 @@ class ExcelService {
     // 1. Identify header row (usually row 0)
     final headerRow = sheet.rows.first;
     final columnIndexMap = <String, int>{};
+    final originalHeaders = <String>[];
 
     for (int col = 0; col < headerRow.length; col++) {
       final cell = headerRow[col];
       final rawValue = cell?.value?.toString() ?? '';
+      originalHeaders.add(rawValue);
       if (rawValue.trim().isNotEmpty) {
         final canonicalKey = columnMapper.identifyColumn(rawValue);
         if (canonicalKey != null) {
@@ -97,6 +99,16 @@ class ExcelService {
         return parsed ?? defaultValue;
       }
 
+      // Collect all raw column key-value pairs for dynamic preservation on export
+      final rawColumns = <String, dynamic>{};
+      for (int c = 0; c < originalHeaders.length && c < row.length; c++) {
+        final h = originalHeaders[c].trim();
+        if (h.isNotEmpty) {
+          final cell = row[c];
+          rawColumns[h] = cell?.value?.toString() ?? '';
+        }
+      }
+
       final subUnit = getVal(ColumnMapper.keyUnit, defaultUnitName);
       final rawDept = getVal(ColumnMapper.keyDepartment, '');
       final department = rawDept.trim().isEmpty ? '(Empty / Unassigned)' : rawDept.trim();
@@ -110,14 +122,41 @@ class ExcelService {
       final pickDate = getVal(ColumnMapper.keyPickDate, '');
       final prodDate = getVal(ColumnMapper.keyProdDate, '');
       final resourceId = getVal(ColumnMapper.keyResourceId, '');
-      final onHand = getVal(ColumnMapper.keyOnHand, '');
+      final componentResourceId = getVal(ColumnMapper.keyComponentResourceId, '');
+      var onHand = getVal(ColumnMapper.keyOnHand, '');
+      if (onHand.isEmpty) {
+        for (final entry in rawColumns.entries) {
+          final norm = ColumnMapper.normalize(entry.key);
+          if (norm == 'ON HAND' ||
+              norm.contains('ON HAND') ||
+              norm.contains('ONHAND') ||
+              norm.contains('LOCATION') ||
+              norm.contains('BIN') ||
+              norm.contains('STOCK') ||
+              norm.contains('INVENTORY') ||
+              norm == 'BIN LOCATION' ||
+              norm == 'BIN LOC' ||
+              norm == 'LOCATION' ||
+              norm == 'LOC' ||
+              norm == 'STOCK' ||
+              norm == 'OH') {
+            final v = entry.value?.toString().trim() ?? '';
+            if (v.isNotEmpty && v.toLowerCase() != 'null') {
+              onHand = v;
+              break;
+            }
+          }
+        }
+      }
       final deptTypeRaw = getVal(ColumnMapper.keyDeptType, '');
       final deptType = ColumnMapper.parseDeptType(deptTypeRaw);
 
-      // Auto-issue: if department or resourceId is designated for auto-issue OR name contains 'PTF', mark 100% picked
+      // Auto-issue: applies to Component Resources (where parts originate from)
       final isPtfDept = department.toUpperCase().contains('PTF');
-      final isAutoResource = resourceId.trim().isNotEmpty &&
-          autoIssueResourceIds.any((r) => r.trim().toLowerCase() == resourceId.trim().toLowerCase());
+      final isComponentEmpty = componentResourceId.trim().isEmpty;
+      final isAutoResource = isComponentEmpty
+          ? autoIssueResourceIds.any((r) => r.trim().isEmpty || r == '(Empty / Unassigned)')
+          : autoIssueResourceIds.any((r) => r.trim().toLowerCase() == componentResourceId.trim().toLowerCase());
       if (autoIssueDepartments.contains(department) || isPtfDept || isAutoResource) {
         qtyPicked = qtyReq;
         qtyDue = 0.0;
@@ -144,8 +183,10 @@ class ExcelService {
         prodDate: prodDate,
         subUnit: subUnit.isNotEmpty ? subUnit : fileUnitId,
         resourceId: resourceId,
+        componentResourceId: componentResourceId,
         onHand: onHand,
         deptType: deptType,
+        rawColumns: rawColumns,
       ));
     }
 
@@ -153,6 +194,7 @@ class ExcelService {
       'unitId': fileUnitId,
       'departments': departments.toList(),
       'items': items,
+      'headers': originalHeaders,
     };
   }
 
@@ -259,20 +301,25 @@ class ExcelService {
       }
     }
 
-    // Find header column indices
-    final headerRow = sheet.rows.first;
+    // 1. Gather original headers and order them with 'Qty Picked' between Required and Due
+    final origHeaderRow = sheet.rows.first;
+    final origHeaders = origHeaderRow.map((c) => c?.value?.toString().trim() ?? '').toList();
+    final orderedHeaders = orderHeadersWithQtyPicked(origHeaders);
+
+    final headerToCol = <String, int>{};
     int? colPicked;
     int? colDue;
 
-    for (int col = 0; col < headerRow.length; col++) {
-      final val = headerRow[col]?.value?.toString() ?? '';
-      final key = columnMapper.identifyColumn(val);
-      if (key == ColumnMapper.keyQtyPicked) colPicked = col;
-      if (key == ColumnMapper.keyQtyDue) colDue = col;
+    for (int i = 0; i < orderedHeaders.length; i++) {
+      final h = orderedHeaders[i];
+      headerToCol[h.toLowerCase()] = i;
+      final key = columnMapper.identifyColumn(h);
+      if (key == ColumnMapper.keyQtyPicked && colPicked == null) colPicked = i;
+      if (key == ColumnMapper.keyQtyDue && colDue == null) colDue = i;
     }
 
-    // Append service ERP columns to the header if not already present
-    int nextCol = headerRow.length;
+    // Next available column index for service headers
+    int nextCol = orderedHeaders.length;
     final serviceHeaders = [
       'WO Status',
       'WO Progress %',
@@ -289,34 +336,13 @@ class ExcelService {
 
     final serviceColIndices = <String, int>{};
     for (final sHeader in serviceHeaders) {
-      bool found = false;
-      for (int c = 0; c < headerRow.length; c++) {
-        if (headerRow[c]?.value?.toString().trim().toLowerCase() == sHeader.toLowerCase()) {
-          serviceColIndices[sHeader] = c;
-          found = true;
-          break;
-        }
-      }
-      if (!found) {
-        sheet.cell(CellIndex.indexByColumnRow(columnIndex: nextCol, rowIndex: 0)).value =
-            TextCellValue(sHeader);
+      final existingCol = headerToCol[sHeader.toLowerCase()];
+      if (existingCol != null) {
+        serviceColIndices[sHeader] = existingCol;
+      } else {
         serviceColIndices[sHeader] = nextCol;
         nextCol++;
       }
-    }
-
-    // If colPicked or colDue did not exist originally, append them as well
-    if (colPicked == null) {
-      colPicked = nextCol;
-      sheet.cell(CellIndex.indexByColumnRow(columnIndex: colPicked, rowIndex: 0)).value =
-          TextCellValue('Qty Picked');
-      nextCol++;
-    }
-    if (colDue == null) {
-      colDue = nextCol;
-      sheet.cell(CellIndex.indexByColumnRow(columnIndex: colDue, rowIndex: 0)).value =
-          TextCellValue('Qty Due');
-      nextCol++;
     }
 
     // Create item lookup by rowOrder or partId+workOrder
@@ -339,24 +365,14 @@ class ExcelService {
       outExcel.delete(defaultSheet);
     }
 
-    // Write row 0 headers (original columns + service columns)
-    for (int col = 0; col < headerRow.length; col++) {
-      final v = headerRow[col]?.value;
-      if (v != null) {
-        outSheet.cell(CellIndex.indexByColumnRow(columnIndex: col, rowIndex: 0)).value = v;
-      }
+    // Write row 0 headers (ordered original columns + service columns)
+    for (int i = 0; i < orderedHeaders.length; i++) {
+      outSheet.cell(CellIndex.indexByColumnRow(columnIndex: i, rowIndex: 0)).value =
+          TextCellValue(orderedHeaders[i]);
     }
     for (final entry in serviceColIndices.entries) {
       outSheet.cell(CellIndex.indexByColumnRow(columnIndex: entry.value, rowIndex: 0)).value =
           TextCellValue(entry.key);
-    }
-    if (colPicked != null) {
-      outSheet.cell(CellIndex.indexByColumnRow(columnIndex: colPicked, rowIndex: 0)).value =
-          TextCellValue('Qty Picked');
-    }
-    if (colDue != null) {
-      outSheet.cell(CellIndex.indexByColumnRow(columnIndex: colDue, rowIndex: 0)).value =
-          TextCellValue('Qty Due');
     }
 
     int outRowIdx = 1;
@@ -365,22 +381,34 @@ class ExcelService {
       final item = itemByRowOrder[rowIdx];
       if (item == null) continue;
 
-      final isItemResEmpty = item.resourceId.trim().isEmpty;
-      final isAutoResource = isItemResEmpty
+      final isComponentResEmpty = item.componentResourceId.trim().isEmpty;
+      final isAutoResource = isComponentResEmpty
           ? autoIssueResourceIds.any((r) => r.trim().isEmpty || r == '(Empty / Unassigned)')
-          : autoIssueResourceIds.any((r) => r.trim().toLowerCase() == item.resourceId.trim().toLowerCase());
+          : autoIssueResourceIds.any((r) => r.trim().toLowerCase() == item.componentResourceId.trim().toLowerCase());
 
       final shouldExport = item.qtyPicked > 0.0001 || isAutoResource;
       if (!shouldExport) {
         continue; // Skip unpicked and non-auto-issued rows!
       }
 
-      // Copy original cells from this row
+      // Copy original cells from this row according to header mapping
       final origRow = sheet.rows[rowIdx];
-      for (int c = 0; c < origRow.length; c++) {
+      for (int c = 0; c < origRow.length && c < origHeaders.length; c++) {
         final cellVal = origRow[c]?.value;
-        if (cellVal != null) {
-          outSheet.cell(CellIndex.indexByColumnRow(columnIndex: c, rowIndex: outRowIdx)).value = cellVal;
+        final targetCol = headerToCol[origHeaders[c].toLowerCase()];
+        if (targetCol != null && cellVal != null) {
+          outSheet.cell(CellIndex.indexByColumnRow(columnIndex: targetCol, rowIndex: outRowIdx)).value = cellVal;
+        }
+      }
+
+      // Also copy any raw columns from item.rawColumns if not already set
+      for (final e in item.rawColumns.entries) {
+        final targetCol = headerToCol[e.key.toLowerCase()];
+        if (targetCol != null) {
+          final cell = outSheet.cell(CellIndex.indexByColumnRow(columnIndex: targetCol, rowIndex: outRowIdx));
+          if (cell.value == null) {
+            cell.value = TextCellValue(e.value.toString());
+          }
         }
       }
 
@@ -396,13 +424,15 @@ class ExcelService {
       final pickedVal = isAutoResource ? item.qtyRequired : item.qtyPicked;
       final dueVal = isAutoResource ? 0.0 : item.qtyDue;
 
-      // Update Qty Picked
-      outSheet.cell(CellIndex.indexByColumnRow(columnIndex: colPicked, rowIndex: outRowIdx)).value =
-          qtyToCell(pickedVal);
-
-      // Update Qty Due
-      outSheet.cell(CellIndex.indexByColumnRow(columnIndex: colDue, rowIndex: outRowIdx)).value =
-          qtyToCell(dueVal);
+      // Update Qty Picked & Qty Due in their properly ordered columns
+      if (colPicked != null) {
+        outSheet.cell(CellIndex.indexByColumnRow(columnIndex: colPicked, rowIndex: outRowIdx)).value =
+            qtyToCell(pickedVal);
+      }
+      if (colDue != null) {
+        outSheet.cell(CellIndex.indexByColumnRow(columnIndex: colDue, rowIndex: outRowIdx)).value =
+            qtyToCell(dueVal);
+      }
 
       // Set WO Status & Progress Columns
       outSheet.cell(CellIndex.indexByColumnRow(columnIndex: serviceColIndices['WO Status']!, rowIndex: outRowIdx)).value =
@@ -469,26 +499,69 @@ class ExcelService {
     return resolvedOutputPath;
   }
 
-  /// Exports a consolidated Super Export Excel file combining multiple unexported sessions across one or more units.
-  /// Writes all picked items from all participating units, with consolidated audit columns:
-  /// - Session ID: list of session sequence numbers (e.g. "Batch: #1, #2, #3")
-  /// - Worker Name: comma-separated distinct worker names (e.g. "Alex, John")
-  /// - Start Time: earliest session start time
-  /// - End Time: latest session end time
-  /// - Issued Status: ERP status (e.g. "Pending Issue" or custom)
+  /// Reorders [rawHeaders] such that the 'Qty Picked' column is placed
+  /// directly between 'Qty Required' and 'Qty Due'.
+  /// Preserves all other original and arbitrary columns in their relative order.
+  static List<String> orderHeadersWithQtyPicked(List<String> rawHeaders, [ColumnMapper? mapper]) {
+    final colMapper = mapper ?? ColumnMapper();
+    final headers = List<String>.from(rawHeaders);
+    int? pickedIdx;
+    int? reqIdx;
+    int? dueIdx;
+
+    for (int i = 0; i < headers.length; i++) {
+      final key = colMapper.identifyColumn(headers[i]);
+      if (key == ColumnMapper.keyQtyPicked) pickedIdx = i;
+      if (key == ColumnMapper.keyQtyRequired) reqIdx = i;
+      if (key == ColumnMapper.keyQtyDue) dueIdx = i;
+    }
+
+    String pickedHeaderName = 'Qty Picked';
+    if (pickedIdx != null) {
+      pickedHeaderName = headers.removeAt(pickedIdx);
+      reqIdx = null;
+      dueIdx = null;
+      for (int i = 0; i < headers.length; i++) {
+        final key = colMapper.identifyColumn(headers[i]);
+        if (key == ColumnMapper.keyQtyRequired) reqIdx = i;
+        if (key == ColumnMapper.keyQtyDue) dueIdx = i;
+      }
+    }
+
+    if (dueIdx != null) {
+      headers.insert(dueIdx, pickedHeaderName);
+    } else if (reqIdx != null) {
+      headers.insert(reqIdx + 1, pickedHeaderName);
+    } else {
+      headers.add(pickedHeaderName);
+    }
+
+    return headers;
+  }
+
+  /// Exports a consolidated Super Export Excel file combining multiple unexported sessions
+  /// across multiple units into ONE single file.
+  ///
+  /// The consolidated workbook contains:
+  /// - Column 0: 'File Name'
+  /// - Columns 1..N: all preserved original & extra picklist columns with 'Qty Picked' placed between 'Qty Required' and 'Qty Due'
+  /// - Columns N+1..: ERP audit columns (WO Status, WO Progress %, Total Picked, Session Picked, Session ID, etc.)
   Future<String> exportMultiUnitBatchSuperSession({
-    required Map<String, String> unitOriginalFiles, // unitId -> filePath
-    required Map<String, List<PicklistItem>> unitItems, // unitId -> items
-    required Map<String, String> unitNames, // unitId -> unitName
+    required Map<String, String> unitOriginalFiles,
+    required Map<String, List<PicklistItem>> unitItems,
+    required Map<String, String> unitNames,
     required List<SessionMetadata> sessions,
-    required Map<String, Map<String, List<String>>> unitReturnComments, // unitId -> partId -> comments
+    required Map<String, Map<String, List<String>>> unitReturnComments,
     required String outputPath,
     Map<String, List<String>> unitAutoIssueResourceIds = const {},
-    Map<String, Set<String>> unitBatchPickedPartIds = const {}, // unitId -> set of picked partIds in this batch
+    Map<String, Set<String>> unitBatchPickedPartIds = const {},
     String issuedStatus = 'Pending Issue',
   }) async {
-    if (sessions.isEmpty || unitOriginalFiles.isEmpty) {
-      throw Exception('No sessions or units provided for multi-unit batch export.');
+    if (sessions.isEmpty) {
+      throw Exception('No sessions provided for batch export.');
+    }
+    if (unitOriginalFiles.isEmpty) {
+      throw Exception('No unit files provided for batch export.');
     }
 
     final earliestStart = sessions.map((s) => s.startTime).reduce((a, b) => a < b ? a : b);
@@ -516,43 +589,69 @@ class ExcelService {
     final startTimeStr = timeFormatter.format(DateTime.fromMillisecondsSinceEpoch(earliestStart));
     final endTimeStr = timeFormatter.format(DateTime.fromMillisecondsSinceEpoch(latestEnd));
 
-    // 1. Read first available unit file as reference structure
-    final firstUnitId = unitOriginalFiles.keys.first;
-    final firstFilePath = unitOriginalFiles[firstUnitId]!;
-    final firstFile = File(firstFilePath);
-    if (!await firstFile.exists()) {
-      throw Exception('Source file not found: $firstFilePath');
+    // 1. Gather all unique original headers across all unit files
+    final allHeaders = <String>[];
+    String targetSheetName = 'Sheet1';
+
+    for (final unitId in unitOriginalFiles.keys) {
+      final filePath = unitOriginalFiles[unitId];
+      if (filePath == null) continue;
+      final file = File(filePath);
+      if (!file.existsSync()) continue;
+      try {
+        final bytes = file.readAsBytesSync();
+        final unitExcel = Excel.decodeBytes(bytes);
+        for (final name in unitExcel.tables.keys) {
+          final s = unitExcel.tables[name];
+          if (s != null && s.rows.isNotEmpty) {
+            targetSheetName = name;
+            final hRow = s.rows.first;
+            for (final cell in hRow) {
+              final hStr = cell?.value?.toString().trim() ?? '';
+              if (hStr.isNotEmpty &&
+                  !allHeaders.any((existing) => existing.toLowerCase() == hStr.toLowerCase())) {
+                allHeaders.add(hStr);
+              }
+            }
+            break;
+          }
+        }
+      } catch (_) {}
     }
 
-    final firstBytes = await firstFile.readAsBytes();
-    final firstExcel = Excel.decodeBytes(firstBytes);
-    String targetSheetName = firstExcel.tables.keys.first;
-    for (final name in firstExcel.tables.keys) {
-      if (firstExcel.tables[name]?.rows.isNotEmpty ?? false) {
-        targetSheetName = name;
-        break;
+    // Fallback if allHeaders is still empty: collect from item.rawColumns
+    if (allHeaders.isEmpty) {
+      for (final items in unitItems.values) {
+        for (final item in items) {
+          for (final k in item.rawColumns.keys) {
+            if (!allHeaders.any((existing) => existing.toLowerCase() == k.toLowerCase())) {
+              allHeaders.add(k);
+            }
+          }
+        }
       }
     }
 
-    final firstSheet = firstExcel.tables[targetSheetName]!;
-    final firstHeaderRow = firstSheet.rows.first;
+    // Order headers with 'Qty Picked' placed directly between 'Qty Required' and 'Qty Due'
+    final orderedHeaders = orderHeadersWithQtyPicked(allHeaders);
 
-    final headerNames = <String>[];
-    int? origColPicked;
-    int? origColDue;
-    int? origColUnit;
+    // Map orderedHeaders to their column indices in outSheet (shifted by 1 for 'File Name' in col 0)
+    final headerToOutCol = <String, int>{};
+    int? colPicked;
+    int? colDue;
+    int? colUnit;
 
-    for (int col = 0; col < firstHeaderRow.length; col++) {
-      final val = firstHeaderRow[col]?.value?.toString() ?? '';
-      headerNames.add(val);
-      final key = columnMapper.identifyColumn(val);
-      if (key == ColumnMapper.keyQtyPicked) origColPicked = col;
-      if (key == ColumnMapper.keyQtyDue) origColDue = col;
-      if (key == ColumnMapper.keyUnit) origColUnit = col;
+    for (int i = 0; i < orderedHeaders.length; i++) {
+      final h = orderedHeaders[i];
+      final col = i + 1;
+      headerToOutCol[h.toLowerCase()] = col;
+      final key = columnMapper.identifyColumn(h);
+      if (key == ColumnMapper.keyQtyPicked && colPicked == null) colPicked = col;
+      if (key == ColumnMapper.keyQtyDue && colDue == null) colDue = col;
+      if (key == ColumnMapper.keyUnit && colUnit == null) colUnit = col;
     }
 
-    // Next available column index after 'File Name' (col 0) and all original headers (cols 1..length)
-    int nextCol = firstHeaderRow.length + 1;
+    int nextCol = orderedHeaders.length + 1;
     final serviceHeaders = [
       'WO Status',
       'WO Progress %',
@@ -569,23 +668,14 @@ class ExcelService {
 
     final serviceColIndices = <String, int>{};
     for (final sHeader in serviceHeaders) {
-      bool found = false;
-      for (int c = 0; c < firstHeaderRow.length; c++) {
-        if (firstHeaderRow[c]?.value?.toString().trim().toLowerCase() == sHeader.toLowerCase()) {
-          serviceColIndices[sHeader] = c + 1;
-          found = true;
-          break;
-        }
-      }
-      if (!found) {
+      final existingCol = headerToOutCol[sHeader.toLowerCase()];
+      if (existingCol != null) {
+        serviceColIndices[sHeader] = existingCol;
+      } else {
         serviceColIndices[sHeader] = nextCol;
         nextCol++;
       }
     }
-
-    final int colPicked = origColPicked != null ? (origColPicked + 1) : nextCol++;
-    final int colDue = origColDue != null ? (origColDue + 1) : nextCol++;
-    final int colUnit = origColUnit != null ? (origColUnit + 1) : nextCol++;
 
     // 2. Create target workbook
     final outExcel = Excel.createExcel();
@@ -599,27 +689,13 @@ class ExcelService {
     outSheet.cell(CellIndex.indexByColumnRow(columnIndex: 0, rowIndex: 0)).value =
         TextCellValue('File Name');
 
-    for (int col = 0; col < firstHeaderRow.length; col++) {
-      final v = firstHeaderRow[col]?.value;
-      if (v != null) {
-        outSheet.cell(CellIndex.indexByColumnRow(columnIndex: col + 1, rowIndex: 0)).value = v;
-      }
+    for (int i = 0; i < orderedHeaders.length; i++) {
+      outSheet.cell(CellIndex.indexByColumnRow(columnIndex: i + 1, rowIndex: 0)).value =
+          TextCellValue(orderedHeaders[i]);
     }
     for (final entry in serviceColIndices.entries) {
       outSheet.cell(CellIndex.indexByColumnRow(columnIndex: entry.value, rowIndex: 0)).value =
           TextCellValue(entry.key);
-    }
-    if (origColPicked == null) {
-      outSheet.cell(CellIndex.indexByColumnRow(columnIndex: colPicked, rowIndex: 0)).value =
-          TextCellValue('Qty Picked');
-    }
-    if (origColDue == null) {
-      outSheet.cell(CellIndex.indexByColumnRow(columnIndex: colDue, rowIndex: 0)).value =
-          TextCellValue('Qty Due');
-    }
-    if (origColUnit == null) {
-      outSheet.cell(CellIndex.indexByColumnRow(columnIndex: colUnit, rowIndex: 0)).value =
-          TextCellValue('Unit');
     }
 
     int outRowIdx = 1;
@@ -707,31 +783,17 @@ class ExcelService {
         itemByRowOrder[item.rowOrder] = item;
       }
 
-      // Map unitSheet column indices to outSheet column indices
       final unitHeaderRow = unitSheet.rows.first;
-      final colMapping = <int, int>{};
-      for (int uCol = 0; uCol < unitHeaderRow.length; uCol++) {
-        final uHeader = unitHeaderRow[uCol]?.value?.toString().trim().toLowerCase() ?? '';
-        int? matchedOutCol;
-        for (int oCol = 0; oCol < headerNames.length; oCol++) {
-          if (headerNames[oCol].trim().toLowerCase() == uHeader) {
-            matchedOutCol = oCol + 1; // Shifted by 1 because col 0 is File Name
-            break;
-          }
-        }
-        colMapping[uCol] = matchedOutCol ?? (uCol + 1);
-      }
-
       final sourceFileName = p.basename(filePath);
 
       for (int rowIdx = 1; rowIdx < unitSheet.rows.length; rowIdx++) {
         final item = itemByRowOrder[rowIdx];
         if (item == null) continue;
 
-        final isItemResEmpty = item.resourceId.trim().isEmpty;
-        final isAutoResource = isItemResEmpty
+        final isComponentResEmpty = item.componentResourceId.trim().isEmpty;
+        final isAutoResource = isComponentResEmpty
             ? autoIssueResourceIds.any((r) => r.trim().isEmpty || r == '(Empty / Unassigned)')
-            : autoIssueResourceIds.any((r) => r.trim().toLowerCase() == item.resourceId.trim().toLowerCase());
+            : autoIssueResourceIds.any((r) => r.trim().toLowerCase() == item.componentResourceId.trim().toLowerCase());
 
         final batchPartIds = unitBatchPickedPartIds[unitId] ?? <String>{};
         final wasPickedInBatch = unitBatchPickedPartIds.containsKey(unitId)
@@ -746,11 +808,23 @@ class ExcelService {
             TextCellValue(sourceFileName);
 
         final origRow = unitSheet.rows[rowIdx];
-        for (int c = 0; c < origRow.length; c++) {
-          final targetCol = colMapping[c];
+        for (int c = 0; c < origRow.length && c < unitHeaderRow.length; c++) {
+          final uHeader = unitHeaderRow[c]?.value?.toString().trim().toLowerCase() ?? '';
+          final targetCol = headerToOutCol[uHeader];
           final cellVal = origRow[c]?.value;
           if (targetCol != null && cellVal != null) {
             outSheet.cell(CellIndex.indexByColumnRow(columnIndex: targetCol, rowIndex: outRowIdx)).value = cellVal;
+          }
+        }
+
+        // Also copy any raw columns from item.rawColumns if not already set
+        for (final e in item.rawColumns.entries) {
+          final targetCol = headerToOutCol[e.key.toLowerCase()];
+          if (targetCol != null) {
+            final cell = outSheet.cell(CellIndex.indexByColumnRow(columnIndex: targetCol, rowIndex: outRowIdx));
+            if (cell.value == null) {
+              cell.value = TextCellValue(e.value.toString());
+            }
           }
         }
 

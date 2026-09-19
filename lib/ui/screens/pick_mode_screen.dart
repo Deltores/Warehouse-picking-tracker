@@ -1,5 +1,6 @@
 import 'package:flutter/material.dart';
 
+import '../../engine/column_mapper.dart';
 import '../../engine/fifo_allocation_engine.dart';
 import '../../models/part_summary.dart';
 import '../../models/picklist_item.dart';
@@ -141,6 +142,44 @@ class _PickModeScreenState extends State<PickModeScreen> with WidgetsBindingObse
         state == AppLifecycleState.detached) {
       _flushSession();
     }
+  }
+
+  /// Resolves the ON-HAND info for a part across all loaded items and raw columns.
+  String _resolveOnHand(PartSummary part) {
+    if (part.onHand.trim().isNotEmpty && part.onHand.trim().toLowerCase() != 'null') {
+      return part.onHand.trim();
+    }
+    final matching = _items.where(
+      (i) => i.partId.toLowerCase().trim() == part.partId.toLowerCase().trim(),
+    ).toList();
+    for (final it in matching) {
+      if (it.onHand.trim().isNotEmpty && it.onHand.trim().toLowerCase() != 'null') {
+        return it.onHand.trim();
+      }
+    }
+    // Dynamic fallback to rawColumns
+    for (final it in matching) {
+      if (it.rawColumns.isNotEmpty) {
+        for (final entry in it.rawColumns.entries) {
+          final norm = ColumnMapper.normalize(entry.key);
+          if (norm == 'ON HAND' ||
+              norm.contains('ON HAND') ||
+              norm.contains('ONHAND') ||
+              norm.contains('LOCATION') ||
+              norm.contains('BIN') ||
+              norm.contains('STOCK') ||
+              norm.contains('INVENTORY') ||
+              norm == 'LOC' ||
+              norm == 'OH') {
+            final val = entry.value?.toString().trim() ?? '';
+            if (val.isNotEmpty && val.toLowerCase() != 'null') {
+              return val;
+            }
+          }
+        }
+      }
+    }
+    return '';
   }
 
   /// Ensure session is persisted to SQLite ONLY upon first pick.
@@ -638,15 +677,7 @@ class _PickModeScreenState extends State<PickModeScreen> with WidgetsBindingObse
                       textAlign: TextAlign.center,
                     ),
                     Builder(builder: (_) {
-                      String onHandStr = part.onHand;
-                      if (onHandStr.isEmpty) {
-                        final match = _items.firstWhere(
-                          (i) => i.partId == part.partId && i.onHand.isNotEmpty,
-                          orElse: () => PicklistItem(id: '', unitId: '', department: '', line: '', workOrder: '', partId: '', partDescription: '', qtyRequired: 0, qtyDue: 0, qtyPicked: 0, rowOrder: 0),
-                        );
-                        onHandStr = match.onHand;
-                      }
-                      if (part.description.isEmpty && onHandStr.isEmpty) return const SizedBox.shrink();
+                      final onHandStr = _resolveOnHand(part);
                       return Padding(
                         padding: const EdgeInsets.only(top: 8),
                         child: Wrap(
@@ -663,30 +694,39 @@ class _PickModeScreenState extends State<PickModeScreen> with WidgetsBindingObse
                                 maxLines: 2,
                                 overflow: TextOverflow.ellipsis,
                               ),
-                            if (onHandStr.isNotEmpty)
-                              Container(
-                                padding: const EdgeInsets.symmetric(horizontal: 7, vertical: 2),
-                                decoration: BoxDecoration(
-                                  color: AppTheme.accentCyan.withValues(alpha: 0.15),
-                                  borderRadius: BorderRadius.circular(5),
-                                  border: Border.all(color: AppTheme.accentCyan.withValues(alpha: 0.4)),
-                                ),
-                                child: Row(
-                                  mainAxisSize: MainAxisSize.min,
-                                  children: [
-                                    const Icon(Icons.location_on_rounded, size: 12, color: AppTheme.accentCyan),
-                                    const SizedBox(width: 3),
-                                    Text(
-                                      'ON-HAND: $onHandStr',
-                                      style: const TextStyle(
-                                        fontSize: 11,
-                                        color: AppTheme.accentCyan,
-                                        fontWeight: FontWeight.bold,
-                                      ),
-                                    ),
-                                  ],
+                            Container(
+                              padding: const EdgeInsets.symmetric(horizontal: 7, vertical: 2),
+                              decoration: BoxDecoration(
+                                color: onHandStr.isNotEmpty
+                                    ? AppTheme.accentCyan.withOpacity(0.15)
+                                    : AppTheme.cardDark.withOpacity(0.5),
+                                borderRadius: BorderRadius.circular(5),
+                                border: Border.all(
+                                  color: onHandStr.isNotEmpty
+                                      ? AppTheme.accentCyan.withOpacity(0.4)
+                                      : AppTheme.borderDark,
                                 ),
                               ),
+                              child: Row(
+                                mainAxisSize: MainAxisSize.min,
+                                children: [
+                                  Icon(
+                                    Icons.location_on_rounded,
+                                    size: 12,
+                                    color: onHandStr.isNotEmpty ? AppTheme.accentCyan : AppTheme.textMuted,
+                                  ),
+                                  const SizedBox(width: 3),
+                                  Text(
+                                    onHandStr.isNotEmpty ? 'ON-HAND: $onHandStr' : 'ON-HAND: —',
+                                    style: TextStyle(
+                                      fontSize: 11,
+                                      color: onHandStr.isNotEmpty ? AppTheme.accentCyan : AppTheme.textMuted,
+                                      fontWeight: onHandStr.isNotEmpty ? FontWeight.bold : FontWeight.w500,
+                                    ),
+                                  ),
+                                ],
+                              ),
+                            ),
                           ],
                         ),
                       );
@@ -1087,14 +1127,7 @@ class _PickModeScreenState extends State<PickModeScreen> with WidgetsBindingObse
                 : AppTheme.statusUnpicked;
 
     // ON_HAND info
-    String onHand = part.onHand;
-    if (onHand.isEmpty) {
-      final match = _items.firstWhere(
-        (i) => i.partId == part.partId && i.onHand.isNotEmpty,
-        orElse: () => PicklistItem(id: '', unitId: '', department: '', line: '', workOrder: '', partId: '', partDescription: '', qtyRequired: 0, qtyDue: 0, qtyPicked: 0, rowOrder: 0),
-      );
-      onHand = match.onHand;
-    }
+    final onHand = _resolveOnHand(part);
 
     // Work Orders info — list per WO with quantities
     final woItems = _items
@@ -1170,43 +1203,54 @@ class _PickModeScreenState extends State<PickModeScreen> with WidgetsBindingObse
               part.partId,
               style: const TextStyle(fontSize: 34, fontWeight: FontWeight.bold, letterSpacing: 1.2, color: AppTheme.textLight),
             ),
-            if (part.description.isNotEmpty || onHand.isNotEmpty) ...[
-              const SizedBox(height: 4),
-              Wrap(
-                crossAxisAlignment: WrapCrossAlignment.center,
-                spacing: 10,
-                runSpacing: 4,
-                children: [
-                  if (part.description.isNotEmpty)
-                    Text(
-                      part.description,
-                      style: const TextStyle(fontSize: 15, color: AppTheme.textMuted, height: 1.2),
-                      maxLines: 2,
-                      overflow: TextOverflow.ellipsis,
+            const SizedBox(height: 4),
+            Wrap(
+              crossAxisAlignment: WrapCrossAlignment.center,
+              spacing: 10,
+              runSpacing: 6,
+              children: [
+                if (part.description.isNotEmpty)
+                  Text(
+                    part.description,
+                    style: const TextStyle(fontSize: 15, color: AppTheme.textMuted, height: 1.2),
+                    maxLines: 2,
+                    overflow: TextOverflow.ellipsis,
+                  ),
+                Container(
+                  padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 3),
+                  decoration: BoxDecoration(
+                    color: onHand.isNotEmpty
+                        ? AppTheme.accentCyan.withOpacity(0.15)
+                        : AppTheme.cardDark.withOpacity(0.5),
+                    borderRadius: BorderRadius.circular(6),
+                    border: Border.all(
+                      color: onHand.isNotEmpty
+                          ? AppTheme.accentCyan.withOpacity(0.5)
+                          : AppTheme.borderDark,
                     ),
-                  if (onHand.isNotEmpty)
-                    Container(
-                      padding: const EdgeInsets.symmetric(horizontal: 7, vertical: 2),
-                      decoration: BoxDecoration(
-                        color: AppTheme.accentCyan.withValues(alpha: 0.15),
-                        borderRadius: BorderRadius.circular(6),
-                        border: Border.all(color: AppTheme.accentCyan.withValues(alpha: 0.5)),
+                  ),
+                  child: Row(
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      Icon(
+                        Icons.location_on_rounded,
+                        size: 13,
+                        color: onHand.isNotEmpty ? AppTheme.accentCyan : AppTheme.textMuted,
                       ),
-                      child: Row(
-                        mainAxisSize: MainAxisSize.min,
-                        children: [
-                          const Icon(Icons.location_on_rounded, size: 13, color: AppTheme.accentCyan),
-                          const SizedBox(width: 4),
-                          Text(
-                            'ON-HAND: $onHand',
-                            style: const TextStyle(fontSize: 12, color: AppTheme.accentCyan, fontWeight: FontWeight.bold),
-                          ),
-                        ],
+                      const SizedBox(width: 4),
+                      Text(
+                        onHand.isNotEmpty ? 'ON-HAND: $onHand' : 'ON-HAND: —',
+                        style: TextStyle(
+                          fontSize: 12,
+                          color: onHand.isNotEmpty ? AppTheme.accentCyan : AppTheme.textMuted,
+                          fontWeight: onHand.isNotEmpty ? FontWeight.bold : FontWeight.w500,
+                        ),
                       ),
-                    ),
-                ],
-              ),
-            ],
+                    ],
+                  ),
+                ),
+              ],
+            ),
 
             // Dedicated ON-HAND Locations & Stock with Legal Disclaimer
             if (onHand.isNotEmpty) ...[

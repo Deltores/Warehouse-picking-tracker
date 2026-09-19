@@ -14,6 +14,7 @@ import '../../services/excel_service.dart';
 import '../../services/log_service.dart';
 import '../../services/storage_manager.dart';
 import '../theme/app_theme.dart';
+import 'admin_screen.dart';
 import 'picking_screen.dart';
 
 /// PickerFlowScreen: A guided 3-step onboarding for pickers.
@@ -258,6 +259,9 @@ class _PickerFlowScreenState extends State<PickerFlowScreen> {
   // ─── Step 2: Unit Loading & Import ───────────────────────────
 
   Future<void> _loadUnits() async {
+    try {
+      await widget.dbService.syncAllKnownCatalogs(widget.columnMapper);
+    } catch (_) {}
     final units = await widget.dbService.getAllUnits();
     final progressMap = <String, Map<String, int>>{};
     final urgencyMap = <String, UnitPickDateUrgency>{};
@@ -434,7 +438,7 @@ class _PickerFlowScreenState extends State<PickerFlowScreen> {
               const SizedBox(height: 12),
               const Text(
                 'Do you want to restore previous picking progress onto this newly imported file? All previously picked quantities and sessions will be preserved.',
-                style: const TextStyle(color: AppTheme.textMuted, fontSize: 13),
+                style: TextStyle(color: AppTheme.textMuted, fontSize: 13),
               ),
             ],
           ),
@@ -485,6 +489,7 @@ class _PickerFlowScreenState extends State<PickerFlowScreen> {
       final unitId = parseResult['unitId'] as String;
       final deptList = parseResult['departments'] as List<String>;
       final parsedItems = parseResult['items'] as List<PicklistItem>;
+      final parsedHeaders = (parseResult['headers'] as List<String>?) ?? const [];
 
       final totalReq = parsedItems.fold<double>(0.0, (s, i) => s + i.qtyRequired).round();
       final totalPicked = parsedItems.fold<double>(0.0, (s, i) => s + i.qtyPicked).round();
@@ -499,6 +504,7 @@ class _PickerFlowScreenState extends State<PickerFlowScreen> {
         status: totalPicked >= totalReq && totalReq > 0 ? 'COMPLETED' : 'IN_PROGRESS',
         createdAt: now,
         lastAccessedAt: now,
+        originalHeaders: parsedHeaders,
       );
 
       UnitRecord finalUnit;
@@ -515,6 +521,24 @@ class _PickerFlowScreenState extends State<PickerFlowScreen> {
         finalUnit = baseUnit;
       }
 
+      // Discover and register any new departments, component resources, or MAIN LINE resources
+      final compResourcesInFile = parsedItems.map((i) => i.componentResourceId).toList();
+      final mainLineResourcesInFile = parsedItems
+          .where((i) => i.deptType == 'MAIN LINE' || i.department.toUpperCase().contains('MAIN') || i.department.toUpperCase().contains('MACG'))
+          .map((i) => i.resourceId)
+          .toList();
+
+      final discovered = await widget.dbService.registerDiscoveredPicklistItems(
+        departments: deptList,
+        componentResources: compResourcesInFile,
+        mainLineResources: mainLineResourcesInFile,
+      );
+
+      final newDepts = discovered['departments'] ?? [];
+      final newCompRes = discovered['component_resources'] ?? [];
+      final newMainLine = discovered['main_line_resources'] ?? [];
+      final hasNewItems = newDepts.isNotEmpty || newCompRes.isNotEmpty || newMainLine.isNotEmpty;
+
       await _loadUnits();
       setState(() {
         _selectedUnit = finalUnit;
@@ -522,7 +546,14 @@ class _PickerFlowScreenState extends State<PickerFlowScreen> {
       });
       await _loadDepartments(finalUnit);
 
-      if (shouldRestore && mounted) {
+      if (hasNewItems && mounted) {
+        await _showNewDiscoveredItemsDialog(
+          unitName: finalUnit.name,
+          newDepts: newDepts,
+          newCompRes: newCompRes,
+          newMainLine: newMainLine,
+        );
+      } else if (shouldRestore && mounted) {
         ScaffoldMessenger.of(context).showSnackBar(
           SnackBar(
             content: Text('Unit "$unitId" successfully restored with historical picking progress!'),
@@ -544,6 +575,169 @@ class _PickerFlowScreenState extends State<PickerFlowScreen> {
     }
   }
 
+  Future<void> _showNewDiscoveredItemsDialog({
+    required String unitName,
+    required List<String> newDepts,
+    required List<String> newCompRes,
+    required List<String> newMainLine,
+  }) async {
+    return showDialog<void>(
+      context: context,
+      barrierDismissible: false,
+      builder: (ctx) => AlertDialog(
+        backgroundColor: AppTheme.cardDark,
+        shape: RoundedRectangleBorder(
+          borderRadius: BorderRadius.circular(16),
+          side: const BorderSide(color: AppTheme.borderDark),
+        ),
+        title: const Row(
+          children: [
+            Icon(Icons.auto_awesome_rounded, color: AppTheme.accentCyan, size: 26),
+            SizedBox(width: 10),
+            Text('New Categories Discovered', style: TextStyle(color: AppTheme.textLight, fontSize: 18)),
+          ],
+        ),
+        content: SizedBox(
+          width: 480,
+          child: SingleChildScrollView(
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text(
+                  'Importing "$unitName" revealed new items not previously recorded on this tablet:',
+                  style: const TextStyle(color: AppTheme.textLight, fontSize: 13, height: 1.4),
+                ),
+                const SizedBox(height: 14),
+                if (newDepts.isNotEmpty) ...[
+                  Row(
+                    children: [
+                      const Icon(Icons.apartment_rounded, color: AppTheme.accentCyan, size: 16),
+                      const SizedBox(width: 6),
+                      Text(
+                        'New Departments (${newDepts.length}):',
+                        style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 12, color: AppTheme.accentCyan),
+                      ),
+                    ],
+                  ),
+                  const SizedBox(height: 6),
+                  Wrap(
+                    spacing: 6,
+                    runSpacing: 6,
+                    children: newDepts.map((d) => Chip(
+                      label: Text(d, style: const TextStyle(fontSize: 11, color: AppTheme.textLight)),
+                      backgroundColor: AppTheme.bgDark,
+                      side: const BorderSide(color: AppTheme.accentCyan, width: 0.8),
+                      padding: const EdgeInsets.symmetric(horizontal: 4),
+                    )).toList(),
+                  ),
+                  const SizedBox(height: 12),
+                ],
+                if (newCompRes.isNotEmpty) ...[
+                  Row(
+                    children: [
+                      const Icon(Icons.precision_manufacturing_rounded, color: AppTheme.statusComplete, size: 16),
+                      const SizedBox(width: 6),
+                      Text(
+                        'New Component Resources (${newCompRes.length}):',
+                        style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 12, color: AppTheme.statusComplete),
+                      ),
+                    ],
+                  ),
+                  const SizedBox(height: 6),
+                  Wrap(
+                    spacing: 6,
+                    runSpacing: 6,
+                    children: newCompRes.map((r) => Chip(
+                      label: Text(r, style: const TextStyle(fontSize: 11, color: AppTheme.textLight)),
+                      backgroundColor: AppTheme.bgDark,
+                      side: const BorderSide(color: AppTheme.statusComplete, width: 0.8),
+                      padding: const EdgeInsets.symmetric(horizontal: 4),
+                    )).toList(),
+                  ),
+                  const SizedBox(height: 12),
+                ],
+                if (newMainLine.isNotEmpty) ...[
+                  Row(
+                    children: [
+                      const Icon(Icons.layers_rounded, color: AppTheme.statusPartial, size: 16),
+                      const SizedBox(width: 6),
+                      Text(
+                        'New MAIN LINE Resources (${newMainLine.length}):',
+                        style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 12, color: AppTheme.statusPartial),
+                      ),
+                    ],
+                  ),
+                  const SizedBox(height: 6),
+                  Wrap(
+                    spacing: 6,
+                    runSpacing: 6,
+                    children: newMainLine.map((r) => Chip(
+                      label: Text(r, style: const TextStyle(fontSize: 11, color: AppTheme.textLight)),
+                      backgroundColor: AppTheme.bgDark,
+                      side: const BorderSide(color: AppTheme.statusPartial, width: 0.8),
+                      padding: const EdgeInsets.symmetric(horizontal: 4),
+                    )).toList(),
+                  ),
+                  const SizedBox(height: 12),
+                ],
+                Container(
+                  width: double.infinity,
+                  padding: const EdgeInsets.all(12),
+                  decoration: BoxDecoration(
+                    color: AppTheme.bgDark,
+                    borderRadius: BorderRadius.circular(8),
+                    border: Border.all(color: AppTheme.statusComplete),
+                  ),
+                  child: const Row(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      Icon(Icons.check_circle_rounded, color: AppTheme.statusComplete, size: 18),
+                      SizedBox(width: 8),
+                      Expanded(
+                        child: Text(
+                          'Default Status: ENABLED (Allowed for Pick).\nAll new items are immediately available for picking. You can adjust permissions or configure auto-issue in Admin at any time.',
+                          style: TextStyle(fontSize: 11, color: AppTheme.textLight, height: 1.4),
+                        ),
+                      ),
+                    ],
+                  ),
+                ),
+              ],
+            ),
+          ),
+        ),
+        actions: [
+          TextButton.icon(
+            icon: const Icon(Icons.admin_panel_settings_rounded, size: 16),
+            label: const Text('Review in Admin'),
+            onPressed: () {
+              Navigator.of(ctx).pop();
+              if (_selectedUnit != null) {
+                Navigator.of(context).push(
+                  MaterialPageRoute(
+                    builder: (_) => AdminScreen(
+                      dbService: widget.dbService,
+                      storageManager: widget.storageManager,
+                      columnMapper: widget.columnMapper,
+                      activeUnitId: _selectedUnit!.id,
+                      onDataChanged: () => _loadDepartments(_selectedUnit!),
+                    ),
+                  ),
+                );
+              }
+            },
+          ),
+          ElevatedButton(
+            style: ElevatedButton.styleFrom(backgroundColor: AppTheme.accentCyan),
+            onPressed: () => Navigator.of(ctx).pop(),
+            child: const Text('Continue to Picking', style: TextStyle(color: Colors.black, fontWeight: FontWeight.bold)),
+          ),
+        ],
+      ),
+    );
+  }
+
   // ─── Step 3: Department Loading ───────────────────────────────
 
   Future<void> _loadDepartments(UnitRecord unit) async {
@@ -557,6 +751,13 @@ class _PickerFlowScreenState extends State<PickerFlowScreen> {
     // Check if any Resource IDs are configured for MAIN LINE department-level picking
     final mainLinePicks = await widget.dbService.getMainLineResourcePicks();
     if (mainLinePicks.isNotEmpty) {
+      final blockedRes = await widget.dbService.getBlockedResourceIds();
+      final isBlockedEmpty = blockedRes.any((r) => r.trim().isEmpty || r == '(Empty / Unassigned)');
+      final blockedResSet = blockedRes
+          .map((r) => r.trim().toLowerCase())
+          .where((s) => s.isNotEmpty && s != '(empty / unassigned)')
+          .toSet();
+
       final allItems = await widget.dbService.getPicklistItems(unit.id);
       final mainLineItems = allItems.where((i) =>
           i.deptType.toUpperCase() == 'MAIN LINE' ||
@@ -565,7 +766,16 @@ class _PickerFlowScreenState extends State<PickerFlowScreen> {
 
       for (final res in mainLinePicks) {
         final resItems = mainLineItems
-            .where((i) => i.resourceId.trim().toLowerCase() == res.trim().toLowerCase())
+            .where((i) {
+              if (i.resourceId.trim().toLowerCase() != res.trim().toLowerCase()) return false;
+              final cr = i.componentResourceId.trim().toLowerCase();
+              if (cr.isEmpty) {
+                if (isBlockedEmpty) return false;
+              } else {
+                if (blockedResSet.contains(cr)) return false;
+              }
+              return true;
+            })
             .toList();
         if (resItems.isNotEmpty) {
           final resKey = 'Resource: $res (MAIN LINE)';

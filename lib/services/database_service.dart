@@ -7,6 +7,7 @@ import 'package:sqflite/sqflite.dart';
 import 'package:sqflite_common_ffi/sqflite_ffi.dart';
 import 'package:uuid/uuid.dart';
 
+import '../engine/column_mapper.dart';
 import '../models/picklist_item.dart';
 import '../models/session_metadata.dart';
 import '../models/unit_pick_date_urgency.dart';
@@ -49,7 +50,7 @@ class DatabaseService implements LogDatabase {
     return await factory.openDatabase(
       dbPath,
       options: OpenDatabaseOptions(
-        version: 11,
+        version: 12,
         onCreate: _onCreate,
         onUpgrade: _onUpgrade,
         onOpen: (db) async {
@@ -73,7 +74,8 @@ class DatabaseService implements LogDatabase {
         created_at INTEGER NOT NULL,
         completed_at INTEGER,
         last_accessed_at INTEGER NOT NULL,
-        deleted_at INTEGER
+        deleted_at INTEGER,
+        original_headers TEXT NOT NULL DEFAULT '[]'
       );
     ''');
 
@@ -104,8 +106,10 @@ class DatabaseService implements LogDatabase {
         prod_date TEXT NOT NULL DEFAULT '',
         sub_unit TEXT NOT NULL DEFAULT '',
         resource_id TEXT NOT NULL DEFAULT '',
+        component_resource_id TEXT NOT NULL DEFAULT '',
         on_hand TEXT NOT NULL DEFAULT '',
         dept_type TEXT NOT NULL DEFAULT '',
+        raw_columns TEXT NOT NULL DEFAULT '{}',
         FOREIGN KEY(unit_id) REFERENCES units(id) ON DELETE CASCADE
       );
     ''');
@@ -297,6 +301,11 @@ class DatabaseService implements LogDatabase {
       ''');
       await db.execute("CREATE INDEX IF NOT EXISTS idx_session_picks_session ON session_picks(session_id);");
       await db.execute("CREATE INDEX IF NOT EXISTS idx_session_picks_part ON session_picks(session_id, part_id);");
+    }
+    if (oldVersion < 12) {
+      await db.execute("ALTER TABLE units ADD COLUMN original_headers TEXT NOT NULL DEFAULT '[]';");
+      await db.execute("ALTER TABLE picklist_items ADD COLUMN component_resource_id TEXT NOT NULL DEFAULT '';");
+      await db.execute("ALTER TABLE picklist_items ADD COLUMN raw_columns TEXT NOT NULL DEFAULT '{}';");
     }
   }
 
@@ -877,21 +886,18 @@ class DatabaseService implements LogDatabase {
     );
   }
 
-  /// Returns all distinct departments globally and their active status (allowed for picking).
-  /// Any department not explicitly blocked in admin_config defaults to true (allowed).
-  Future<Map<String, bool>> getGlobalDepartments() async {
-    final allDepts = await getAllDistinctDepartments();
-    final db = await database;
-
+  /// Returns the set of all department names currently blocked from picking globally or per unit.
+  Future<Set<String>> getBlockedDepartmentSet() async {
     final blockedJson = await getConfig('blocked_departments');
     final blockedSet = <String>{};
     if (blockedJson != null) {
       try {
-        final list = (json.decode(blockedJson) as List).map((e) => e.toString()).toSet();
+        final list = (json.decode(blockedJson) as List).map((e) => e.toString().trim()).where((s) => s.isNotEmpty);
         blockedSet.addAll(list);
       } catch (_) {}
     }
 
+    final db = await database;
     final inactiveRows = await db.query(
       'departments',
       columns: ['name'],
@@ -901,6 +907,14 @@ class DatabaseService implements LogDatabase {
       final n = r['name']?.toString().trim();
       if (n != null && n.isNotEmpty) blockedSet.add(n);
     }
+    return blockedSet;
+  }
+
+  /// Returns all distinct departments globally and their active status (allowed for picking).
+  /// Any department not explicitly blocked in admin_config defaults to true (allowed).
+  Future<Map<String, bool>> getGlobalDepartments() async {
+    final allDepts = await getAllDistinctDepartments();
+    final blockedSet = await getBlockedDepartmentSet();
 
     final result = <String, bool>{};
     for (final d in allDepts) {
@@ -973,6 +987,8 @@ class DatabaseService implements LogDatabase {
       final name = (m['department'] as String?)?.trim();
       if (name != null && name.isNotEmpty) set.add(name);
     }
+    final knownDepts = await getKnownDepartments();
+    set.addAll(knownDepts);
     final emptyCount = Sqflite.firstIntValue(emptyItems) ?? 0;
     if (emptyCount > 0) {
       set.add('(Empty / Unassigned)');
@@ -1355,6 +1371,258 @@ class DatabaseService implements LogDatabase {
     await setConfig('standard_pickers', jsonEncode(pickers));
   }
 
+  /// Exports all device configuration settings into a structured Map suitable for JSON serialization.
+  Future<Map<String, dynamic>> exportFullConfiguration({
+    bool includePins = true,
+    String? columnMapperJson,
+  }) async {
+    final db = await database;
+    final rows = await db.query('admin_config');
+    final rawConfig = <String, String>{};
+    for (final r in rows) {
+      final k = r['key'] as String? ?? '';
+      final v = r['value'] as String? ?? '';
+      if (k.isNotEmpty) rawConfig[k] = v;
+    }
+
+    final tabletId = rawConfig['tablet_id'] ?? 'Tablet 1';
+    final autoAdvance = rawConfig['auto_advance_pick'] == '1' || rawConfig['auto_advance_pick'] == 'true';
+    final groupByLine = rawConfig['group_by_line'] != '0' && rawConfig['group_by_line'] != 'false';
+    final lastExportDir = rawConfig['last_export_dir'] ?? '';
+    final standardPickers = await getStandardPickers();
+    final globalDepts = await getGlobalDepartments();
+    final blockedResources = await getBlockedResourceIds();
+    final autoIssueResources = await getAutoIssueResourceIds();
+    final autoIssueComponents = await getAutoIssueComponents();
+    final patternRules = await getResourcePatternRules();
+    final mainLinePicks = await getMainLineResourcePicks();
+    final mainLineDefaultView = rawConfig['mainline_resource_default_view'] ?? 'combined';
+    final mainLineViews = await getMainLineResourceViewOverrides();
+    final deptLineOverrides = await getLineGroupingDeptOverrides();
+    final resLineOverrides = await getLineGroupingResourceOverrides();
+
+    final mapperConfig = columnMapperJson ?? rawConfig['column_mapper_config'];
+    final knownDepts = await getKnownDepartments();
+    final knownCompResources = await getKnownComponentResources();
+    final knownMainLine = await getKnownMainLineResources();
+
+    final settings = <String, dynamic>{
+      'tablet_id': tabletId,
+      'auto_advance_pick': autoAdvance,
+      'group_by_line': groupByLine,
+      'last_export_dir': lastExportDir,
+      'standard_pickers': standardPickers,
+      'global_departments': globalDepts,
+      'known_departments': knownDepts,
+      'known_component_resources': knownCompResources,
+      'known_main_line_resources': knownMainLine,
+      'blocked_resource_ids': blockedResources,
+      'auto_issue_resource_ids': autoIssueResources,
+      'auto_issue_components': autoIssueComponents,
+      'component_resource_pattern_rules': patternRules,
+      'main_line_resource_picks': mainLinePicks,
+      'mainline_resource_default_view': mainLineDefaultView,
+      'mainline_resource_views': mainLineViews,
+      'line_grouping_dept_overrides': deptLineOverrides,
+      'line_grouping_resource_overrides': resLineOverrides,
+    };
+
+    if (mapperConfig != null && mapperConfig.isNotEmpty) {
+      try {
+        settings['column_mapper_config'] = jsonDecode(mapperConfig);
+      } catch (_) {
+        settings['column_mapper_config'] = mapperConfig;
+      }
+    }
+
+    if (includePins) {
+      if (rawConfig.containsKey('admin_pin')) settings['admin_pin'] = rawConfig['admin_pin'];
+      if (rawConfig.containsKey('super_admin_pin')) settings['super_admin_pin'] = rawConfig['super_admin_pin'];
+    }
+
+    return {
+      'app': 'Picklist Tracker',
+      'config_version': 1,
+      'exported_at': DateTime.now().millisecondsSinceEpoch,
+      'source_tablet_id': tabletId,
+      'settings': settings,
+    };
+  }
+
+  /// Imports configuration settings from a Map (parsed from a configuration JSON file).
+  Future<void> importFullConfiguration(
+    Map<String, dynamic> configData, {
+    bool overwriteTabletId = false,
+    bool overwritePins = false,
+  }) async {
+    final settings = (configData['settings'] as Map<String, dynamic>?) ?? configData;
+    final db = await database;
+
+    await db.transaction((txn) async {
+      Future<void> setCfg(String key, String val) async {
+        await txn.insert(
+          'admin_config',
+          {'key': key, 'value': val},
+          conflictAlgorithm: ConflictAlgorithm.replace,
+        );
+      }
+
+      if (overwriteTabletId && settings.containsKey('tablet_id')) {
+        final tid = settings['tablet_id']?.toString().trim() ?? '';
+        if (tid.isNotEmpty) await setCfg('tablet_id', tid);
+      }
+
+      if (settings.containsKey('auto_advance_pick')) {
+        final val = settings['auto_advance_pick'];
+        final b = val == true || val == 1 || val == '1' || val == 'true';
+        await setCfg('auto_advance_pick', b ? '1' : '0');
+      }
+
+      if (settings.containsKey('group_by_line')) {
+        final val = settings['group_by_line'];
+        final b = val == true || val == 1 || val == '1' || val == 'true';
+        await setCfg('group_by_line', b ? '1' : '0');
+      }
+
+      if (settings.containsKey('last_export_dir')) {
+        final dir = settings['last_export_dir']?.toString().trim() ?? '';
+        if (dir.isNotEmpty) await setCfg('last_export_dir', dir);
+      }
+
+      if (settings.containsKey('standard_pickers')) {
+        final p = settings['standard_pickers'];
+        if (p is List) {
+          final list = p.map((e) => e.toString().trim()).where((s) => s.isNotEmpty).toList();
+          await setCfg('standard_pickers', jsonEncode(list));
+        }
+      }
+
+      if (settings.containsKey('global_departments')) {
+        final gd = settings['global_departments'];
+        if (gd is Map) {
+          final map = <String, bool>{};
+          for (final e in gd.entries) {
+            map[e.key.toString()] = e.value == true;
+          }
+          await setCfg('global_departments', jsonEncode(map));
+        }
+      }
+
+      if (settings.containsKey('known_departments')) {
+        final kd = settings['known_departments'];
+        if (kd is List) {
+          final list = kd.map((e) => e.toString().trim()).where((s) => s.isNotEmpty).toList();
+          await setCfg('known_departments', jsonEncode(list));
+        }
+      }
+
+      if (settings.containsKey('known_component_resources')) {
+        final kcr = settings['known_component_resources'];
+        if (kcr is List) {
+          final list = kcr.map((e) => e.toString().trim()).where((s) => s.isNotEmpty).toList();
+          await setCfg('known_component_resources', jsonEncode(list));
+        }
+      }
+
+      if (settings.containsKey('known_main_line_resources')) {
+        final kml = settings['known_main_line_resources'];
+        if (kml is List) {
+          final list = kml.map((e) => e.toString().trim()).where((s) => s.isNotEmpty).toList();
+          await setCfg('known_main_line_resources', jsonEncode(list));
+        }
+      }
+
+      if (settings.containsKey('blocked_resource_ids')) {
+        final br = settings['blocked_resource_ids'];
+        if (br is List) {
+          final list = br.map((e) => e.toString().trim()).where((s) => s.isNotEmpty).toList();
+          await setCfg('blocked_resource_ids', jsonEncode(list));
+        }
+      }
+
+      if (settings.containsKey('auto_issue_resource_ids')) {
+        final ar = settings['auto_issue_resource_ids'];
+        if (ar is List) {
+          final list = ar.map((e) => e.toString().trim()).where((s) => s.isNotEmpty).toList();
+          await setCfg('auto_issue_resource_ids', jsonEncode(list));
+        }
+      }
+
+      if (settings.containsKey('auto_issue_components')) {
+        final ac = settings['auto_issue_components'];
+        if (ac is List) {
+          final list = ac.map((e) => e.toString().trim()).where((s) => s.isNotEmpty).toList();
+          await setCfg('auto_issue_components', jsonEncode(list));
+        }
+      }
+
+      if (settings.containsKey('component_resource_pattern_rules')) {
+        final pr = settings['component_resource_pattern_rules'];
+        if (pr is List) {
+          await setCfg('component_resource_pattern_rules', jsonEncode(pr));
+        }
+      }
+
+      if (settings.containsKey('main_line_resource_picks')) {
+        final ml = settings['main_line_resource_picks'];
+        if (ml is List) {
+          final list = ml.map((e) => e.toString().trim()).where((s) => s.isNotEmpty).toList();
+          await setCfg('main_line_resource_picks', jsonEncode(list));
+        }
+      }
+
+      if (settings.containsKey('mainline_resource_default_view')) {
+        await setCfg('mainline_resource_default_view', settings['mainline_resource_default_view'].toString());
+      }
+
+      if (settings.containsKey('mainline_resource_views')) {
+        final mv = settings['mainline_resource_views'];
+        if (mv is Map) {
+          final map = mv.map((k, v) => MapEntry(k.toString(), v.toString()));
+          await setCfg('mainline_resource_views', jsonEncode(map));
+        }
+      }
+
+      if (settings.containsKey('line_grouping_dept_overrides')) {
+        final ld = settings['line_grouping_dept_overrides'];
+        if (ld is Map) {
+          final map = ld.map((k, v) => MapEntry(k.toString(), v == true));
+          await setCfg('line_grouping_dept_overrides', jsonEncode(map));
+        }
+      }
+
+      if (settings.containsKey('line_grouping_resource_overrides')) {
+        final lr = settings['line_grouping_resource_overrides'];
+        if (lr is Map) {
+          final map = lr.map((k, v) => MapEntry(k.toString(), v == true));
+          await setCfg('line_grouping_resource_overrides', jsonEncode(map));
+        }
+      }
+
+      if (settings.containsKey('column_mapper_config')) {
+        final cm = settings['column_mapper_config'];
+        if (cm is Map || cm is List) {
+          await setCfg('column_mapper_config', jsonEncode(cm));
+        } else if (cm is String && cm.isNotEmpty) {
+          await setCfg('column_mapper_config', cm);
+        }
+      }
+
+      if (overwritePins) {
+        if (settings.containsKey('admin_pin')) {
+          final ap = settings['admin_pin']?.toString().trim() ?? '';
+          if (ap.isNotEmpty) await setCfg('admin_pin', ap);
+        }
+        if (settings.containsKey('super_admin_pin')) {
+          final sap = settings['super_admin_pin']?.toString().trim() ?? '';
+          if (sap.isNotEmpty) await setCfg('super_admin_pin', sap);
+        }
+      }
+    });
+
+    await LogService.admin('Admin imported configuration file (overwriteTabletId: $overwriteTabletId, overwritePins: $overwritePins)');
+  }
+
   // --- RETURNS & FLAGS ---
 
   Future<void> recordReturn({
@@ -1456,21 +1724,39 @@ class DatabaseService implements LogDatabase {
   }
 
   /// Calculates progress by unique Part IDs for the given unit.
+  /// Parts belonging to blocked departments or blocked component resources are completely excluded.
   /// Returns a Map with 'totalParts' and 'completedParts'.
   Future<Map<String, int>> getUnitPartProgress(String unitId) async {
-    final db = await database;
-    final rows = await db.rawQuery('''
-      SELECT part_id, SUM(qty_due) as total_due
-      FROM picklist_items
-      WHERE unit_id = ?
-      GROUP BY part_id
-    ''', [unitId]);
+    final allItems = await getPicklistItems(unitId);
+    if (allItems.isEmpty) {
+      return {'totalParts': 0, 'completedParts': 0};
+    }
+    final blockedDepts = await getBlockedDepartmentSet();
+    final blockedRes = await getBlockedResourceIds();
+    final isBlockedEmpty = blockedRes.any((r) => r.trim().isEmpty || r == '(Empty / Unassigned)');
+    final blockedResSet = blockedRes
+        .map((r) => r.trim().toLowerCase())
+        .where((s) => s.isNotEmpty && s != '(empty / unassigned)')
+        .toSet();
 
-    final totalParts = rows.length;
-    final completedParts = rows.where((r) {
-      final due = (r['total_due'] as num?)?.toDouble() ?? 0.0;
-      return due <= 0.0001;
-    }).length;
+    final unblockedItems = allItems.where((i) {
+      if (blockedDepts.contains(i.department)) return false;
+      final cr = i.componentResourceId.trim().toLowerCase();
+      if (cr.isEmpty) {
+        if (isBlockedEmpty) return false;
+      } else {
+        if (blockedResSet.contains(cr)) return false;
+      }
+      return true;
+    }).toList();
+
+    final partMap = <String, double>{};
+    for (final i in unblockedItems) {
+      partMap[i.partId] = (partMap[i.partId] ?? 0.0) + i.qtyDue;
+    }
+
+    final totalParts = partMap.length;
+    final completedParts = partMap.values.where((due) => due <= 0.0001).length;
 
     return {
       'totalParts': totalParts,
@@ -1494,51 +1780,80 @@ class DatabaseService implements LogDatabase {
   }
 
   /// Calculates progress by unique Part IDs for the given department in a unit.
+  /// Parts belonging to blocked component resources are completely excluded.
   /// Returns a Map with 'totalParts', 'completedParts', and 'missingParts'.
   Future<Map<String, int>> getDepartmentPartProgress(String unitId, String department) async {
     await cleanupResolvedMissingFlags(unitId);
-    final db = await database;
+    final allItems = await getPicklistItems(unitId);
+    final deptItems = allItems.where((i) => i.department == department).toList();
+    if (deptItems.isEmpty) {
+      return {'totalParts': 0, 'completedParts': 0, 'missingParts': 0};
+    }
+
+    final blockedRes = await getBlockedResourceIds();
+    final isBlockedEmpty = blockedRes.any((r) => r.trim().isEmpty || r == '(Empty / Unassigned)');
+    final blockedResSet = blockedRes
+        .map((r) => r.trim().toLowerCase())
+        .where((s) => s.isNotEmpty && s != '(empty / unassigned)')
+        .toSet();
 
     final isMainLineDept = department.toUpperCase().contains('MAIN') ||
         department.toUpperCase().contains('MACG');
     final mainLineResourcePicks = isMainLineDept ? await getMainLineResourcePicks() : <String>[];
-    final excludeSql = isMainLineDept ? _buildMainLineResourceExcludeSql(mainLineResourcePicks) : '';
+    final mainLinePicksSet = mainLineResourcePicks.map((r) => r.trim().toLowerCase()).toSet();
+    final isMainLineEmptyPick = mainLineResourcePicks.contains('(Empty / Unassigned)');
 
-    final rows = await db.rawQuery('''
-      SELECT part_id, SUM(qty_due) as total_due
-      FROM picklist_items
-      WHERE unit_id = ? AND department = ? $excludeSql
-      GROUP BY part_id
-    ''', [unitId, department]);
+    final unblockedItems = deptItems.where((i) {
+      // Exclude blocked component resources
+      final cr = i.componentResourceId.trim().toLowerCase();
+      if (cr.isEmpty) {
+        if (isBlockedEmpty) return false;
+      } else {
+        if (blockedResSet.contains(cr)) return false;
+      }
+      // Exclude destination resources picked under Whole Resource mode
+      if (isMainLineDept && mainLineResourcePicks.isNotEmpty) {
+        final r = i.resourceId.trim().toLowerCase();
+        if (r.isEmpty && isMainLineEmptyPick) return false;
+        if (r.isNotEmpty && mainLinePicksSet.contains(r)) return false;
+      }
+      return true;
+    }).toList();
 
-    final totalParts = rows.length;
-    final completedParts = rows.where((r) {
-      final due = (r['total_due'] as num?)?.toDouble() ?? 0.0;
-      return due <= 0.0001;
-    }).length;
+    final partMap = <String, double>{};
+    for (final i in unblockedItems) {
+      partMap[i.partId] = (partMap[i.partId] ?? 0.0) + i.qtyDue;
+    }
 
-    // Count parts flagged as MISSING that are still incomplete (qty_due > 0.0001)
-    final missingRows = await db.rawQuery('''
-      SELECT DISTINCT part_id
-      FROM part_flags
-      WHERE unit_id = ? AND department = ? AND UPPER(flag_type) = 'MISSING'
-        AND part_id IN (
-          SELECT part_id FROM picklist_items WHERE unit_id = ? AND department = ? $excludeSql GROUP BY part_id HAVING SUM(qty_due) > 0.0001
-        )
-    ''', [unitId, department, unitId, department]);
+    final totalParts = partMap.length;
+    final completedParts = partMap.values.where((due) => due <= 0.0001).length;
 
-    final missingParts = missingRows.length;
+    // Missing parts among unblocked incomplete parts
+    final db = await database;
+    final missingFlags = await db.query(
+      'part_flags',
+      where: 'unit_id = ? AND department = ? AND UPPER(flag_type) = "MISSING"',
+      whereArgs: [unitId, department],
+    );
+    final missingPartIds = missingFlags.map((f) => f['part_id']?.toString() ?? '').toSet();
+    int missingCount = 0;
+    for (final entry in partMap.entries) {
+      if (entry.value > 0.0001 && missingPartIds.contains(entry.key)) {
+        missingCount++;
+      }
+    }
 
     return {
       'totalParts': totalParts,
       'completedParts': completedParts,
-      'missingParts': missingParts,
+      'missingParts': missingCount,
     };
   }
 
   /// Returns the earliest incomplete pick date urgency for a unit.
+  /// Parts belonging to blocked departments or blocked component resources are completely excluded.
   /// Parts marked as MISSING in part_flags are excluded (they do not block completion).
-  /// If all non-missing parts are picked, returns status = completed.
+  /// If all non-missing unblocked parts are picked, returns status = completed.
   /// Compares with today:
   /// - < 0 days (past due date) -> Glow RED
   /// - 0..2 days -> Glow YELLOW
@@ -1547,45 +1862,42 @@ class DatabaseService implements LogDatabase {
     String unitId, {
     DateTime? referenceToday,
   }) async {
+    final allItems = await getPicklistItems(unitId);
+    if (allItems.isEmpty) return null;
+
+    final blockedDepts = await getBlockedDepartmentSet();
+    final blockedRes = await getBlockedResourceIds();
+    final isBlockedEmpty = blockedRes.any((r) => r.trim().isEmpty || r == '(Empty / Unassigned)');
+    final blockedResSet = blockedRes
+        .map((r) => r.trim().toLowerCase())
+        .where((s) => s.isNotEmpty && s != '(empty / unassigned)')
+        .toSet();
+
+    // Query missing part flags
     final db = await database;
+    final missingRows = await db.query(
+      'part_flags',
+      columns: ['part_id'],
+      where: 'unit_id = ? AND UPPER(flag_type) = "MISSING"',
+      whereArgs: [unitId],
+    );
+    final missingPartIds = missingRows.map((r) => r['part_id']?.toString() ?? '').toSet();
 
-    // Check if unit has any items
-    final totalItemsCount = Sqflite.firstIntValue(
-      await db.rawQuery(
-        'SELECT COUNT(*) FROM picklist_items WHERE unit_id = ?',
-        [unitId],
-      ),
-    ) ?? 0;
+    // Filter to unblocked incomplete items not flagged as missing
+    final activeIncompleteItems = allItems.where((i) {
+      if (blockedDepts.contains(i.department)) return false;
+      final cr = i.componentResourceId.trim().toLowerCase();
+      if (cr.isEmpty) {
+        if (isBlockedEmpty) return false;
+      } else {
+        if (blockedResSet.contains(cr)) return false;
+      }
+      if (i.qtyDue <= 0.0001) return false;
+      if (missingPartIds.contains(i.partId)) return false;
+      return true;
+    }).toList();
 
-    if (totalItemsCount == 0) return null;
-
-    // Check if there are any incomplete non-missing items in the unit
-    final incompleteRows = await db.rawQuery('''
-      SELECT DISTINCT department
-      FROM picklist_items
-      WHERE unit_id = ?
-        AND qty_due > 0.0001
-        AND part_id NOT IN (
-          SELECT part_id FROM part_flags WHERE unit_id = ? AND UPPER(flag_type) = 'MISSING'
-        )
-    ''', [unitId, unitId]);
-
-    // If no incomplete items, unit is 100% completed
-    if (incompleteRows.isEmpty) {
-      return UnitPickDateUrgency.evaluate(
-        dateStr: null,
-        department: null,
-        isAllCompleted: true,
-        referenceToday: referenceToday,
-      );
-    }
-
-    final incompleteDepts = incompleteRows
-        .map((r) => r['department']?.toString() ?? '')
-        .where((d) => d.isNotEmpty)
-        .toList();
-
-    if (incompleteDepts.isEmpty) {
+    if (activeIncompleteItems.isEmpty) {
       return UnitPickDateUrgency.evaluate(
         dateStr: null,
         department: 'All Complete',
@@ -1594,37 +1906,30 @@ class DatabaseService implements LogDatabase {
       );
     }
 
-    // For each incomplete department, find its pick_date
+    // Find earliest pick date among active incomplete items
     String? earliestDateStr;
     DateTime? earliestParsedDate;
     String? earliestDept;
 
-    for (final dept in incompleteDepts) {
-      final dateRow = await db.rawQuery('''
-        SELECT pick_date
-        FROM picklist_items
-        WHERE unit_id = ? AND department = ? AND pick_date IS NOT NULL AND TRIM(pick_date) != ''
-        LIMIT 1
-      ''', [unitId, dept]);
-
-      if (dateRow.isNotEmpty) {
-        final rawDate = dateRow.first['pick_date']?.toString() ?? '';
+    for (final item in activeIncompleteItems) {
+      final rawDate = item.pickDate.trim();
+      if (rawDate.isNotEmpty) {
         final parsed = UnitPickDateUrgency.parseDateRobust(rawDate);
         if (parsed != null) {
           if (earliestParsedDate == null || parsed.isBefore(earliestParsedDate)) {
             earliestParsedDate = parsed;
             earliestDateStr = rawDate;
-            earliestDept = dept;
+            earliestDept = item.department;
           }
         } else if (earliestDateStr == null) {
           earliestDateStr = rawDate;
-          earliestDept = dept;
+          earliestDept = item.department;
         }
       }
     }
 
-    if (earliestDateStr == null && incompleteDepts.isNotEmpty) {
-      earliestDept = incompleteDepts.first;
+    if (earliestDateStr == null && activeIncompleteItems.isNotEmpty) {
+      earliestDept = activeIncompleteItems.first.department;
     }
 
     return UnitPickDateUrgency.evaluate(
@@ -1636,55 +1941,84 @@ class DatabaseService implements LogDatabase {
   }
 
   /// Returns a map of department -> UnitPickDateUrgency for all departments in a unit.
-  /// Excludes MISSING parts from blocking department completion.
+  /// Excludes blocked component resources and MISSING parts from blocking department completion.
   Future<Map<String, UnitPickDateUrgency>> getDepartmentPickDates(
     String unitId, {
     DateTime? referenceToday,
   }) async {
-    final db = await database;
+    final allItems = await getPicklistItems(unitId);
+    if (allItems.isEmpty) return {};
 
-    final deptRows = await db.rawQuery('''
-      SELECT DISTINCT department
-      FROM picklist_items
-      WHERE unit_id = ?
-    ''', [unitId]);
+    final blockedRes = await getBlockedResourceIds();
+    final isBlockedEmpty = blockedRes.any((r) => r.trim().isEmpty || r == '(Empty / Unassigned)');
+    final blockedResSet = blockedRes
+        .map((r) => r.trim().toLowerCase())
+        .where((s) => s.isNotEmpty && s != '(empty / unassigned)')
+        .toSet();
+
+    final mainLineResourcePicks = await getMainLineResourcePicks();
+    final mainLinePicksSet = mainLineResourcePicks.map((r) => r.trim().toLowerCase()).toSet();
+    final isMainLineEmptyPick = mainLineResourcePicks.contains('(Empty / Unassigned)');
+
+    final db = await database;
+    final missingRows = await db.query(
+      'part_flags',
+      columns: ['part_id', 'department'],
+      where: 'unit_id = ? AND UPPER(flag_type) = "MISSING"',
+      whereArgs: [unitId],
+    );
+    final missingSet = missingRows.map((r) => '${r['department']}__${r['part_id']}').toSet();
+
+    final deptGroups = <String, List<PicklistItem>>{};
+    for (final i in allItems) {
+      deptGroups.putIfAbsent(i.department, () => []).add(i);
+    }
 
     final result = <String, UnitPickDateUrgency>{};
-    final mainLineResourcePicks = await getMainLineResourcePicks();
 
-    for (final r in deptRows) {
-      final dept = r['department']?.toString() ?? '';
-      if (dept.isEmpty) continue;
-
+    for (final entry in deptGroups.entries) {
+      final dept = entry.key;
       final isMainLineDept = dept.toUpperCase().contains('MAIN') || dept.toUpperCase().contains('MACG');
-      final excludeSql = isMainLineDept ? _buildMainLineResourceExcludeSql(mainLineResourcePicks) : '';
 
-      // Check if department has unpicked non-missing items
-      final incompleteCount = Sqflite.firstIntValue(
-        await db.rawQuery('''
-          SELECT COUNT(*)
-          FROM picklist_items
-          WHERE unit_id = ?
-            AND department = ?
-            $excludeSql
-            AND qty_due > 0.0001
-            AND part_id NOT IN (
-              SELECT part_id FROM part_flags WHERE unit_id = ? AND UPPER(flag_type) = 'MISSING'
-            )
-        ''', [unitId, dept, unitId]),
-      ) ?? 0;
+      final unblockedItems = entry.value.where((i) {
+        final cr = i.componentResourceId.trim().toLowerCase();
+        if (cr.isEmpty) {
+          if (isBlockedEmpty) return false;
+        } else {
+          if (blockedResSet.contains(cr)) return false;
+        }
+        if (isMainLineDept && mainLineResourcePicks.isNotEmpty) {
+          final r = i.resourceId.trim().toLowerCase();
+          if (r.isEmpty && isMainLineEmptyPick) return false;
+          if (r.isNotEmpty && mainLinePicksSet.contains(r)) return false;
+        }
+        return true;
+      }).toList();
 
-      final isDeptCompleted = incompleteCount == 0;
+      if (unblockedItems.isEmpty) {
+        result[dept] = UnitPickDateUrgency.evaluate(
+          dateStr: null,
+          department: dept,
+          isAllCompleted: true,
+          referenceToday: referenceToday,
+        );
+        continue;
+      }
 
-      // Get department pick_date
-      final dateRow = await db.rawQuery('''
-        SELECT pick_date
-        FROM picklist_items
-        WHERE unit_id = ? AND department = ? $excludeSql AND pick_date IS NOT NULL AND TRIM(pick_date) != ''
-        LIMIT 1
-      ''', [unitId, dept]);
+      final incompleteItems = unblockedItems.where((i) {
+        if (i.qtyDue <= 0.0001) return false;
+        if (missingSet.contains('${dept}__${i.partId}')) return false;
+        return true;
+      }).toList();
 
-      final rawDate = dateRow.isNotEmpty ? dateRow.first['pick_date']?.toString() : null;
+      final isDeptCompleted = incompleteItems.isEmpty;
+      String? rawDate;
+      for (final i in unblockedItems) {
+        if (i.pickDate.trim().isNotEmpty) {
+          rawDate = i.pickDate.trim();
+          break;
+        }
+      }
 
       result[dept] = UnitPickDateUrgency.evaluate(
         dateStr: rawDate,
@@ -1764,6 +2098,303 @@ class DatabaseService implements LogDatabase {
     return await getGroupByLine();
   }
 
+  // --- KNOWN DISCOVERED CATALOGS & AUTO-REGISTRATION ---
+
+  Future<List<String>> getKnownComponentResources() async {
+    final val = await getConfig('known_component_resources');
+    if (val != null && val.isNotEmpty) {
+      try {
+        return (jsonDecode(val) as List).map((e) => e.toString().trim()).where((s) => s.isNotEmpty).toList();
+      } catch (_) {}
+    }
+    return [];
+  }
+
+  Future<void> recordKnownComponentResources(List<String> resources) async {
+    final current = await getKnownComponentResources();
+    final set = current.toSet();
+    set.addAll(resources.map((s) => s.trim()).where((s) => s.isNotEmpty && s != '(Empty / Unassigned)'));
+    await setConfig('known_component_resources', jsonEncode(set.toList()));
+  }
+
+  Future<List<String>> getKnownMainLineResources() async {
+    final val = await getConfig('known_main_line_resources');
+    if (val != null && val.isNotEmpty) {
+      try {
+        return (jsonDecode(val) as List).map((e) => e.toString().trim()).where((s) => s.isNotEmpty).toList();
+      } catch (_) {}
+    }
+    return [];
+  }
+
+  Future<void> recordKnownMainLineResources(List<String> resources) async {
+    final current = await getKnownMainLineResources();
+    final set = current.toSet();
+    set.addAll(resources.map((s) => s.trim()).where((s) => s.isNotEmpty && s != '(Empty / Unassigned)'));
+    await setConfig('known_main_line_resources', jsonEncode(set.toList()));
+  }
+
+  Future<List<String>> getKnownDepartments() async {
+    final val = await getConfig('known_departments');
+    if (val != null && val.isNotEmpty) {
+      try {
+        return (jsonDecode(val) as List).map((e) => e.toString().trim()).where((s) => s.isNotEmpty).toList();
+      } catch (_) {}
+    }
+    return [];
+  }
+
+  Future<void> recordKnownDepartments(List<String> departments) async {
+    final current = await getKnownDepartments();
+    final set = current.toSet();
+    set.addAll(departments.map((s) => s.trim()).where((s) => s.isNotEmpty && s != '(Empty / Unassigned)'));
+    await setConfig('known_departments', jsonEncode(set.toList()));
+  }
+
+  /// Automatically registers and persists any new departments, component resources,
+  /// or MAIN LINE destination resources found in an imported picklist.
+  ///
+  /// Returns a map of newly discovered items:
+  /// {
+  ///   'departments': [...],
+  ///   'component_resources': [...],
+  ///   'main_line_resources': [...],
+  /// }
+  Future<Map<String, List<String>>> registerDiscoveredPicklistItems({
+    required List<String> departments,
+    required List<String> componentResources,
+    required List<String> mainLineResources,
+  }) async {
+    final existingDepts = (await getAllDistinctDepartments()).map((s) => s.trim().toLowerCase()).toSet();
+    final existingCompRes = (await getAllDistinctComponentResourceIds()).map((s) => s.trim().toLowerCase()).toSet();
+    final existingMainLine = (await getMainLineDistinctResourceIds()).map((s) => s.trim().toLowerCase()).toSet();
+
+    final newDepts = <String>[];
+    final seenDepts = <String>{};
+    for (final d in departments) {
+      final trimmed = d.trim();
+      final lower = trimmed.toLowerCase();
+      if (trimmed.isNotEmpty &&
+          trimmed != '(Empty / Unassigned)' &&
+          !existingDepts.contains(lower) &&
+          seenDepts.add(lower)) {
+        newDepts.add(trimmed);
+      }
+    }
+
+    final newCompRes = <String>[];
+    final seenCompRes = <String>{};
+    for (final cr in componentResources) {
+      final trimmed = cr.trim();
+      final lower = trimmed.toLowerCase();
+      if (trimmed.isNotEmpty &&
+          trimmed != '(Empty / Unassigned)' &&
+          !existingCompRes.contains(lower) &&
+          seenCompRes.add(lower)) {
+        newCompRes.add(trimmed);
+      }
+    }
+
+    final newMainLine = <String>[];
+    final seenMainLine = <String>{};
+    for (final ml in mainLineResources) {
+      final trimmed = ml.trim();
+      final lower = trimmed.toLowerCase();
+      if (trimmed.isNotEmpty &&
+          trimmed != '(Empty / Unassigned)' &&
+          !existingMainLine.contains(lower) &&
+          seenMainLine.add(lower)) {
+        newMainLine.add(trimmed);
+      }
+    }
+
+    if (newDepts.isNotEmpty) {
+      await recordKnownDepartments(newDepts);
+    }
+    if (newCompRes.isNotEmpty) {
+      await recordKnownComponentResources(newCompRes);
+    }
+    if (newMainLine.isNotEmpty) {
+      await recordKnownMainLineResources(newMainLine);
+    }
+
+    return {
+      'departments': newDepts,
+      'component_resources': newCompRes,
+      'main_line_resources': newMainLine,
+    };
+  }
+
+  /// Scans all picklist_items in the database, backfills any missing component_resource_id
+  /// using raw_columns (for files imported with legacy mappings), and synchronizes all
+  /// distinct departments, component resources, and MAIN LINE resources into known catalogs.
+  Future<Map<String, int>> syncAllKnownCatalogs(ColumnMapper mapper) async {
+    final db = await database;
+
+    // 1. Backfill component_resource_id from raw_columns for rows where it is empty
+    final emptyRows = await db.query(
+      'picklist_items',
+      columns: ['id', 'raw_columns'],
+      where: "(component_resource_id IS NULL OR TRIM(component_resource_id) = '') AND raw_columns IS NOT NULL AND TRIM(raw_columns) != '' AND raw_columns != '{}'",
+    );
+
+    int backfilledCount = 0;
+    final newlyDiscoveredCompRes = <String>{};
+
+    if (emptyRows.isNotEmpty) {
+      final batch = db.batch();
+      for (final row in emptyRows) {
+        final id = row['id'] as String;
+        final rawStr = row['raw_columns'] as String;
+        try {
+          final rawMap = jsonDecode(rawStr) as Map<String, dynamic>;
+          String foundValue = '';
+          for (final entry in rawMap.entries) {
+            final identified = mapper.identifyColumn(entry.key);
+            if (identified == ColumnMapper.keyComponentResourceId) {
+              final val = entry.value?.toString().trim() ?? '';
+              if (val.isNotEmpty) {
+                foundValue = val;
+                break;
+              }
+            }
+          }
+          if (foundValue.isNotEmpty) {
+            batch.update(
+              'picklist_items',
+              {'component_resource_id': foundValue},
+              where: 'id = ?',
+              whereArgs: [id],
+            );
+            newlyDiscoveredCompRes.add(foundValue);
+            backfilledCount++;
+          }
+        } catch (_) {}
+      }
+
+      if (backfilledCount > 0) {
+        await batch.commit(noResult: true);
+        if (newlyDiscoveredCompRes.isNotEmpty) {
+          await recordKnownComponentResources(newlyDiscoveredCompRes.toList());
+        }
+      }
+    }
+
+    // 2. Backfill on_hand from raw_columns for rows where it is empty
+    final emptyOnHandRows = await db.query(
+      'picklist_items',
+      columns: ['id', 'raw_columns'],
+      where: "(on_hand IS NULL OR TRIM(on_hand) = '') AND raw_columns IS NOT NULL AND TRIM(raw_columns) != '' AND raw_columns != '{}'",
+    );
+
+    int backfilledOnHandCount = 0;
+    if (emptyOnHandRows.isNotEmpty) {
+      final batch = db.batch();
+      for (final row in emptyOnHandRows) {
+        final id = row['id'] as String;
+        final rawStr = row['raw_columns'] as String;
+        try {
+          final rawMap = jsonDecode(rawStr) as Map<String, dynamic>;
+          String foundOnHand = '';
+            for (final entry in rawMap.entries) {
+            final key = entry.key;
+            final identified = mapper.identifyColumn(key);
+            final norm = ColumnMapper.normalize(key);
+            if (identified == ColumnMapper.keyOnHand ||
+                norm == 'ON HAND' ||
+                norm.contains('ON HAND') ||
+                norm.contains('ONHAND') ||
+                norm.contains('LOCATION') ||
+                norm.contains('BIN') ||
+                norm.contains('STOCK') ||
+                norm.contains('INVENTORY') ||
+                norm == 'LOC' ||
+                norm == 'OH') {
+              final val = entry.value?.toString().trim() ?? '';
+              if (val.isNotEmpty && val.toLowerCase() != 'null') {
+                foundOnHand = val;
+                break;
+              }
+            }
+          }
+          if (foundOnHand.isNotEmpty) {
+            batch.update(
+              'picklist_items',
+              {'on_hand': foundOnHand},
+              where: 'id = ?',
+              whereArgs: [id],
+            );
+            backfilledOnHandCount++;
+          }
+        } catch (_) {}
+      }
+
+      if (backfilledOnHandCount > 0) {
+        await batch.commit(noResult: true);
+      }
+    }
+
+    // 3. Discover departments across all units
+    final allDepts = await getAllDistinctDepartments();
+    if (allDepts.isNotEmpty) {
+      await recordKnownDepartments(allDepts);
+    }
+
+    // 3. Discover component resources across all units
+    final allCompRes = await getAllDistinctComponentResourceIds();
+    if (allCompRes.isNotEmpty) {
+      await recordKnownComponentResources(allCompRes);
+    }
+
+    // 4. Discover MAIN LINE resources across all units
+    final allMainLine = await getMainLineDistinctResourceIds();
+    if (allMainLine.isNotEmpty) {
+      await recordKnownMainLineResources(allMainLine);
+    }
+
+    return {
+      'backfilledItems': backfilledCount,
+      'departments': allDepts.length,
+      'componentResources': allCompRes.length,
+      'mainLineResources': allMainLine.length,
+    };
+  }
+
+  Future<List<String>> getAllDistinctComponentResourceIds() async {
+    final db = await database;
+    final rows = await db.rawQuery(
+      "SELECT DISTINCT component_resource_id FROM picklist_items WHERE component_resource_id IS NOT NULL AND TRIM(component_resource_id) != '' ORDER BY component_resource_id ASC",
+    );
+    final set = rows.map((r) => (r['component_resource_id'] as String).trim()).where((s) => s.isNotEmpty).toSet();
+    final knownList = await getKnownComponentResources();
+    set.addAll(knownList);
+    final autoIssueList = await getAutoIssueResourceIds();
+    set.addAll(autoIssueList);
+    final blockedList = await getBlockedResourceIds();
+    set.addAll(blockedList);
+    // Always include (Empty / Unassigned) so admin can always configure it
+    set.add('(Empty / Unassigned)');
+    final list = set.toList();
+    list.sort((a, b) {
+      if (a == '(Empty / Unassigned)') return 1;
+      if (b == '(Empty / Unassigned)') return -1;
+      return a.toLowerCase().compareTo(b.toLowerCase());
+    });
+    return list;
+  }
+
+  Future<List<String>> _getRawDistinctComponentResourceNames() async {
+    final db = await database;
+    final rows = await db.rawQuery(
+      "SELECT DISTINCT component_resource_id FROM picklist_items WHERE component_resource_id IS NOT NULL AND TRIM(component_resource_id) != ''",
+    );
+    final list = rows.map((r) => (r['component_resource_id'] as String).trim()).where((s) => s.isNotEmpty).toList();
+    final knownList = await getKnownComponentResources();
+    list.addAll(knownList);
+    list.add('(Empty / Unassigned)');
+    return list.toSet().toList();
+  }
+
   Future<List<String>> getAllDistinctResourceIds() async {
     final db = await database;
     final rows = await db.rawQuery(
@@ -1798,7 +2429,7 @@ class DatabaseService implements LogDatabase {
     // Include resources matching any blocked pattern rules
     final rules = await getResourcePatternRules();
     if (rules.isNotEmpty) {
-      final allRes = await _getRawDistinctResourceNames();
+      final allRes = await _getRawDistinctComponentResourceNames();
       for (final rule in rules) {
         final pat = (rule['pattern']?.toString() ?? '').trim().toLowerCase();
         final allowPick = rule['allowPick'] == true;
@@ -1846,7 +2477,7 @@ class DatabaseService implements LogDatabase {
     // Include resources matching any auto-issue pattern rules
     final rules = await getResourcePatternRules();
     if (rules.isNotEmpty) {
-      final allRes = await _getRawDistinctResourceNames();
+      final allRes = await _getRawDistinctComponentResourceNames();
       for (final rule in rules) {
         final pat = (rule['pattern']?.toString() ?? '').trim().toLowerCase();
         final autoIssue = rule['autoIssue'] == true;
@@ -2013,12 +2644,16 @@ class DatabaseService implements LogDatabase {
         set.add(res);
       }
     }
-    final list = set.toList();
-    list.sort((a, b) => a.toLowerCase().compareTo(b.toLowerCase()));
-    if (hasEmpty) {
-      list.add('(Empty / Unassigned)');
+    if (unitId == null) {
+      final known = await getKnownMainLineResources();
+      set.addAll(known);
     }
-    return list;
+    final sortedList = set.toList();
+    sortedList.sort((a, b) => a.toLowerCase().compareTo(b.toLowerCase()));
+    if (hasEmpty) {
+      sortedList.add('(Empty / Unassigned)');
+    }
+    return sortedList;
   }
 
   /// Returns a map of Resource ID -> view mode ('combined' or 'split_by_dept')
