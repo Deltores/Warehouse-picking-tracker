@@ -2074,7 +2074,7 @@ class _PickerFlowScreenState extends State<PickerFlowScreen> {
                                               border: Border.all(color: const Color(0xFF0EA5E9)),
                                             ),
                                             child: const Text(
-                                              'MAIN LINE RESOURCE',
+                                              'MAIN LINE',
                                               style: TextStyle(
                                                 fontSize: 9,
                                                 fontWeight: FontWeight.bold,
@@ -2084,7 +2084,9 @@ class _PickerFlowScreenState extends State<PickerFlowScreen> {
                                           ),
                                         Expanded(
                                           child: Text(
-                                            dept,
+                                            dept.endsWith(' (MAIN LINE)')
+                                                ? dept.substring(0, dept.length - ' (MAIN LINE)'.length)
+                                                : dept,
                                             style: TextStyle(
                                               fontSize: 18,
                                               fontWeight: FontWeight.bold,

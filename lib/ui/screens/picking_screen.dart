@@ -1158,7 +1158,7 @@ class _PickingScreenState extends State<PickingScreen> with WidgetsBindingObserv
                       ? deptItems.first.deptType
                       : '';
                   final autoType = _isResourceScope
-                      ? 'MAIN LINE RESOURCE'
+                      ? 'MAIN LINE'
                       : (deptTypeFromItems.isNotEmpty
                           ? deptTypeFromItems
                           : ((_activeDepartment?.toUpperCase().contains('MAIN') ?? false) ||
@@ -1208,7 +1208,7 @@ class _PickingScreenState extends State<PickingScreen> with WidgetsBindingObserv
                               color: AppTheme.accentCyan,
                             ),
                             const SizedBox(width: 8),
-                            // Dept type badge (MAIN LINE / SUBASSEMBLY)
+                            // Dept / Resource type badge (MAIN LINE / SUBASSEMBLY)
                             Container(
                               padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
                               decoration: BoxDecoration(
@@ -1237,7 +1237,7 @@ class _PickingScreenState extends State<PickingScreen> with WidgetsBindingObserv
                             Flexible(
                               child: Text(
                                 _isResourceScope
-                                    ? 'Resource: $_targetResourceName (MAIN LINE)'
+                                    ? 'Resource: $_targetResourceName'
                                     : 'Department: $_activeDepartment',
                                 style: const TextStyle(
                                   fontSize: 13,
@@ -1248,7 +1248,7 @@ class _PickingScreenState extends State<PickingScreen> with WidgetsBindingObserv
                               ),
                             ),
                             const SizedBox(width: 10),
-                            // Department Part-ID Progress Badge
+                            // Department / Resource Part-ID Progress Badge
                             Container(
                               padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 3),
                               decoration: BoxDecoration(
@@ -1260,15 +1260,30 @@ class _PickingScreenState extends State<PickingScreen> with WidgetsBindingObserv
                                       : AppTheme.borderDark,
                                 ),
                               ),
-                              child: Text(
-                                '${_isResourceScope ? "Resource" : "Dept"}: $deptCompletedParts / $deptTotalParts parts ($deptPct%)',
-                                style: TextStyle(
-                                  fontSize: 11,
-                                  fontWeight: FontWeight.bold,
-                                  color: deptCompletedParts >= deptTotalParts && deptTotalParts > 0
-                                      ? AppTheme.statusComplete
-                                      : AppTheme.accentCyan,
-                                ),
+                              child: Row(
+                                mainAxisSize: MainAxisSize.min,
+                                children: [
+                                  Icon(
+                                    deptCompletedParts >= deptTotalParts && deptTotalParts > 0
+                                        ? Icons.check_circle_rounded
+                                        : Icons.donut_large_rounded,
+                                    size: 13,
+                                    color: deptCompletedParts >= deptTotalParts && deptTotalParts > 0
+                                        ? AppTheme.statusComplete
+                                        : AppTheme.accentCyan,
+                                  ),
+                                  const SizedBox(width: 5),
+                                  Text(
+                                    '$deptCompletedParts / $deptTotalParts parts ($deptPct%)',
+                                    style: TextStyle(
+                                      fontSize: 11,
+                                      fontWeight: FontWeight.bold,
+                                      color: deptCompletedParts >= deptTotalParts && deptTotalParts > 0
+                                          ? AppTheme.statusComplete
+                                          : AppTheme.textLight,
+                                    ),
+                                  ),
+                                ],
                               ),
                             ),
                             const Spacer(),
