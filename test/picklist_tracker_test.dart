@@ -664,16 +664,16 @@ void main() {
       expect(found.isRemoved, isTrue);
     });
 
-    // 22. Manually Added Part Replacement Synchronization across all DB tables
-    test('22. DatabaseService manually added part replacement synchronizes manual_picks, session_picks, part_flags, and raw_columns', () async {
+    // 22. Manually added parts cannot be replaced or marked as missing (can only be removed or returned)
+    test('22. Manually added parts cannot be replaced or marked as missing (can only be removed or returned)', () async {
       final now = DateTime.now().millisecondsSinceEpoch;
       await dbService.insertUnit(UnitRecord(
         id: 'u_man_rep',
         name: 'Unit Man Rep',
         filePath: 'man_rep.xlsx',
-        totalRequired: 0,
+        totalRequired: 10,
         totalPicked: 0,
-        status: 'IN_PROGRESS',
+        status: 'OPEN',
         createdAt: now,
         lastAccessedAt: now,
       ));
@@ -690,63 +690,64 @@ void main() {
         note: 'Added bracket manually',
       );
 
-      // 2. Also record in session_picks and part_flags
-      await dbService.recordSessionPick(
-        sessionId: 'sess_1',
-        unitId: 'u_man_rep',
-        itemId: manualItem.id,
-        partId: 'MAN-PART-OLD',
-        qtyPickedDelta: 5.0,
+      // 2. Worker attempts to replace manually added part -> must be rejected with ArgumentError!
+      expect(
+        () async => await dbService.recordPartIdReplacement(
+          unitId: 'u_man_rep',
+          sessionId: 'sess_1',
+          workerName: 'Alice',
+          oldPartId: 'MAN-PART-OLD',
+          newPartId: 'MAN-PART-NEW',
+          note: 'Trying to replace manual part',
+          department: 'Assembly',
+          targetItemIds: [manualItem.id],
+        ),
+        throwsA(isA<ArgumentError>()),
       );
-      await dbService.setUserPartNote(
+
+      // 3. Worker attempts to mark manually added part as MISSING -> must be rejected with ArgumentError!
+      expect(
+        () async => await dbService.recordPartFlag(
+          unitId: 'u_man_rep',
+          partId: 'MAN-PART-OLD',
+          department: 'Assembly',
+          flagType: 'MISSING',
+          note: 'Trying to mark manual part missing',
+        ),
+        throwsA(isA<ArgumentError>()),
+      );
+
+      // Verify that the part is still MAN-PART-OLD and untouched
+      final itemsBefore = await dbService.getPicklistItems('u_man_rep');
+      expect(itemsBefore.first.partId, equals('MAN-PART-OLD'));
+      expect(itemsBefore.first.isManualAdd, isTrue);
+
+      // 4. Worker CAN remove the manually added part
+      await dbService.recordPartRemoval(
         unitId: 'u_man_rep',
         partId: 'MAN-PART-OLD',
-        note: 'Torque to 15Nm',
+        workerName: 'Alice',
+        reason: 'Removing extra manual part from assembly',
         department: 'Assembly',
       );
+      final itemsAfterRemoval = await dbService.getPicklistItems('u_man_rep');
+      expect(itemsAfterRemoval.first.isRemoved, isTrue);
 
-      // Verify pre-replacement state
-      final manualPicksBefore = await dbService.getManualPicksForUnit('u_man_rep');
-      expect(manualPicksBefore.first['part_id'], equals('MAN-PART-OLD'));
-      final batchPicksBefore = await dbService.getBatchPickedPartIdsForUnit(['sess_1'], 'u_man_rep');
-      expect(batchPicksBefore.contains('MAN-PART-OLD'), isTrue);
-      final notesBefore = await dbService.getUserPartNotesForUnit('u_man_rep');
-      expect(notesBefore['MAN-PART-OLD'], equals('Torque to 15Nm'));
-
-      // 3. Worker replaces the manually added part
-      const newPartId = 'MAN-PART-NEW';
-      await dbService.recordPartIdReplacement(
+      // 5. Worker CAN return picked quantity for the manually added part
+      await dbService.updateItemQtyPicked(manualItem.id, 3.0, 0.0);
+      await dbService.recordReturn(
         unitId: 'u_man_rep',
         sessionId: 'sess_1',
         workerName: 'Alice',
-        oldPartId: 'MAN-PART-OLD',
-        newPartId: newPartId,
-        note: 'Upgraded to reinforced steel bracket',
+        partId: 'MAN-PART-OLD',
+        qtyReturned: 2.0,
+        comment: 'Returning 2 extra pieces of manual part',
         department: 'Assembly',
-        targetItemIds: [manualItem.id],
       );
-
-      // Verify picklist_items is updated
-      final items = await dbService.getPicklistItems('u_man_rep');
-      final updatedItem = items.firstWhere((i) => i.id == manualItem.id);
-      expect(updatedItem.partId, equals(newPartId));
-      expect(updatedItem.replacedPartId, equals('MAN-PART-OLD'));
-      expect(updatedItem.replacementNote, equals('Upgraded to reinforced steel bracket'));
-      expect(updatedItem.isManualAdd, isTrue);
-
-      // Verify manual_picks table is synchronized!
-      final manualPicksAfter = await dbService.getManualPicksForUnit('u_man_rep');
-      expect(manualPicksAfter.length, equals(1));
-      expect(manualPicksAfter.first['part_id'], equals(newPartId));
-
-      // Verify session_picks table is synchronized!
-      final batchPicksAfter = await dbService.getBatchPickedPartIdsForUnit(['sess_1'], 'u_man_rep');
-      expect(batchPicksAfter.contains(newPartId), isTrue);
-      expect(batchPicksAfter.contains('MAN-PART-OLD'), isFalse);
-
-      // Verify part_flags table is synchronized!
-      final notesAfter = await dbService.getUserPartNotesForUnit('u_man_rep');
-      expect(notesAfter[newPartId], equals('Torque to 15Nm'));
+      final itemsAfterReturn = await dbService.getPicklistItems('u_man_rep');
+      expect(itemsAfterReturn.first.qtyPicked, equals(3.0));
+      final returns = await dbService.getReturnCommentsForUnit('u_man_rep');
+      expect(returns.containsKey('MAN-PART-OLD'), isTrue);
     });
 
     // 23. Manually added part FIFO allocation expansion beyond initial required

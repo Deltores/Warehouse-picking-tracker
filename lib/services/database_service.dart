@@ -1736,6 +1736,30 @@ class DatabaseService implements LogDatabase {
     String note = '',
   }) async {
     final db = await database;
+
+    // Manually added parts cannot be flagged as MISSING
+    if (flagType.toUpperCase() == 'MISSING') {
+      final rows = await db.query(
+        'picklist_items',
+        columns: ['id', 'raw_columns'],
+        where: 'unit_id = ? AND LOWER(TRIM(part_id)) = LOWER(TRIM(?))',
+        whereArgs: [unitId, partId],
+      );
+      final isManual = rows.any((r) {
+        final rawStr = r['raw_columns']?.toString() ?? '';
+        if (rawStr.isEmpty) return false;
+        try {
+          final raw = jsonDecode(rawStr) as Map<String, dynamic>;
+          return raw['_manual_add'] == true || raw['_manual_add'] == 1 || raw['_manual_add'] == 'true';
+        } catch (_) {
+          return false;
+        }
+      });
+      if (isManual) {
+        throw ArgumentError('Manually added parts cannot be marked as missing.');
+      }
+    }
+
     final uuid = const Uuid().v4();
     await db.insert('part_flags', {
       'id': uuid,
@@ -2048,6 +2072,27 @@ class DatabaseService implements LogDatabase {
         }
       }
 
+      // Verify that none of the items being replaced are manually added parts
+      final targetRows = await txn.query(
+        'picklist_items',
+        columns: ['id', 'raw_columns'],
+        where: whereClause,
+        whereArgs: whereArgs,
+      );
+      final isManual = targetRows.any((r) {
+        final rawStr = r['raw_columns']?.toString() ?? '';
+        if (rawStr.isEmpty) return false;
+        try {
+          final raw = jsonDecode(rawStr) as Map<String, dynamic>;
+          return raw['_manual_add'] == true || raw['_manual_add'] == 1 || raw['_manual_add'] == 'true';
+        } catch (_) {
+          return false;
+        }
+      });
+      if (isManual) {
+        throw ArgumentError('Manually added parts cannot be replaced. They can only be removed or returned.');
+      }
+
       await txn.rawUpdate('''
         UPDATE picklist_items
         SET part_id = ?,
@@ -2057,39 +2102,6 @@ class DatabaseService implements LogDatabase {
             replaced_by = ?
         WHERE $whereClause
       ''', [newPartId, oldPartId, note, now, workerName, ...whereArgs]);
-
-      // If any of the replaced items were manual adds, also record replaced_from in raw_columns
-      final updatedRows = await txn.query(
-        'picklist_items',
-        columns: ['id', 'raw_columns'],
-        where: 'unit_id = ? AND LOWER(TRIM(part_id)) = LOWER(TRIM(?))',
-        whereArgs: [unitId, newPartId],
-      );
-      for (final r in updatedRows) {
-        final rawStr = r['raw_columns']?.toString() ?? '';
-        if (rawStr.isNotEmpty) {
-          try {
-            final raw = jsonDecode(rawStr) as Map<String, dynamic>;
-            if (raw['_manual_add'] == true || raw['_manual_add'] == 1 || raw['_manual_add'] == 'true') {
-              raw['_manual_replaced_from'] = oldPartId;
-              raw['_manual_replacement_note'] = note;
-              await txn.update(
-                'picklist_items',
-                {'raw_columns': jsonEncode(raw)},
-                where: 'id = ?',
-                whereArgs: [r['id']],
-              );
-            }
-          } catch (_) {}
-        }
-      }
-
-      // Synchronize manual_picks table so exports and history do not retain stale part_id
-      await txn.rawUpdate('''
-        UPDATE manual_picks
-        SET part_id = ?
-        WHERE unit_id = ? AND LOWER(TRIM(part_id)) = LOWER(TRIM(?))
-      ''', [newPartId, unitId, oldPartId]);
 
       // Synchronize session_picks table so session metrics recognize the new part_id
       await txn.rawUpdate('''

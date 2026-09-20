@@ -708,6 +708,19 @@ class _PickModeScreenState extends State<PickModeScreen> with WidgetsBindingObse
   }
 
   Future<void> _markPartMissing(PartSummary part) async {
+    if (part.isManualAdd) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(
+            content: Text('Manually added parts cannot be marked as missing.'),
+            backgroundColor: AppTheme.statusDanger,
+            duration: Duration(seconds: 3),
+          ),
+        );
+      }
+      return;
+    }
+
     final worker = widget.activeSession?.workerName ?? _session?.workerName ?? 'Picker';
     final now = DateTime.now().millisecondsSinceEpoch;
     setState(() {
@@ -1241,6 +1254,19 @@ class _PickModeScreenState extends State<PickModeScreen> with WidgetsBindingObse
   /// Shows the Replace Part ID dialog.
   /// New Part ID: uppercase only, A-Z and 0-9, no spaces or special characters.
   Future<void> _showReplacePartIdDialog(PartSummary part) async {
+    if (part.isManualAdd) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(
+            content: Text('Manually added parts cannot be replaced. They can only be removed or returned.'),
+            backgroundColor: AppTheme.statusDanger,
+            duration: Duration(seconds: 3),
+          ),
+        );
+      }
+      return;
+    }
+
     final newIdController = TextEditingController();
     final noteController = TextEditingController();
 
@@ -3089,14 +3115,27 @@ class _PickModeScreenState extends State<PickModeScreen> with WidgetsBindingObse
                     Expanded(
                       child: OutlinedButton.icon(
                         style: OutlinedButton.styleFrom(
-                          side: const BorderSide(color: AppTheme.statusDanger),
-                          foregroundColor: AppTheme.statusDanger,
+                          side: BorderSide(
+                            color: part.isManualAdd ? Colors.grey.shade700 : AppTheme.statusDanger,
+                          ),
+                          foregroundColor: part.isManualAdd ? Colors.grey.shade600 : AppTheme.statusDanger,
                           padding: const EdgeInsets.symmetric(vertical: 12),
                           minimumSize: const Size(0, 48),
                           shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(8)),
                         ),
-                        icon: const Icon(Icons.warning_amber_rounded, size: 18),
-                        label: const Text('Missing', style: TextStyle(fontSize: 14, fontWeight: FontWeight.bold)),
+                        icon: Icon(
+                          part.isManualAdd ? Icons.block_rounded : Icons.warning_amber_rounded,
+                          size: 18,
+                          color: part.isManualAdd ? Colors.grey.shade600 : AppTheme.statusDanger,
+                        ),
+                        label: Text(
+                          'Missing',
+                          style: TextStyle(
+                            fontSize: 14,
+                            fontWeight: FontWeight.bold,
+                            color: part.isManualAdd ? Colors.grey.shade600 : AppTheme.statusDanger,
+                          ),
+                        ),
                         onPressed: () => _markPartMissing(part),
                       ),
                     ),
@@ -3169,14 +3208,27 @@ class _PickModeScreenState extends State<PickModeScreen> with WidgetsBindingObse
                     Expanded(
                       child: OutlinedButton.icon(
                         style: OutlinedButton.styleFrom(
-                          side: const BorderSide(color: Color(0xFFAB47BC)),
-                          foregroundColor: const Color(0xFFCE93D8),
+                          side: BorderSide(
+                            color: part.isManualAdd ? Colors.grey.shade700 : const Color(0xFFAB47BC),
+                          ),
+                          foregroundColor: part.isManualAdd ? Colors.grey.shade600 : const Color(0xFFCE93D8),
                           padding: const EdgeInsets.symmetric(vertical: 10),
                           minimumSize: const Size(0, 44),
                           shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(8)),
                         ),
-                        icon: const Icon(Icons.find_replace_rounded, size: 16),
-                        label: const Text('Replace', style: TextStyle(fontSize: 12, fontWeight: FontWeight.bold)),
+                        icon: Icon(
+                          part.isManualAdd ? Icons.block_rounded : Icons.find_replace_rounded,
+                          size: 16,
+                          color: part.isManualAdd ? Colors.grey.shade600 : const Color(0xFFCE93D8),
+                        ),
+                        label: Text(
+                          'Replace',
+                          style: TextStyle(
+                            fontSize: 12,
+                            fontWeight: FontWeight.bold,
+                            color: part.isManualAdd ? Colors.grey.shade600 : const Color(0xFFCE93D8),
+                          ),
+                        ),
                         onPressed: () => _showReplacePartIdDialog(part),
                       ),
                     ),
