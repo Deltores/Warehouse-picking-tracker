@@ -38,6 +38,7 @@ class GroupingTreeView extends StatelessWidget {
   /// (Legacy) Called when the Pick Mode button on a Line node is tapped.
   final void Function(String? lineLabel)? onPickModeFromLine;
   final Map<String, Map<String, dynamic>>? partFlags;
+  final Map<String, String>? userPartNotes;
 
   const GroupingTreeView({
     super.key,
@@ -48,6 +49,7 @@ class GroupingTreeView extends StatelessWidget {
     this.onPickModeFromNode,
     this.onPickModeFromLine,
     this.partFlags,
+    this.userPartNotes,
   });
 
   @override
@@ -81,6 +83,7 @@ class GroupingTreeView extends StatelessWidget {
           onPickModeFromNode: onPickModeFromNode,
           onPickModeFromLine: onPickModeFromLine,
           partFlags: partFlags,
+          userPartNotes: userPartNotes,
           depth: 0,
           isSingleChild: nodes.length == 1,
         );
@@ -98,6 +101,7 @@ class _TreeNodeWidget extends StatefulWidget {
   final void Function(TreeNode node)? onPickModeFromNode;
   final void Function(String? lineLabel)? onPickModeFromLine;
   final Map<String, Map<String, dynamic>>? partFlags;
+  final Map<String, String>? userPartNotes;
   final int depth;
   final bool isSingleChild;
 
@@ -112,6 +116,7 @@ class _TreeNodeWidget extends StatefulWidget {
     this.onPickModeFromNode,
     this.onPickModeFromLine,
     this.partFlags,
+    this.userPartNotes,
   });
 
   @override
@@ -152,10 +157,26 @@ class _TreeNodeWidgetState extends State<_TreeNodeWidget> {
     return count;
   }
 
+  int get _removedPartsCount {
+    if (widget.partFlags == null || widget.partFlags!.isEmpty) return 0;
+    final leafPartIds = widget.node.leafItems.map((i) => i.partId).toSet();
+    int count = 0;
+    for (final pid in leafPartIds) {
+      if (widget.partFlags![pid]?['flag_type']?.toString().toUpperCase() == 'REMOVED') {
+        count++;
+      }
+    }
+    return count;
+  }
+
   bool get _isMissing =>
       !widget.node.isComplete &&
       ((widget.partFlags?[widget.node.label]?['flag_type']?.toString().toUpperCase() == 'MISSING') ||
           _missingPartsCount > 0);
+
+  bool get _isRemoved =>
+      (widget.partFlags?[widget.node.label]?['flag_type']?.toString().toUpperCase() == 'REMOVED') ||
+      (widget.node.isLeaf && widget.node.leafItems.any((i) => i.isRemoved));
 
   Widget _buildMissingBadge(int count) {
     return Container(
@@ -183,10 +204,43 @@ class _TreeNodeWidgetState extends State<_TreeNodeWidget> {
     );
   }
 
+  Widget _buildRemovedBadge(int count) {
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 3),
+      decoration: BoxDecoration(
+        color: AppTheme.textMuted.withValues(alpha: 0.15),
+        borderRadius: BorderRadius.circular(6),
+        border: Border.all(color: AppTheme.textMuted.withValues(alpha: 0.6)),
+      ),
+      child: Row(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          const Icon(Icons.block_rounded, size: 13, color: AppTheme.textMuted),
+          const SizedBox(width: 3),
+          Text(
+            '$count REMOVED',
+            style: const TextStyle(
+              fontSize: 11,
+              fontWeight: FontWeight.bold,
+              color: AppTheme.textMuted,
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
   Color _getStatusColor() {
+    if (widget.node.isLeaf && _isRemoved) return AppTheme.textMuted;
     if (_isMissing) return AppTheme.statusDanger;
+    if (widget.node.isLeaf && widget.node.leafItems.any((i) => i.isManualAdd)) {
+      return const Color(0xFFBB86FC);
+    }
     if (widget.node.isComplete) return AppTheme.statusComplete;
     if (widget.node.isPartial) return AppTheme.statusPartial;
+    if (widget.node.isLeaf && widget.node.leafItems.any((i) => i.replacedPartId.isNotEmpty)) {
+      return const Color(0xFF00E5FF);
+    }
     return AppTheme.statusUnpicked;
   }
 
@@ -272,6 +326,10 @@ class _TreeNodeWidgetState extends State<_TreeNodeWidget> {
                     ),
                   ),
                   const SizedBox(width: 10),
+                  if (_removedPartsCount > 0) ...[
+                    _buildRemovedBadge(_removedPartsCount),
+                    const SizedBox(width: 8),
+                  ],
                   if (_missingPartsCount > 0) ...[
                     _buildMissingBadge(_missingPartsCount),
                     const SizedBox(width: 8),
@@ -342,6 +400,7 @@ class _TreeNodeWidgetState extends State<_TreeNodeWidget> {
                       onPickModeFromNode: widget.onPickModeFromNode,
                       onPickModeFromLine: widget.onPickModeFromLine,
                       partFlags: widget.partFlags,
+                      userPartNotes: widget.userPartNotes,
                       depth: widget.depth + 1,
                       isSingleChild: widget.node.children.length == 1,
                     )).toList(),
@@ -443,6 +502,10 @@ class _TreeNodeWidgetState extends State<_TreeNodeWidget> {
           trailing: Row(
             mainAxisSize: MainAxisSize.min,
             children: [
+              if (_removedPartsCount > 0) ...[
+                _buildRemovedBadge(_removedPartsCount),
+                const SizedBox(width: 8),
+              ],
               if (_missingPartsCount > 0) ...[
                 _buildMissingBadge(_missingPartsCount),
                 const SizedBox(width: 8),
@@ -481,6 +544,7 @@ class _TreeNodeWidgetState extends State<_TreeNodeWidget> {
               onPickModeFromNode: widget.onPickModeFromNode,
               onPickModeFromLine: widget.onPickModeFromLine,
               partFlags: widget.partFlags,
+              userPartNotes: widget.userPartNotes,
               depth: widget.depth + 1,
               isSingleChild: widget.node.children.length == 1,
             );
@@ -492,6 +556,11 @@ class _TreeNodeWidgetState extends State<_TreeNodeWidget> {
 
   Widget _buildLeafCard(BuildContext context, Color statusColor) {
     final firstItem = widget.node.leafItems.isNotEmpty ? widget.node.leafItems.first : null;
+    final isManual = widget.node.leafItems.any((i) => i.isManualAdd);
+    final manualItem = widget.node.leafItems.where((i) => i.isManualAdd).firstOrNull;
+    final isReplaced = firstItem != null && firstItem.replacedPartId.isNotEmpty;
+    final userNote = widget.userPartNotes?[widget.node.label] ?? '';
+
     final onHandItem = widget.node.leafItems.firstWhere(
       (i) => i.onHand.trim().isNotEmpty,
       orElse: () => firstItem ?? PicklistItem(id: '', unitId: '', department: '', line: '', workOrder: '', partId: '', partDescription: '', qtyRequired: 0, qtyDue: 0, qtyPicked: 0, rowOrder: 0),
@@ -538,7 +607,7 @@ class _TreeNodeWidgetState extends State<_TreeNodeWidget> {
       child: InkWell(
         borderRadius: BorderRadius.circular(10),
         // Tap navigates to unified PickModeScreen — line-scoped or group-scoped
-        onTap: () => widget.onLeafPartTapped?.call(widget.node.label, widget.parentGroupNode),
+        onTap: () => widget.onLeafPartTapped?.call(widget.node.label.trim(), widget.parentGroupNode),
         child: Padding(
           padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 14),
           child: Row(
@@ -559,47 +628,138 @@ class _TreeNodeWidgetState extends State<_TreeNodeWidget> {
                 child: Column(
                   crossAxisAlignment: CrossAxisAlignment.start,
                   children: [
-                    Text(
-                      widget.node.label,
-                      style: const TextStyle(
-                        fontSize: 17,
-                        fontWeight: FontWeight.bold,
-                        color: AppTheme.textLight,
-                      ),
+                    Row(
+                      children: [
+                        Flexible(
+                          child: Text(
+                            widget.node.label,
+                            style: TextStyle(
+                              fontSize: 17,
+                              fontWeight: FontWeight.bold,
+                              color: _isRemoved ? AppTheme.textMuted : AppTheme.textLight,
+                            ),
+                          ),
+                        ),
+                      ],
                     ),
-                    if (_isMissing) ...[
+                    // MANUAL ADD badge
+                    if (isManual) ...[
+                      const SizedBox(height: 3),
+                      Container(
+                        padding: const EdgeInsets.symmetric(horizontal: 7, vertical: 2),
+                        decoration: BoxDecoration(
+                          color: const Color(0xFFBB86FC).withValues(alpha: 0.18),
+                          borderRadius: BorderRadius.circular(5),
+                          border: Border.all(color: const Color(0xFFBB86FC).withValues(alpha: 0.6)),
+                        ),
+                        child: Row(
+                          mainAxisSize: MainAxisSize.min,
+                          children: [
+                            const Icon(Icons.add_circle_outline_rounded, size: 12, color: Color(0xFFBB86FC)),
+                            const SizedBox(width: 4),
+                            Flexible(
+                              child: Text(
+                                '➕ MANUAL ADD${manualItem?.manualWorker.isNotEmpty == true ? ' • by ${manualItem!.manualWorker}' : ''}${manualItem?.manualNote.isNotEmpty == true ? ': "${manualItem!.manualNote}"' : ''}',
+                                style: const TextStyle(fontSize: 11, fontWeight: FontWeight.bold, color: Color(0xFFBB86FC)),
+                                overflow: TextOverflow.ellipsis,
+                              ),
+                            ),
+                          ],
+                        ),
+                      ),
+                    ],
+                    // REPLACED badge
+                    if (isReplaced) ...[
+                      const SizedBox(height: 3),
+                      Container(
+                        padding: const EdgeInsets.symmetric(horizontal: 7, vertical: 2),
+                        decoration: BoxDecoration(
+                          color: const Color(0xFF00E5FF).withValues(alpha: 0.15),
+                          borderRadius: BorderRadius.circular(5),
+                          border: Border.all(color: const Color(0xFF00E5FF).withValues(alpha: 0.5)),
+                        ),
+                        child: Row(
+                          mainAxisSize: MainAxisSize.min,
+                          children: [
+                            const Icon(Icons.find_replace_rounded, size: 12, color: Color(0xFF00E5FF)),
+                            const SizedBox(width: 4),
+                            Flexible(
+                              child: Text(
+                                '🔄 REPLACED • was: ${firstItem.replacedPartId}${firstItem.replacementNote.isNotEmpty ? ' (${firstItem.replacementNote})' : ''}',
+                                style: const TextStyle(fontSize: 11, fontWeight: FontWeight.bold, color: Color(0xFF00E5FF)),
+                                overflow: TextOverflow.ellipsis,
+                              ),
+                            ),
+                          ],
+                        ),
+                      ),
+                    ],
+                    if (_isRemoved) ...[
+                      const SizedBox(height: 3),
+                      Builder(builder: (_) {
+                        final flag = widget.partFlags?[widget.node.label];
+                        String removeReason = firstItem?.removeNote ?? '';
+                        if (removeReason.isEmpty && flag != null) {
+                          removeReason = flag['note']?.toString() ?? '';
+                        }
+                        return Container(
+                          padding: const EdgeInsets.symmetric(horizontal: 7, vertical: 2),
+                          decoration: BoxDecoration(
+                            color: const Color(0xFF757575).withValues(alpha: 0.18),
+                            borderRadius: BorderRadius.circular(5),
+                            border: Border.all(color: const Color(0xFF757575).withValues(alpha: 0.6)),
+                          ),
+                          child: Row(
+                            mainAxisSize: MainAxisSize.min,
+                            children: [
+                              const Icon(Icons.block_rounded, size: 12, color: Color(0xFF757575)),
+                              const SizedBox(width: 4),
+                              Flexible(
+                                child: Text(
+                                  '⛔ REMOVED FROM PICKING${removeReason.isNotEmpty ? ' • $removeReason' : ''}',
+                                  style: const TextStyle(fontSize: 11, fontWeight: FontWeight.bold, color: Color(0xFF757575)),
+                                  overflow: TextOverflow.ellipsis,
+                                ),
+                              ),
+                            ],
+                          ),
+                        );
+                      }),
+                    ] else if (_isMissing) ...[
                       const SizedBox(height: 3),
                       Builder(builder: (_) {
                         final flag = widget.partFlags![widget.node.label]!;
                         final ts = flag['created_at'] as int?;
                         final dateStr = ts != null
-                            ? DateFormat('yyyy-MM-dd HH:mm').format(DateTime.fromMillisecondsSinceEpoch(ts))
+                            ? DateFormat('yyyy-MM-dd').format(DateTime.fromMillisecondsSinceEpoch(ts))
                             : '';
                         final note = flag['note']?.toString() ?? '';
-                        String pickerName = '';
-                        if (note.contains('Marked missing by ')) {
-                          pickerName = note.replaceAll('Marked missing by ', '').replaceAll(' in Pick Mode', '').trim();
-                        } else if (note.isNotEmpty) {
-                          pickerName = note;
-                        } else {
-                          pickerName = 'Picker';
+                        String pickerName = flag['worker_name']?.toString() ?? '';
+                        if (pickerName.isEmpty) {
+                          if (note.contains('Marked missing by ')) {
+                            pickerName = note.replaceAll('Marked missing by ', '').replaceAll(' in Pick Mode', '').trim();
+                          } else if (note.isNotEmpty) {
+                            pickerName = note;
+                          } else {
+                            pickerName = 'Picker';
+                          }
                         }
                         return Container(
                           padding: const EdgeInsets.symmetric(horizontal: 7, vertical: 2),
                           decoration: BoxDecoration(
-                            color: AppTheme.statusDanger.withValues(alpha: 0.18),
+                            color: const Color(0xFFFF3B30).withValues(alpha: 0.18),
                             borderRadius: BorderRadius.circular(5),
-                            border: Border.all(color: AppTheme.statusDanger.withValues(alpha: 0.6)),
+                            border: Border.all(color: const Color(0xFFFF3B30).withValues(alpha: 0.6)),
                           ),
                           child: Row(
                             mainAxisSize: MainAxisSize.min,
                             children: [
-                              const Icon(Icons.warning_amber_rounded, size: 12, color: AppTheme.statusDanger),
+                              const Icon(Icons.warning_amber_rounded, size: 12, color: Color(0xFFFF3B30)),
                               const SizedBox(width: 4),
                               Flexible(
                                 child: Text(
-                                  'MISSING • $pickerName • $dateStr',
-                                  style: const TextStyle(fontSize: 11, fontWeight: FontWeight.bold, color: AppTheme.statusDanger),
+                                  '⚠️ MISSING • $pickerName${dateStr.isNotEmpty ? ' • $dateStr' : ''}',
+                                  style: const TextStyle(fontSize: 11, fontWeight: FontWeight.bold, color: Color(0xFFFF3B30)),
                                   overflow: TextOverflow.ellipsis,
                                 ),
                               ),
@@ -608,13 +768,45 @@ class _TreeNodeWidgetState extends State<_TreeNodeWidget> {
                         );
                       }),
                     ],
+                    // Picker Note badge
+                    if (userNote.isNotEmpty) ...[
+                      const SizedBox(height: 3),
+                      Container(
+                        padding: const EdgeInsets.symmetric(horizontal: 7, vertical: 2),
+                        decoration: BoxDecoration(
+                          color: const Color(0xFF00E5FF).withValues(alpha: 0.12),
+                          borderRadius: BorderRadius.circular(5),
+                          border: Border.all(color: const Color(0xFF00E5FF).withValues(alpha: 0.4)),
+                        ),
+                        child: Row(
+                          mainAxisSize: MainAxisSize.min,
+                          children: [
+                            const Icon(Icons.comment_rounded, size: 12, color: Color(0xFF00E5FF)),
+                            const SizedBox(width: 4),
+                            Flexible(
+                              child: Text(
+                                'Picker Note: $userNote',
+                                style: const TextStyle(fontSize: 11, fontWeight: FontWeight.w600, color: Color(0xFF00E5FF)),
+                                overflow: TextOverflow.ellipsis,
+                              ),
+                            ),
+                          ],
+                        ),
+                      ),
+                    ],
                     const SizedBox(height: 3),
                     Wrap(
                       crossAxisAlignment: WrapCrossAlignment.center,
                       spacing: 8,
                       runSpacing: 4,
                       children: [
-                        if (widget.node.partDescription != null && widget.node.partDescription!.isNotEmpty)
+                        if (widget.node.partDescription != null &&
+                            widget.node.partDescription!.isNotEmpty &&
+                            !(isManual &&
+                                (widget.node.partDescription == manualItem?.manualNote ||
+                                    widget.node.partDescription == firstItem?.manualNote ||
+                                    (manualItem?.manualNote.isNotEmpty ?? false))) &&
+                            !(isReplaced && widget.node.partDescription == firstItem.replacementNote))
                           Text(
                             widget.node.partDescription!,
                             style: const TextStyle(fontSize: 13, color: AppTheme.textMuted),
@@ -625,12 +817,12 @@ class _TreeNodeWidgetState extends State<_TreeNodeWidget> {
                           padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
                           decoration: BoxDecoration(
                             color: onHandInfo.isNotEmpty
-                                ? AppTheme.accentCyan.withOpacity(0.12)
-                                : AppTheme.cardDark.withOpacity(0.5),
+                                ? AppTheme.accentCyan.withValues(alpha: 0.12)
+                                : AppTheme.cardDark.withValues(alpha: 0.5),
                             borderRadius: BorderRadius.circular(4),
                             border: Border.all(
                               color: onHandInfo.isNotEmpty
-                                  ? AppTheme.accentCyan.withOpacity(0.4)
+                                  ? AppTheme.accentCyan.withValues(alpha: 0.4)
                                   : AppTheme.borderDark,
                             ),
                           ),
@@ -649,6 +841,33 @@ class _TreeNodeWidgetState extends State<_TreeNodeWidget> {
                                   fontSize: 11,
                                   color: onHandInfo.isNotEmpty ? AppTheme.accentCyan : AppTheme.textMuted,
                                   fontWeight: onHandInfo.isNotEmpty ? FontWeight.bold : FontWeight.w500,
+                                ),
+                              ),
+                            ],
+                          ),
+                        ),
+                        Container(
+                          padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
+                          decoration: BoxDecoration(
+                            color: AppTheme.cardDark.withValues(alpha: 0.5),
+                            borderRadius: BorderRadius.circular(4),
+                            border: Border.all(color: AppTheme.borderDark),
+                          ),
+                          child: Row(
+                            mainAxisSize: MainAxisSize.min,
+                            children: [
+                              const Icon(
+                                Icons.straighten_rounded,
+                                size: 12,
+                                color: AppTheme.textMuted,
+                              ),
+                              const SizedBox(width: 3),
+                              Text(
+                                'UOM: ${firstItem?.uom ?? "NA"}',
+                                style: const TextStyle(
+                                  fontSize: 11,
+                                  color: AppTheme.textMuted,
+                                  fontWeight: FontWeight.w600,
                                 ),
                               ),
                             ],

@@ -126,9 +126,9 @@ class _HomeScreenState extends State<HomeScreen> {
                             child: Container(
                               padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
                               decoration: BoxDecoration(
-                                color: AppTheme.accentCyan.withOpacity(0.12),
+                                color: AppTheme.accentCyan.withValues(alpha: 0.12),
                                 borderRadius: BorderRadius.circular(20),
-                                border: Border.all(color: AppTheme.accentCyan.withOpacity(0.4)),
+                                border: Border.all(color: AppTheme.accentCyan.withValues(alpha: 0.4)),
                               ),
                               child: Row(
                                 mainAxisSize: MainAxisSize.min,
@@ -153,9 +153,9 @@ class _HomeScreenState extends State<HomeScreen> {
                           Container(
                             padding: EdgeInsets.all(isCompact ? 14 : 20),
                             decoration: BoxDecoration(
-                              color: AppTheme.primaryBlue.withOpacity(0.12),
+                              color: AppTheme.primaryBlue.withValues(alpha: 0.12),
                               shape: BoxShape.circle,
-                              border: Border.all(color: AppTheme.accentCyan.withOpacity(0.4), width: 2),
+                              border: Border.all(color: AppTheme.accentCyan.withValues(alpha: 0.4), width: 2),
                             ),
                             child: Icon(
                               Icons.inventory_2_rounded,
@@ -350,7 +350,7 @@ class _HomeScreenState extends State<HomeScreen> {
                                     Icon(Icons.terminal_rounded, size: 12, color: AppTheme.accentCyan),
                                     SizedBox(width: 6),
                                     Text(
-                                      'Picklist Tracker • v1.01 • Build: 12/Aug/2026 • Production Tablet',
+                                      'Picklist Tracker • v1.02 • Build: 19/Sep/2026 • Production Tablet',
                                       style: TextStyle(
                                         fontSize: 10.5,
                                         fontWeight: FontWeight.w600,
@@ -381,9 +381,9 @@ class _HomeScreenState extends State<HomeScreen> {
     return Container(
       padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 3),
       decoration: BoxDecoration(
-        color: color.withOpacity(0.1),
+        color: color.withValues(alpha: 0.1),
         borderRadius: BorderRadius.circular(4),
-        border: Border.all(color: color.withOpacity(0.4)),
+        border: Border.all(color: color.withValues(alpha: 0.4)),
       ),
       child: Text(
         name,
@@ -428,10 +428,10 @@ class _RoleCard extends StatelessWidget {
           decoration: BoxDecoration(
             color: AppTheme.cardDark,
             borderRadius: BorderRadius.circular(20),
-            border: Border.all(color: borderColor.withOpacity(0.6), width: 1.5),
+            border: Border.all(color: borderColor.withValues(alpha: 0.6), width: 1.5),
             boxShadow: [
               BoxShadow(
-                color: borderColor.withOpacity(0.1),
+                color: borderColor.withValues(alpha: 0.1),
                 blurRadius: 24,
                 spreadRadius: 2,
               ),
@@ -443,7 +443,7 @@ class _RoleCard extends StatelessWidget {
               Container(
                 padding: EdgeInsets.all(isCompact ? 14 : 20),
                 decoration: BoxDecoration(
-                  color: iconColor.withOpacity(0.12),
+                  color: iconColor.withValues(alpha: 0.12),
                   shape: BoxShape.circle,
                 ),
                 child: Icon(icon, size: isCompact ? 40 : 52, color: iconColor),
@@ -471,9 +471,9 @@ class _RoleCard extends StatelessWidget {
               Container(
                 padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 10),
                 decoration: BoxDecoration(
-                  color: iconColor.withOpacity(0.15),
+                  color: iconColor.withValues(alpha: 0.15),
                   borderRadius: BorderRadius.circular(30),
-                  border: Border.all(color: iconColor.withOpacity(0.5)),
+                  border: Border.all(color: iconColor.withValues(alpha: 0.5)),
                 ),
                 child: Text(
                   'Continue as $title →',

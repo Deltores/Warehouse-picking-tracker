@@ -202,13 +202,13 @@ class GroupingEngine {
       // In Combined view: Unit → Resource ID → Part ID
       // In By Dept view: Unit → Resource ID → Department → Part ID
       if (bypassDepartmentLevel) {
-        return GroupingPreset(
+        return const GroupingPreset(
           id: 'preset_main_line_whole_resource_combined',
           name: 'Main Line Resource Combined (Unit → Resource ID → Part ID)',
           levels: [GroupLevel.unit, GroupLevel.resourceId, GroupLevel.partId],
         );
       } else {
-        return GroupingPreset(
+        return const GroupingPreset(
           id: 'preset_main_line_whole_resource_by_dept',
           name: 'Main Line Resource by Dept (Unit → Resource ID → Department → Part ID)',
           levels: [GroupLevel.unit, GroupLevel.resourceId, GroupLevel.department, GroupLevel.partId],

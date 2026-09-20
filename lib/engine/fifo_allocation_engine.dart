@@ -80,6 +80,22 @@ class FifoAllocationEngine {
       }
     }
 
+    // If remainingToPick > 0 and target items contain a manually added item,
+    // expand the manual item's quantity rather than truncating it.
+    if (remainingToPick > 0.0001) {
+      final manualIdx = updatedTargetItems.lastIndexWhere((it) => it.isManualAdd);
+      if (manualIdx >= 0) {
+        final manualItem = updatedTargetItems[manualIdx];
+        final newPicked = manualItem.qtyPicked + remainingToPick;
+        updatedTargetItems[manualIdx] = manualItem.copyWith(
+          qtyPicked: newPicked,
+          qtyRequired: newPicked,
+          qtyDue: 0.0,
+        );
+        remainingToPick = 0.0;
+      }
+    }
+
     // Reconstruct full item list preserving original indices
     final result = List<PicklistItem>.from(allItems);
     for (int i = 0; i < targetIndices.length; i++) {

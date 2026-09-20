@@ -91,7 +91,7 @@ class _SessionStartDialogState extends State<SessionStartDialog> {
                   Container(
                     padding: const EdgeInsets.all(10),
                     decoration: BoxDecoration(
-                      color: AppTheme.primaryBlue.withOpacity(0.15),
+                      color: AppTheme.primaryBlue.withValues(alpha: 0.15),
                       borderRadius: BorderRadius.circular(10),
                     ),
                     child: const Icon(Icons.badge_outlined, color: AppTheme.accentCyan, size: 28),

@@ -241,7 +241,11 @@ class _SessionExportScreenState extends State<SessionExportScreen>
       final unitItems = <String, List<PicklistItem>>{};
       final unitNames = <String, String>{};
       final unitReturnComments = <String, Map<String, List<String>>>{};
+      final unitRemoveComments = <String, Map<String, String>>{};
+      final unitManualPicks = <String, List<Map<String, dynamic>>>{};
       final unitAutoIssueResourceIds = <String, List<String>>{};
+      final unitPartNotes = <String, Map<String, String>>{};
+      final unitPartFlags = <String, Map<String, Map<String, dynamic>>>{};
       final autoIssueResourceIds = await widget.dbService.getAutoIssueResourceIds();
 
       for (final uid in allUnitIds) {
@@ -251,6 +255,18 @@ class _SessionExportScreenState extends State<SessionExportScreen>
         unitNames[uid] = u.name;
         unitItems[uid] = await widget.dbService.getPicklistItems(uid);
         unitReturnComments[uid] = await widget.dbService.getReturnCommentsForUnit(uid);
+        unitRemoveComments[uid] = await widget.dbService.getRemovedPartCommentsForUnit(uid);
+        unitManualPicks[uid] = await widget.dbService.getManualPicksForUnit(uid);
+        unitPartNotes[uid] = await widget.dbService.getUserPartNotesForUnit(uid);
+        final rawFlags = await widget.dbService.getPartFlags(uid);
+        final flagsMap = <String, Map<String, dynamic>>{};
+        for (final f in rawFlags) {
+          final pid = f['part_id']?.toString() ?? '';
+          if (pid.isNotEmpty && !flagsMap.containsKey(pid)) {
+            flagsMap[pid] = f;
+          }
+        }
+        unitPartFlags[uid] = flagsMap;
         final isAutoAlreadyExported = await widget.dbService.isUnitAutoIssueExported(uid);
         unitAutoIssueResourceIds[uid] = isAutoAlreadyExported ? <String>[] : autoIssueResourceIds;
       }
@@ -283,7 +299,12 @@ class _SessionExportScreenState extends State<SessionExportScreen>
         }
       }
 
-      if (totalPickedInBatch == 0 && !hasPendingAutoIssue) {
+      int totalManualPicks = 0;
+      for (final picks in unitManualPicks.values) {
+        totalManualPicks += picks.length;
+      }
+
+      if (totalPickedInBatch == 0 && !hasPendingAutoIssue && totalManualPicks == 0) {
         setState(() => _isLoading = false);
         if (mounted) {
           showDialog(
@@ -355,6 +376,10 @@ class _SessionExportScreenState extends State<SessionExportScreen>
         unitAutoIssueResourceIds: unitAutoIssueResourceIds,
         unitBatchPickedPartIds: unitBatchPickedPartIds,
         issuedStatus: issuedStatus,
+        unitRemoveComments: unitRemoveComments,
+        unitManualPicks: unitManualPicks,
+        unitPartNotes: unitPartNotes,
+        unitPartFlags: unitPartFlags,
       );
 
       // Single batchId grouping all sessions exported in this Super Session
@@ -406,7 +431,11 @@ class _SessionExportScreenState extends State<SessionExportScreen>
       final unitItems = <String, List<PicklistItem>>{};
       final unitNames = <String, String>{};
       final unitReturnComments = <String, Map<String, List<String>>>{};
+      final unitRemoveComments = <String, Map<String, String>>{};
+      final unitManualPicks = <String, List<Map<String, dynamic>>>{};
       final unitAutoIssueResourceIds = <String, List<String>>{};
+      final unitPartNotes = <String, Map<String, String>>{};
+      final unitPartFlags = <String, Map<String, Map<String, dynamic>>>{};
       final autoIssueResourceIds = await widget.dbService.getAutoIssueResourceIds();
 
       for (final uid in allUnitIds) {
@@ -416,6 +445,18 @@ class _SessionExportScreenState extends State<SessionExportScreen>
         unitNames[uid] = u.name;
         unitItems[uid] = await widget.dbService.getPicklistItems(uid);
         unitReturnComments[uid] = await widget.dbService.getReturnCommentsForUnit(uid);
+        unitRemoveComments[uid] = await widget.dbService.getRemovedPartCommentsForUnit(uid);
+        unitManualPicks[uid] = await widget.dbService.getManualPicksForUnit(uid);
+        unitPartNotes[uid] = await widget.dbService.getUserPartNotesForUnit(uid);
+        final rawFlags = await widget.dbService.getPartFlags(uid);
+        final flagsMap = <String, Map<String, dynamic>>{};
+        for (final f in rawFlags) {
+          final pid = f['part_id']?.toString() ?? '';
+          if (pid.isNotEmpty && !flagsMap.containsKey(pid)) {
+            flagsMap[pid] = f;
+          }
+        }
+        unitPartFlags[uid] = flagsMap;
         final isFirstBatch = batchSessions.any((s) => s.sessionSeqNo <= 1);
         unitAutoIssueResourceIds[uid] = isFirstBatch ? autoIssueResourceIds : <String>[];
       }
@@ -456,6 +497,10 @@ class _SessionExportScreenState extends State<SessionExportScreen>
         outputPath: outputPath,
         unitAutoIssueResourceIds: unitAutoIssueResourceIds,
         issuedStatus: issuedStatus,
+        unitRemoveComments: unitRemoveComments,
+        unitManualPicks: unitManualPicks,
+        unitPartNotes: unitPartNotes,
+        unitPartFlags: unitPartFlags,
       );
 
       await _loadSessions();
@@ -1174,7 +1219,7 @@ class _SessionExportScreenState extends State<SessionExportScreen>
           crossAxisAlignment: CrossAxisAlignment.start,
           children: [
             Row(children: [
-              Container(width: 10, height: 10, decoration: BoxDecoration(color: statusColor, shape: BoxShape.circle)),
+              Container(width: 10, height: 10, decoration: const BoxDecoration(color: statusColor, shape: BoxShape.circle)),
               const SizedBox(width: 10),
               Expanded(
                 child: Column(
@@ -1199,7 +1244,7 @@ class _SessionExportScreenState extends State<SessionExportScreen>
                   borderRadius: BorderRadius.circular(20),
                   border: Border.all(color: statusColor.withValues(alpha: 0.5)),
                 ),
-                child: Text(statusLabel, style: TextStyle(fontSize: 11, fontWeight: FontWeight.bold, color: statusColor)),
+                child: const Text(statusLabel, style: TextStyle(fontSize: 11, fontWeight: FontWeight.bold, color: statusColor)),
               ),
             ]),
             if (unit != null)

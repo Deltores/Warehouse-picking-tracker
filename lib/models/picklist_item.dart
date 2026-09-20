@@ -28,6 +28,11 @@ class PicklistItem {
   final String onHand;
   final String deptType; // 'MAIN LINE' | 'SUBASSEMBLY' | ''
   final Map<String, dynamic> rawColumns;
+  // Part ID replacement tracking (Replace Part ID feature)
+  final String replacedPartId;   // original Part ID if this item was re-keyed
+  final String replacementNote;  // mandatory comment entered when replacing
+  final int? replacedAt;         // timestamp (ms since epoch) of replacement
+  final String replacedBy;       // worker name who performed the replacement
 
   PicklistItem({
     required this.id,
@@ -49,6 +54,10 @@ class PicklistItem {
     this.onHand = '',
     this.deptType = '',
     this.rawColumns = const {},
+    this.replacedPartId = '',
+    this.replacementNote = '',
+    this.replacedAt,
+    this.replacedBy = '',
   });
 
   static String formatQty(double val) {
@@ -63,6 +72,51 @@ class PicklistItem {
   String get qtyRequiredStr => formatQty(qtyRequired);
   String get qtyDueStr => formatQty(qtyDue);
   String get qtyPickedStr => formatQty(qtyPicked);
+
+  bool get isManualAdd {
+    final flag = rawColumns['_manual_add'];
+    return flag == true || flag == 1 || flag == 'true';
+  }
+  String get manualNote => rawColumns['_manual_note']?.toString() ?? '';
+  String get manualWorker => rawColumns['_manual_worker']?.toString() ?? '';
+
+  bool get isRemoved {
+    final flag = rawColumns['_is_removed'];
+    return flag == true || flag == 1 || flag == 'true';
+  }
+  String get removeNote => rawColumns['_remove_note']?.toString() ?? '';
+  String get removeWorker => rawColumns['_remove_worker']?.toString() ?? '';
+
+  String get uom {
+    final raw = rawColumns['_uom'] ??
+        rawColumns['uom'] ??
+        rawColumns['UOM'] ??
+        rawColumns['Unit of Measure'] ??
+        rawColumns['UNIT OF MEASURE'] ??
+        rawColumns['UM'] ??
+        rawColumns['Um'];
+    if (raw != null) {
+      final s = raw.toString().trim();
+      if (s.isNotEmpty && s.toLowerCase() != 'null') return s;
+    }
+    return 'NA';
+  }
+
+  String get uomLabel => formatUom(uom);
+
+  static String formatUom(String? rawUom) {
+    final u = rawUom?.trim() ?? '';
+    final upper = u.toUpperCase();
+    if (upper.isEmpty ||
+        upper == 'NA' ||
+        upper == 'N/A' ||
+        upper == 'EA' ||
+        upper == 'PCS' ||
+        upper == 'PC') {
+      return 'PCS';
+    }
+    return u;
+  }
 
   PicklistItem copyWith({
     String? id,
@@ -84,7 +138,19 @@ class PicklistItem {
     String? onHand,
     String? deptType,
     Map<String, dynamic>? rawColumns,
+    bool? isRemoved,
+    String? replacedPartId,
+    String? replacementNote,
+    int? replacedAt,
+    bool clearReplacedAt = false,
+    String? replacedBy,
   }) {
+    Map<String, dynamic>? updatedRaw = rawColumns != null ? Map<String, dynamic>.from(rawColumns) : null;
+    if (isRemoved != null) {
+      updatedRaw ??= Map<String, dynamic>.from(this.rawColumns);
+      updatedRaw['_is_removed'] = isRemoved;
+    }
+
     return PicklistItem(
       id: id ?? this.id,
       unitId: unitId ?? this.unitId,
@@ -104,7 +170,11 @@ class PicklistItem {
       componentResourceId: componentResourceId ?? this.componentResourceId,
       onHand: onHand ?? this.onHand,
       deptType: deptType ?? this.deptType,
-      rawColumns: rawColumns ?? this.rawColumns,
+      rawColumns: updatedRaw ?? this.rawColumns,
+      replacedPartId: replacedPartId ?? this.replacedPartId,
+      replacementNote: replacementNote ?? this.replacementNote,
+      replacedAt: clearReplacedAt ? null : (replacedAt ?? this.replacedAt),
+      replacedBy: replacedBy ?? this.replacedBy,
     );
   }
 
@@ -129,6 +199,10 @@ class PicklistItem {
       'on_hand': onHand,
       'dept_type': deptType,
       'raw_columns': jsonEncode(rawColumns),
+      'replaced_part_id': replacedPartId,
+      'replacement_note': replacementNote,
+      'replaced_at': replacedAt,
+      'replaced_by': replacedBy,
     };
   }
 
@@ -163,6 +237,10 @@ class PicklistItem {
       onHand: (map['on_hand'] ?? '') as String,
       deptType: (map['dept_type'] ?? '') as String,
       rawColumns: parsedRaw,
+      replacedPartId: (map['replaced_part_id'] ?? '') as String,
+      replacementNote: (map['replacement_note'] ?? '') as String,
+      replacedAt: (map['replaced_at'] as num?)?.toInt(),
+      replacedBy: (map['replaced_by'] ?? '') as String,
     );
   }
 }

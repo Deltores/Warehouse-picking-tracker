@@ -1,4 +1,6 @@
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
+import 'package:intl/intl.dart';
 
 import '../../engine/column_mapper.dart';
 import '../../engine/fifo_allocation_engine.dart';
@@ -70,6 +72,16 @@ class _PickModeScreenState extends State<PickModeScreen> with WidgetsBindingObse
   late UnitRecord _unit;
   int _currentIndex = 0;
   final Set<String> _flaggedMissingParts = {};
+  final Map<String, Map<String, dynamic>> _missingPartDetails = {};
+  // Parts flagged as REMOVED FROM PICKING (greyed out, excluded from auto-advance)
+  final Set<String> _removedFromPickingParts = {};
+  final Map<String, String> _removedPartComments = {};
+  // Map of current partId → original (replaced) partId for display
+  final Map<String, String> _replacedPartIds = {};
+  // Free-form picker notes map: partId → note
+  final Map<String, String> _userPartNotes = {};
+  // Expanded Work Orders per partId
+  final Set<String> _expandedWoPartIds = {};
   String _inputBuffer = '';
   bool _autoAdvance = false;
 
@@ -88,20 +100,47 @@ class _PickModeScreenState extends State<PickModeScreen> with WidgetsBindingObse
   String _fullyPickedPartId = '';
 
   SessionMetadata? _session;
+  String? _initialTargetPartId;
 
   @override
   void initState() {
     super.initState();
     WidgetsBinding.instance.addObserver(this);
     _session = widget.activeSession;
-    _currentParts = List.from(widget.partSummaries);
-    _currentIndex = widget.startIndex.clamp(
-        0, _currentParts.isEmpty ? 0 : _currentParts.length - 1);
+    final initialPart = (widget.startIndex >= 0 && widget.startIndex < widget.partSummaries.length)
+        ? widget.partSummaries[widget.startIndex]
+        : null;
+    _initialTargetPartId = initialPart?.partId;
+
+    _currentParts = widget.partSummaries.where((p) {
+      if (!p.isRemoved) return true;
+      if (initialPart != null && p.partId.trim().toUpperCase() == initialPart.partId.trim().toUpperCase()) {
+        return true;
+      }
+      return false;
+    }).toList();
+
+    _currentIndex = initialPart != null
+        ? _currentParts.indexWhere((p) => p.partId.trim().toUpperCase() == initialPart.partId.trim().toUpperCase())
+        : 0;
+    if (_currentIndex < 0) _currentIndex = 0;
     _pageController = PageController(initialPage: _currentIndex);
     _items = List.from(widget.allDeptItems);
     _unit = widget.unit;
     _loadSettings();
     _loadMissingParts();
+    _loadRemovedParts();
+    _loadReplacedPartIds();
+    _loadUserPartNotes();
+  }
+
+  Future<void> _loadUserPartNotes() async {
+    final notes = await widget.dbService.getUserPartNotesForUnit(_unit.id);
+    if (mounted) {
+      setState(() {
+        _userPartNotes.addAll(notes);
+      });
+    }
   }
 
   Future<void> _loadSettings() async {
@@ -113,14 +152,70 @@ class _PickModeScreenState extends State<PickModeScreen> with WidgetsBindingObse
     final flags = _isResourceScope
         ? await widget.dbService.getPartFlags(_unit.id)
         : await widget.dbService.getPartFlags(_unit.id, department: widget.department);
-    final missing = flags
-        .where((f) => f['flag_type']?.toString().toUpperCase() == 'MISSING')
-        .map((f) => f['part_id']?.toString() ?? '')
-        .where((id) => id.isNotEmpty)
-        .toSet();
+    final missing = <String>{};
+    final details = <String, Map<String, dynamic>>{};
+    for (final f in flags) {
+      if (f['flag_type']?.toString().toUpperCase() == 'MISSING') {
+        final pid = f['part_id']?.toString() ?? '';
+        if (pid.isNotEmpty) {
+          missing.add(pid);
+          details[pid] = f;
+        }
+      }
+    }
     if (mounted) {
       setState(() {
         _flaggedMissingParts.addAll(missing);
+        _missingPartDetails.addAll(details);
+      });
+    }
+  }
+
+  /// Loads all parts flagged as REMOVED FROM PICKING for the current scope.
+  Future<void> _loadRemovedParts() async {
+    final dept = _isResourceScope ? null : widget.department;
+    final removed = await widget.dbService.getRemovedFromPickingParts(
+      _unit.id,
+      department: dept,
+    );
+    final comments = await widget.dbService.getRemovedPartCommentsForUnit(
+      _unit.id,
+      department: dept,
+    );
+    if (mounted) {
+      setState(() {
+        _removedFromPickingParts.addAll(removed);
+        _removedPartComments.addAll(comments);
+        // Exclude removed parts from Pick Mode carousel, except for the initially targeted part
+        _currentParts.removeWhere((p) {
+          final isRemoved = p.isRemoved || _removedFromPickingParts.contains(p.partId);
+          if (!isRemoved) return false;
+          if (_initialTargetPartId != null && p.partId.trim().toUpperCase() == _initialTargetPartId!.trim().toUpperCase()) {
+            return false;
+          }
+          return true;
+        });
+        if (_currentIndex >= _currentParts.length) {
+          _currentIndex = _currentParts.isEmpty ? 0 : _currentParts.length - 1;
+        }
+        if (_currentParts.isNotEmpty && _pageController.hasClients) {
+          _pageController.jumpToPage(_currentIndex);
+        }
+      });
+    }
+  }
+
+  /// Loads the replaced Part ID map (currentPartId → originalPartId) from loaded items.
+  void _loadReplacedPartIds() {
+    final map = <String, String>{};
+    for (final item in _items) {
+      if (item.replacedPartId.isNotEmpty) {
+        map[item.partId] = item.replacedPartId;
+      }
+    }
+    if (mounted) {
+      setState(() {
+        _replacedPartIds.addAll(map);
       });
     }
   }
@@ -273,12 +368,22 @@ class _PickModeScreenState extends State<PickModeScreen> with WidgetsBindingObse
 
     final previousItems = List<PicklistItem>.from(_items);
 
-    final updatedList = FifoAllocationEngine.allocateByPartId(
+    final wasRemoved = part.isRemoved || _removedFromPickingParts.contains(part.partId);
+
+    var updatedList = FifoAllocationEngine.allocateByPartId(
       allItems: _items,
       department: widget.department,
       partId: part.partId,
       totalPickedToAllocate: newTotal,
     );
+    if (wasRemoved) {
+      updatedList = updatedList.map<PicklistItem>((i) {
+        if (i.partId.toLowerCase().trim() == part.partId.toLowerCase().trim()) {
+          return i.copyWith(isRemoved: false);
+        }
+        return i;
+      }).toList();
+    }
 
     final newTotalPicked = updatedList.fold<double>(0.0, (sum, i) => sum + i.qtyPicked).round();
     final nowMs = DateTime.now().millisecondsSinceEpoch;
@@ -323,6 +428,13 @@ class _PickModeScreenState extends State<PickModeScreen> with WidgetsBindingObse
               qtyPickedDelta: itemDelta,
             );
           }
+          if (item.isManualAdd) {
+            await widget.dbService.updateManualPickQuantity(
+              unitId: _unit.id,
+              partId: item.partId,
+              newQty: item.qtyPicked,
+            );
+          }
         }
       }
       final pickedCount = await widget.dbService.getSessionPickedPartCount(_session!.id);
@@ -342,24 +454,47 @@ class _PickModeScreenState extends State<PickModeScreen> with WidgetsBindingObse
     }
     widget.onItemsUpdated?.call(updatedList);
 
-    // If part was flagged MISSING and is now fully picked, clear the flag and badge
-    if (isNowFullyPicked) {
-      if (_flaggedMissingParts.contains(part.partId)) {
-        await widget.dbService.clearPartFlag(
-          unitId: _unit.id,
-          partId: part.partId,
-          department: widget.department,
-          flagType: 'MISSING',
-        );
-        if (mounted) {
-          setState(() {
-            _flaggedMissingParts.remove(part.partId);
-          });
-        }
+    // If part was marked REMOVED and is now picked, unmark REMOVED status
+    if (wasRemoved) {
+      await widget.dbService.unmarkPartRemoval(
+        unitId: _unit.id,
+        partId: part.partId,
+        department: widget.department,
+        resourceId: _isResourceScope ? _targetResourceName : null,
+      );
+      if (mounted) {
+        setState(() {
+          _removedFromPickingParts.remove(part.partId);
+          _removedPartComments.remove(part.partId);
+          if (_initialTargetPartId?.toUpperCase() == part.partId.toUpperCase()) {
+            _initialTargetPartId = null;
+          }
+          for (int i = 0; i < _currentParts.length; i++) {
+            if (_currentParts[i].partId.toUpperCase() == part.partId.toUpperCase()) {
+              _currentParts[i] = _currentParts[i].copyWith(isRemoved: false);
+            }
+          }
+        });
       }
     }
 
-    LogService.picker('PICK: ${part.partId} +${PartSummary.formatQty(delta)} pcs (${PartSummary.formatQty(newTotal)}/${PartSummary.formatQty(requiredQty)}) → Unit: ${_unit.name}, Dept: ${widget.department}, Line: ${widget.lineLabel ?? "Default"}');
+    // If part was flagged MISSING and is now picked, clear the flag and badge immediately
+    if (_flaggedMissingParts.contains(part.partId)) {
+      await widget.dbService.clearPartFlag(
+        unitId: _unit.id,
+        partId: part.partId,
+        department: widget.department,
+        flagType: 'MISSING',
+      );
+      if (mounted) {
+        setState(() {
+          _flaggedMissingParts.remove(part.partId);
+          _missingPartDetails.remove(part.partId);
+        });
+      }
+    }
+
+    LogService.picker('PICK: ${part.partId} +${PartSummary.formatQty(delta)} ${part.uomLabel} (${PartSummary.formatQty(newTotal)}/${PartSummary.formatQty(requiredQty)}) → Unit: ${_unit.name}, Dept: ${widget.department}, Line: ${widget.lineLabel ?? "Default"}');
 
     // Show banner + optional auto-advance
     if (isNowFullyPicked && mounted) {
@@ -441,7 +576,7 @@ class _PickModeScreenState extends State<PickModeScreen> with WidgetsBindingObse
     if (delta > dueQty + 0.0001) {
       ScaffoldMessenger.of(context).showSnackBar(
         SnackBar(
-          content: Text('Cannot pick more than remaining due (${PartSummary.formatQty(dueQty)} pcs).'),
+          content: Text('Cannot pick more than remaining due (${PartSummary.formatQty(dueQty)} ${part.uomLabel}).'),
           backgroundColor: AppTheme.statusDanger,
         ),
       );
@@ -465,6 +600,29 @@ class _PickModeScreenState extends State<PickModeScreen> with WidgetsBindingObse
   }
 
   void _goToNextPart() {
+    final currentPart = _currentParts.isNotEmpty ? _currentParts[_currentIndex] : null;
+    final isCurrentPartRemoved = currentPart != null &&
+        (currentPart.isRemoved || _removedFromPickingParts.contains(currentPart.partId));
+
+    if (isCurrentPartRemoved) {
+      if (_initialTargetPartId != null &&
+          _initialTargetPartId!.trim().toUpperCase() == currentPart.partId.trim().toUpperCase()) {
+        _initialTargetPartId = null;
+      }
+      final targetIdx = _currentIndex < _currentParts.length - 1 ? _currentIndex : 0;
+      setState(() {
+        _currentParts.removeAt(_currentIndex);
+        _inputBuffer = '';
+        _currentIndex = _currentParts.isEmpty ? 0 : targetIdx.clamp(0, _currentParts.length - 1);
+      });
+      if (_currentParts.isEmpty) {
+        _handleAllPartsFinished();
+        return;
+      }
+      _pageController.jumpToPage(_currentIndex);
+      return;
+    }
+
     if (_currentIndex < _currentParts.length - 1) {
       LogService.info('USER_ACTION', 'PickMode: Next (idx $_currentIndex)');
       _pageController.nextPage(
@@ -474,25 +632,15 @@ class _PickModeScreenState extends State<PickModeScreen> with WidgetsBindingObse
     } else {
       // Reached the end -> Smoothly animate back to the first incomplete part!
       final targetIdx = _currentParts.indexWhere((p) {
+        final isRemoved = p.isRemoved || _removedFromPickingParts.contains(p.partId);
+        if (isRemoved) return false;
         final isMissing = _flaggedMissingParts.contains(p.partId);
         final due = _getDueQty(p.partId);
         return due > 0.0001 || isMissing;
       });
 
       if (targetIdx == -1) {
-        LogService.picker('PickMode: all parts complete in ${widget.department}');
-        ScaffoldMessenger.of(context).showSnackBar(
-          const SnackBar(
-            content: Text('All parts for this department have been picked!'),
-            backgroundColor: AppTheme.statusComplete,
-            duration: Duration(seconds: 3),
-          ),
-        );
-        if (widget.onFinished != null) {
-          widget.onFinished!();
-        } else {
-          Navigator.of(context).maybePop();
-        }
+        _handleAllPartsFinished();
         return;
       }
 
@@ -511,6 +659,29 @@ class _PickModeScreenState extends State<PickModeScreen> with WidgetsBindingObse
   }
 
   void _goToPrevPart() {
+    final currentPart = _currentParts.isNotEmpty ? _currentParts[_currentIndex] : null;
+    final isCurrentPartRemoved = currentPart != null &&
+        (currentPart.isRemoved || _removedFromPickingParts.contains(currentPart.partId));
+
+    if (isCurrentPartRemoved) {
+      if (_initialTargetPartId != null &&
+          _initialTargetPartId!.trim().toUpperCase() == currentPart.partId.trim().toUpperCase()) {
+        _initialTargetPartId = null;
+      }
+      final targetIdx = (_currentIndex - 1).clamp(0, _currentParts.length - 2);
+      setState(() {
+        _currentParts.removeAt(_currentIndex);
+        _inputBuffer = '';
+        _currentIndex = targetIdx < 0 ? 0 : targetIdx;
+      });
+      if (_currentParts.isEmpty) {
+        _handleAllPartsFinished();
+        return;
+      }
+      _pageController.jumpToPage(_currentIndex);
+      return;
+    }
+
     if (_currentIndex > 0) {
       LogService.picker('PickMode: Previous (idx $_currentIndex)');
       _pageController.previousPage(
@@ -520,9 +691,32 @@ class _PickModeScreenState extends State<PickModeScreen> with WidgetsBindingObse
     }
   }
 
+  void _handleAllPartsFinished() {
+    LogService.picker('PickMode: all parts complete in ${widget.department}');
+    ScaffoldMessenger.of(context).showSnackBar(
+      const SnackBar(
+        content: Text('All parts for this department have been picked!'),
+        backgroundColor: AppTheme.statusComplete,
+        duration: Duration(seconds: 3),
+      ),
+    );
+    if (widget.onFinished != null) {
+      widget.onFinished!();
+    } else {
+      Navigator.of(context).maybePop();
+    }
+  }
+
   Future<void> _markPartMissing(PartSummary part) async {
+    final worker = widget.activeSession?.workerName ?? _session?.workerName ?? 'Picker';
+    final now = DateTime.now().millisecondsSinceEpoch;
     setState(() {
       _flaggedMissingParts.add(part.partId);
+      _missingPartDetails[part.partId] = {
+        'worker_name': worker,
+        'note': 'Marked missing by $worker in Pick Mode',
+        'created_at': now,
+      };
       _inputBuffer = '';
     });
 
@@ -531,7 +725,7 @@ class _PickModeScreenState extends State<PickModeScreen> with WidgetsBindingObse
       partId: part.partId,
       department: widget.department,
       flagType: 'MISSING',
-      note: 'Marked missing by ${widget.activeSession?.workerName ?? 'Picker'} in Pick Mode',
+      note: 'Marked missing by $worker in Pick Mode',
     );
 
     LogService.picker('MISSING flagged: ${part.partId}');
@@ -550,7 +744,894 @@ class _PickModeScreenState extends State<PickModeScreen> with WidgetsBindingObse
     _goToNextPart();
   }
 
+  // ---------------------------------------------------------------------------
+  // MANUAL ADD PART (Pick Mode only)
+  // ---------------------------------------------------------------------------
+
+  /// Shows the manual part addition dialog. Only available in Pick Mode.
+  /// Worker enters Part ID (any), quantity, and a mandatory description ≥10 chars.
+  Future<void> _showManualAddPartDialog() async {
+    if (_session == null) return;
+    final partIdController = TextEditingController();
+    final noteController = TextEditingController();
+    String qtyBuffer = '1';
+
+    await showDialog<void>(
+      context: context,
+      barrierDismissible: false,
+      builder: (ctx) {
+        return StatefulBuilder(builder: (ctx, setDlgState) {
+          final scopePartIds = _items
+              .where((i) => _itemMatchesScope(i))
+              .map((i) => i.partId.trim().toUpperCase())
+              .toSet();
+          final noteLen = noteController.text.trim().length;
+          final isNoteOk = noteLen >= 10;
+          final rawPartId = partIdController.text.trim().toUpperCase();
+          final isLengthOk = rawPartId.length >= 8;
+          final isValidPartId = RegExp(r'^[A-Z0-9]+$').hasMatch(rawPartId);
+          final isDuplicate = rawPartId.isNotEmpty && scopePartIds.contains(rawPartId);
+          final isPartIdOk = isValidPartId && isLengthOk && !isDuplicate;
+          final parsedQty = double.tryParse(qtyBuffer) ?? 0.0;
+          final isQtyOk = parsedQty > 0.0001;
+          final canConfirm = isPartIdOk && isQtyOk && isNoteOk;
+
+          void tapKey(String k) {
+            setDlgState(() {
+              if (k == '⌫') {
+                if (qtyBuffer.isNotEmpty) qtyBuffer = qtyBuffer.substring(0, qtyBuffer.length - 1);
+              } else if (k == 'C') {
+                qtyBuffer = '';
+              } else if (k == '.') {
+                if (!qtyBuffer.contains('.')) qtyBuffer = qtyBuffer.isEmpty ? '0.' : '$qtyBuffer.';
+              } else {
+                if (qtyBuffer.contains('.')) {
+                  final parts = qtyBuffer.split('.');
+                  if (parts.length > 1 && parts[1].length >= 2) return;
+                }
+                qtyBuffer = qtyBuffer == '0' ? k : '$qtyBuffer$k';
+              }
+            });
+          }
+
+          Widget keyBtn(String label) => Expanded(
+                child: Padding(
+                  padding: const EdgeInsets.all(3),
+                  child: ElevatedButton(
+                    style: ElevatedButton.styleFrom(
+                      backgroundColor: AppTheme.bgDark,
+                      foregroundColor: AppTheme.textLight,
+                      padding: const EdgeInsets.symmetric(vertical: 12),
+                      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(6)),
+                    ),
+                    onPressed: () => tapKey(label),
+                    child: Text(label, style: const TextStyle(fontSize: 18, fontWeight: FontWeight.bold)),
+                  ),
+                ),
+              );
+
+          return AlertDialog(
+            backgroundColor: AppTheme.cardDark,
+            shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
+            title: const Row(children: [
+              Icon(Icons.add_circle_outline_rounded, color: AppTheme.accentCyan, size: 22),
+              SizedBox(width: 8),
+              Text('Add Part Manually', style: TextStyle(color: AppTheme.textLight, fontSize: 18)),
+            ]),
+            content: SizedBox(
+              width: 480,
+              child: SingleChildScrollView(
+                child: Column(
+                  mainAxisSize: MainAxisSize.min,
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    // Part ID input
+                    TextField(
+                      controller: partIdController,
+                      autofocus: true,
+                      textCapitalization: TextCapitalization.characters,
+                      inputFormatters: [_UpperAlphanumericInputFormatter()],
+                      style: const TextStyle(color: AppTheme.textLight, fontSize: 16, letterSpacing: 1.2),
+                      decoration: InputDecoration(
+                        labelText: 'Part ID (min 8 chars) *',
+                        labelStyle: const TextStyle(color: AppTheme.textMuted),
+                        hintText: 'UPPERCASE, digits only',
+                        hintStyle: const TextStyle(color: AppTheme.textMuted),
+                        filled: true,
+                        fillColor: AppTheme.bgDark,
+                        errorText: isDuplicate
+                            ? 'Part ID already exists in this ${_isResourceScope ? "Resource" : "Department"}'
+                            : (rawPartId.isNotEmpty && !isValidPartId
+                                ? 'Only uppercase letters (A-Z) and digits (0-9) allowed'
+                                : (rawPartId.isNotEmpty && !isLengthOk
+                                    ? '${rawPartId.length}/8 min characters required'
+                                    : null)),
+                        helperText: rawPartId.isNotEmpty && isValidPartId && isLengthOk
+                            ? '${rawPartId.length} chars — OK'
+                            : null,
+                      ),
+                      onChanged: (_) => setDlgState(() {}),
+                    ),
+                    const SizedBox(height: 12),
+                    // Quantity display
+                    Container(
+                      padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+                      decoration: BoxDecoration(
+                        color: AppTheme.bgDark,
+                        borderRadius: BorderRadius.circular(8),
+                        border: Border.all(color: AppTheme.accentCyan.withValues(alpha: 0.5)),
+                      ),
+                      child: Row(
+                        mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                        children: [
+                          const Text('QTY PICKED:', style: TextStyle(fontSize: 11, color: AppTheme.textMuted, fontWeight: FontWeight.bold)),
+                          Text(
+                            qtyBuffer.isEmpty ? '0' : qtyBuffer,
+                            style: const TextStyle(fontSize: 28, fontWeight: FontWeight.bold, color: AppTheme.accentCyan),
+                          ),
+                        ],
+                      ),
+                    ),
+                    const SizedBox(height: 8),
+                    // Mini keypad
+                    for (final row in [
+                      ['1', '2', '3'],
+                      ['4', '5', '6'],
+                      ['7', '8', '9'],
+                      ['.', '0', '⌫'],
+                    ])
+                      Row(children: row.map(keyBtn).toList()),
+                    const SizedBox(height: 12),
+                    // Description/note
+                    TextField(
+                      controller: noteController,
+                      keyboardType: TextInputType.multiline,
+                      minLines: 2,
+                      maxLines: 5,
+                      style: const TextStyle(color: AppTheme.textLight, fontSize: 14),
+                      decoration: const InputDecoration(
+                        labelText: 'Description / Note (min 10 characters) *',
+                        labelStyle: TextStyle(color: AppTheme.textMuted, fontSize: 13),
+                        hintText: 'Why was this part added manually?',
+                        hintStyle: TextStyle(color: AppTheme.textMuted, fontSize: 12),
+                        filled: true,
+                        fillColor: AppTheme.bgDark,
+                      ),
+                      onChanged: (_) => setDlgState(() {}),
+                    ),
+                    const SizedBox(height: 4),
+                  Row(children: [
+                    Icon(
+                      isNoteOk ? Icons.check_circle_rounded : Icons.info_outline_rounded,
+                      size: 14,
+                      color: isNoteOk ? AppTheme.statusComplete : AppTheme.textMuted,
+                    ),
+                    const SizedBox(width: 4),
+                    Text(
+                      isNoteOk ? '$noteLen/10 chars — OK' : '$noteLen/10 min chars required',
+                      style: TextStyle(fontSize: 11, color: isNoteOk ? AppTheme.statusComplete : AppTheme.textMuted),
+                    ),
+                  ]),
+                ],
+              ),
+            ),
+            ),
+            actions: [
+              TextButton(
+                child: const Text('Cancel', style: TextStyle(color: AppTheme.textMuted)),
+                onPressed: () => Navigator.of(ctx).pop(),
+              ),
+              ElevatedButton.icon(
+                style: ElevatedButton.styleFrom(
+                  backgroundColor: canConfirm ? AppTheme.accentCyan : AppTheme.bgDark,
+                  foregroundColor: canConfirm ? Colors.black : AppTheme.textMuted,
+                ),
+                icon: const Icon(Icons.add_rounded, size: 18),
+                label: Text('Add ${qtyBuffer.isEmpty ? '' : qtyBuffer} PCS', style: const TextStyle(fontWeight: FontWeight.bold)),
+                onPressed: canConfirm
+                    ? () async {
+                        Navigator.of(ctx).pop();
+                        await _commitManualAdd(
+                          partId: partIdController.text.trim().toUpperCase(),
+                          qty: parsedQty,
+                          note: noteController.text.trim(),
+                        );
+                      }
+                    : null,
+              ),
+            ],
+          );
+        });
+      },
+    );
+  }
+
+  /// Commits a manually added part: ensures session is active, records in DB, updates local state.
+  Future<void> _commitManualAdd({required String partId, required double qty, required String note}) async {
+    await _ensureSessionPersisted();
+    final sessionId = _session?.id ?? '';
+    final workerName = _session?.workerName ?? widget.activeSession?.workerName ?? 'Picker';
+
+    // Find the best reference item from the active picking context
+    final currentPart = _currentParts.isNotEmpty
+        ? _currentParts[_currentIndex.clamp(0, _currentParts.length - 1)]
+        : null;
+
+    PicklistItem? sampleItem;
+    if (currentPart != null) {
+      for (final it in widget.allDeptItems) {
+        if (it.partId.trim().toUpperCase() == currentPart.partId.trim().toUpperCase()) {
+          sampleItem = it;
+          break;
+        }
+      }
+    }
+    if (sampleItem == null && widget.allDeptItems.isNotEmpty) {
+      sampleItem = widget.allDeptItems.first;
+    }
+    sampleItem ??= _items.where((i) => _itemMatchesScope(i)).firstOrNull;
+    sampleItem ??= _items.firstOrNull;
+
+    final workOrder = sampleItem?.workOrder.isNotEmpty == true && sampleItem!.workOrder != 'WO-0'
+        ? sampleItem.workOrder
+        : 'MANUAL';
+
+    final deptFromLabel = (widget.lineLabel != null && widget.lineLabel!.startsWith('Department: '))
+        ? widget.lineLabel!.substring('Department: '.length).trim()
+        : '';
+    final dept = deptFromLabel.isNotEmpty
+        ? deptFromLabel
+        : (_isResourceScope
+            ? (sampleItem?.department.isNotEmpty == true ? sampleItem!.department : 'MAIN LINE')
+            : widget.department);
+
+    String line = '';
+    if (sampleItem != null && sampleItem.line.isNotEmpty) {
+      line = sampleItem.line;
+    } else if (widget.lineLabel != null && widget.lineLabel!.isNotEmpty) {
+      if (widget.lineLabel!.startsWith('Line: ')) {
+        line = widget.lineLabel!.substring('Line: '.length).trim();
+      } else if (!widget.lineLabel!.startsWith('Department: ') && !widget.lineLabel!.startsWith('Resource')) {
+        line = widget.lineLabel!.trim();
+      }
+    }
+
+    final resId = _isResourceScope ? _targetResourceName : (sampleItem?.resourceId ?? '');
+    final compResId = sampleItem?.componentResourceId.isNotEmpty == true
+        ? sampleItem!.componentResourceId
+        : resId;
+    final subUnit = sampleItem?.subUnit.isNotEmpty == true
+        ? sampleItem!.subUnit
+        : (_unit.name.isNotEmpty ? _unit.name : _unit.id);
+    final deptType = sampleItem?.deptType.isNotEmpty == true
+        ? sampleItem!.deptType
+        : (_isResourceScope ? 'MAIN LINE' : '');
+    final pickDate = sampleItem?.pickDate ?? '';
+    final prodDate = sampleItem?.prodDate ?? '';
+    final uom = sampleItem != null && sampleItem.uom != 'NA' ? sampleItem.uom : 'EA';
+
+    final newItem = await widget.dbService.recordManualPick(
+      unitId: _unit.id,
+      sessionId: sessionId,
+      workerName: workerName,
+      department: dept,
+      workOrder: workOrder,
+      partId: partId,
+      qtyPicked: qty,
+      note: note,
+      line: line,
+      resourceId: resId,
+      componentResourceId: compResId,
+      subUnit: subUnit,
+      deptType: deptType,
+      pickDate: pickDate,
+      prodDate: prodDate,
+      uom: uom,
+    );
+
+    // Also record in session_picks so it appears in session metrics
+    if (sessionId.isNotEmpty) {
+      await widget.dbService.recordSessionPick(
+        sessionId: sessionId,
+        unitId: _unit.id,
+        itemId: newItem.id,
+        partId: partId,
+        qtyPickedDelta: qty,
+      );
+      final pickedCount = await widget.dbService.getSessionPickedPartCount(sessionId);
+      await widget.dbService.updateSessionProgress(sessionId, pickedCount);
+      if (mounted) {
+        setState(() {
+          _session = _session?.copyWith(totalItemsPicked: pickedCount);
+        });
+      }
+    }
+
+    final updatedItems = await widget.dbService.getPicklistItems(_unit.id);
+    final updatedUnit = (await widget.dbService.getUnit(_unit.id)) ?? _unit;
+    final newSummary = PartSummary.fromItem(newItem);
+
+    if (mounted) {
+      setState(() {
+        _items = updatedItems;
+        _unit = updatedUnit;
+        _currentParts = [..._currentParts, newSummary];
+        _currentIndex = _currentParts.length - 1;
+      });
+      if (_pageController.hasClients) {
+        _pageController.jumpToPage(_currentIndex);
+      }
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text('✓ Manually added: $partId × ${PicklistItem.formatQty(qty)} PCS'),
+          backgroundColor: const Color(0xFFBB86FC),
+          duration: const Duration(seconds: 3),
+        ),
+      );
+    }
+
+    widget.onItemsUpdated?.call(updatedItems);
+  }
+
+  // ---------------------------------------------------------------------------
+  // REMOVE FROM PICKING
+  // ---------------------------------------------------------------------------
+
+  /// Shows the Remove from Picking dialog with a mandatory comment.
+  Future<void> _showRemoveFromPickingDialog(PartSummary part) async {
+    final commentController = TextEditingController();
+
+    await showDialog<void>(
+      context: context,
+      barrierDismissible: false,
+      builder: (ctx) {
+        return StatefulBuilder(builder: (ctx, setDlgState) {
+          final commentLen = commentController.text.trim().length;
+          final isCommentOk = commentLen >= 10;
+
+          return AlertDialog(
+            backgroundColor: AppTheme.cardDark,
+            shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
+            title: const Row(children: [
+              Icon(Icons.block_rounded, color: Colors.grey, size: 22),
+              SizedBox(width: 8),
+              Flexible(
+                child: Text('Remove from Picking', style: TextStyle(color: AppTheme.textLight, fontSize: 17)),
+              ),
+            ]),
+            content: SizedBox(
+              width: 480,
+              child: SingleChildScrollView(
+                child: Column(
+                  mainAxisSize: MainAxisSize.min,
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    // Part info
+                    Container(
+                      padding: const EdgeInsets.all(10),
+                      decoration: BoxDecoration(
+                        color: AppTheme.bgDark,
+                        borderRadius: BorderRadius.circular(8),
+                        border: Border.all(color: Colors.grey.shade700),
+                      ),
+                      child: Column(
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        children: [
+                          Text(part.partId, style: const TextStyle(fontSize: 20, fontWeight: FontWeight.bold, color: AppTheme.textLight, letterSpacing: 1.1)),
+                          if (part.description.isNotEmpty)
+                            Text(part.description, style: const TextStyle(fontSize: 12, color: AppTheme.textMuted)),
+                        ],
+                      ),
+                    ),
+                    const SizedBox(height: 6),
+                    const Text(
+                      'This part will be greyed out across all views. The picking remains visible but excluded from active progress.',
+                      style: TextStyle(fontSize: 11, color: AppTheme.textMuted),
+                    ),
+                    const SizedBox(height: 12),
+                    TextField(
+                      controller: commentController,
+                      autofocus: true,
+                      keyboardType: TextInputType.multiline,
+                      minLines: 2,
+                      maxLines: 5,
+                      style: const TextStyle(color: AppTheme.textLight, fontSize: 14),
+                      decoration: const InputDecoration(
+                        labelText: 'Reason for removal (min 10 characters) *',
+                        labelStyle: TextStyle(color: AppTheme.textMuted, fontSize: 12),
+                        hintText: 'Why is this part removed from picking?',
+                        hintStyle: TextStyle(color: AppTheme.textMuted, fontSize: 12),
+                        filled: true,
+                        fillColor: AppTheme.bgDark,
+                      ),
+                      onChanged: (_) => setDlgState(() {}),
+                    ),
+                    const SizedBox(height: 4),
+                    Row(children: [
+                      Icon(
+                        isCommentOk ? Icons.check_circle_rounded : Icons.info_outline_rounded,
+                        size: 14,
+                        color: isCommentOk ? AppTheme.statusComplete : AppTheme.textMuted,
+                      ),
+                      const SizedBox(width: 4),
+                      Text(
+                        isCommentOk ? '$commentLen/10 chars — OK' : '$commentLen/10 min chars required',
+                        style: TextStyle(fontSize: 11, color: isCommentOk ? AppTheme.statusComplete : AppTheme.textMuted),
+                      ),
+                    ]),
+                  ],
+                ),
+              ),
+            ),
+            actions: [
+              TextButton(
+                child: const Text('Cancel', style: TextStyle(color: AppTheme.textMuted)),
+                onPressed: () => Navigator.of(ctx).pop(),
+              ),
+              ElevatedButton.icon(
+                style: ElevatedButton.styleFrom(
+                  backgroundColor: isCommentOk ? Colors.grey.shade700 : AppTheme.bgDark,
+                  foregroundColor: Colors.white,
+                ),
+                icon: const Icon(Icons.block_rounded, size: 18),
+                label: const Text('Remove from Picking', style: TextStyle(fontWeight: FontWeight.bold)),
+                onPressed: isCommentOk
+                    ? () async {
+                        Navigator.of(ctx).pop();
+                        await _commitRemoveFromPicking(part, commentController.text.trim());
+                      }
+                    : null,
+              ),
+            ],
+          );
+        });
+      },
+    );
+  }
+
+  Future<void> _commitRemoveFromPicking(PartSummary part, String comment) async {
+    final workerName = _session?.workerName ?? widget.activeSession?.workerName ?? 'Picker';
+    final dept = _isResourceScope ? null : widget.department;
+    final resId = _isResourceScope ? _targetResourceName : null;
+
+    await widget.dbService.recordPartRemoval(
+      unitId: _unit.id,
+      partId: part.partId,
+      workerName: workerName,
+      reason: comment,
+      department: dept,
+      resourceId: resId,
+    );
+    if (mounted) {
+      setState(() {
+        _removedFromPickingParts.add(part.partId);
+        _removedPartComments[part.partId] = comment;
+        _inputBuffer = '';
+        // If part is removed from picking, it is immediately removed from Pick Mode
+        _currentParts.removeWhere((p) => p.partId.toUpperCase() == part.partId.toUpperCase());
+        if (_currentIndex >= _currentParts.length) {
+          _currentIndex = _currentParts.isEmpty ? 0 : _currentParts.length - 1;
+        }
+        if (_currentParts.isNotEmpty && _pageController.hasClients) {
+          _pageController.jumpToPage(_currentIndex);
+        }
+      });
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text('${part.partId} marked as Removed from Picking'),
+          backgroundColor: const Color(0xFF757575),
+          duration: const Duration(seconds: 2),
+        ),
+      );
+    }
+    final updatedItems = await widget.dbService.getPicklistItems(_unit.id);
+    if (mounted) {
+      setState(() {
+        _items = updatedItems;
+      });
+    }
+    widget.onItemsUpdated?.call(updatedItems);
+    LogService.picker('REMOVED FROM PICKING: ${part.partId} in ${dept ?? resId ?? "all"} — "$comment" by $workerName');
+  }
+
+  // ---------------------------------------------------------------------------
+  // REPLACE PART ID
+  // ---------------------------------------------------------------------------
+
+  /// Shows the Replace Part ID dialog.
+  /// New Part ID: uppercase only, A-Z and 0-9, no spaces or special characters.
+  Future<void> _showReplacePartIdDialog(PartSummary part) async {
+    final newIdController = TextEditingController();
+    final noteController = TextEditingController();
+
+    await showDialog<void>(
+      context: context,
+      barrierDismissible: false,
+      builder: (ctx) {
+        return StatefulBuilder(builder: (ctx, setDlgState) {
+          final scopePartIds = _items
+              .where((i) => _itemMatchesScope(i))
+              .map((i) => i.partId.trim().toUpperCase())
+              .toSet();
+          final rawNew = newIdController.text.trim().toUpperCase();
+          final isLengthOk = rawNew.length >= 8;
+          // Only A-Z and 0-9 allowed, no spaces or special chars
+          final isValidPartId = RegExp(r'^[A-Z0-9]+$').hasMatch(rawNew);
+          final noteLen = noteController.text.trim().length;
+          final isNoteOk = noteLen >= 10;
+          final isDifferent = rawNew.isNotEmpty && rawNew.toUpperCase() != part.partId.toUpperCase();
+          final isDuplicate = rawNew.isNotEmpty && scopePartIds.contains(rawNew);
+          final canConfirm = isValidPartId && isLengthOk && isDifferent && !isDuplicate && isNoteOk;
+
+          return AlertDialog(
+            backgroundColor: AppTheme.cardDark,
+            shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
+            title: const Row(children: [
+              Icon(Icons.find_replace_rounded, color: Color(0xFFAB47BC), size: 22),
+              SizedBox(width: 8),
+              Text('Replace Part ID', style: TextStyle(color: AppTheme.textLight, fontSize: 17)),
+            ]),
+            content: SizedBox(
+              width: 480,
+              child: SingleChildScrollView(
+                child: Column(
+                  mainAxisSize: MainAxisSize.min,
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    // Current Part ID (read-only)
+                    Container(
+                      padding: const EdgeInsets.all(10),
+                      decoration: BoxDecoration(
+                        color: AppTheme.bgDark,
+                        borderRadius: BorderRadius.circular(8),
+                        border: Border.all(color: AppTheme.borderDark),
+                      ),
+                      child: Row(
+                        children: [
+                          const Icon(Icons.label_off_rounded, size: 16, color: AppTheme.textMuted),
+                          const SizedBox(width: 6),
+                          const Text('Current: ', style: TextStyle(fontSize: 12, color: AppTheme.textMuted)),
+                          Expanded(
+                            child: Text(
+                              part.partId,
+                              style: const TextStyle(fontSize: 16, fontWeight: FontWeight.bold, color: AppTheme.textLight, letterSpacing: 1.1),
+                            ),
+                          ),
+                        ],
+                      ),
+                    ),
+                    const SizedBox(height: 12),
+                    // New Part ID input
+                    TextField(
+                      controller: newIdController,
+                      autofocus: true,
+                      textCapitalization: TextCapitalization.characters,
+                      style: const TextStyle(
+                        color: Color(0xFFCE93D8),
+                        fontSize: 18,
+                        fontWeight: FontWeight.bold,
+                        letterSpacing: 1.3,
+                      ),
+                      decoration: InputDecoration(
+                        labelText: 'New Part ID (min 8 chars) *',
+                        labelStyle: const TextStyle(color: AppTheme.textMuted),
+                        hintText: 'UPPERCASE, digits only',
+                        hintStyle: const TextStyle(color: AppTheme.textMuted, fontSize: 13),
+                        filled: true,
+                        fillColor: AppTheme.bgDark,
+                        errorText: isDuplicate
+                            ? 'Part ID already exists in this ${_isResourceScope ? "Resource" : "Department"}'
+                            : (rawNew.isNotEmpty && !isValidPartId
+                                ? 'Only A-Z and 0-9 allowed, no spaces or special chars'
+                                : (rawNew.isNotEmpty && !isLengthOk
+                                    ? '${rawNew.length}/8 min characters required'
+                                    : null)),
+                        helperText: rawNew.isNotEmpty && isValidPartId && isLengthOk
+                            ? '${rawNew.length} chars — OK'
+                            : null,
+                        errorStyle: const TextStyle(color: AppTheme.statusDanger, fontSize: 11),
+                      ),
+                      inputFormatters: [
+                        // Filter non-alphanumeric characters in real-time
+                        _UpperAlphanumericInputFormatter(),
+                      ],
+                      onChanged: (_) => setDlgState(() {}),
+                    ),
+                    if (isValidPartId && isDifferent) ...[
+                      const SizedBox(height: 6),
+                      Row(children: [
+                        const Icon(Icons.arrow_forward_rounded, size: 14, color: Color(0xFFCE93D8)),
+                        const SizedBox(width: 4),
+                        Text('Will replace: ${part.partId} → $rawNew',
+                            style: const TextStyle(fontSize: 11, color: Color(0xFFCE93D8))),
+                      ]),
+                    ],
+                    const SizedBox(height: 8),
+                    const Text(
+                      'The original Part ID will be preserved in the export file.',
+                      style: TextStyle(fontSize: 11, color: AppTheme.textMuted),
+                    ),
+                    const SizedBox(height: 12),
+                    // Mandatory note
+                    TextField(
+                      controller: noteController,
+                      keyboardType: TextInputType.multiline,
+                      minLines: 2,
+                      maxLines: 5,
+                      style: const TextStyle(color: AppTheme.textLight, fontSize: 14),
+                      decoration: const InputDecoration(
+                        labelText: 'Reason for replacement (min 10 characters) *',
+                        labelStyle: TextStyle(color: AppTheme.textMuted, fontSize: 12),
+                        hintText: 'Why is this Part ID being replaced?',
+                        hintStyle: TextStyle(color: AppTheme.textMuted, fontSize: 12),
+                        filled: true,
+                        fillColor: AppTheme.bgDark,
+                      ),
+                      onChanged: (_) => setDlgState(() {}),
+                    ),
+                    const SizedBox(height: 4),
+                    Row(children: [
+                      Icon(
+                        isNoteOk ? Icons.check_circle_rounded : Icons.info_outline_rounded,
+                        size: 14,
+                        color: isNoteOk ? AppTheme.statusComplete : AppTheme.textMuted,
+                      ),
+                      const SizedBox(width: 4),
+                      Text(
+                        isNoteOk ? '$noteLen/10 chars — OK' : '$noteLen/10 min chars required',
+                        style: TextStyle(fontSize: 11, color: isNoteOk ? AppTheme.statusComplete : AppTheme.textMuted),
+                      ),
+                    ]),
+                  ],
+                ),
+              ),
+            ),
+            actions: [
+              TextButton(
+                child: const Text('Cancel', style: TextStyle(color: AppTheme.textMuted)),
+                onPressed: () => Navigator.of(ctx).pop(),
+              ),
+              ElevatedButton.icon(
+                style: ElevatedButton.styleFrom(
+                  backgroundColor: canConfirm ? const Color(0xFFAB47BC) : AppTheme.bgDark,
+                  foregroundColor: Colors.white,
+                ),
+                icon: const Icon(Icons.find_replace_rounded, size: 18),
+                label: const Text('Replace Part ID', style: TextStyle(fontWeight: FontWeight.bold)),
+                onPressed: canConfirm
+                    ? () async {
+                        Navigator.of(ctx).pop();
+                        await _commitReplacePartId(
+                          oldPartId: part.partId,
+                          newPartId: newIdController.text.trim().toUpperCase(),
+                          note: noteController.text.trim(),
+                        );
+                      }
+                    : null,
+              ),
+            ],
+          );
+        });
+      },
+    );
+  }
+
+  Future<void> _commitReplacePartId({
+    required String oldPartId,
+    required String newPartId,
+    required String note,
+  }) async {
+    final sessionId = _session?.id ?? '';
+    final workerName = _session?.workerName ?? widget.activeSession?.workerName ?? 'Picker';
+    final dept = _isResourceScope ? null : widget.department;
+    final resId = _isResourceScope ? _targetResourceName : null;
+
+    final matchingItemIds = _items
+        .where((i) => i.partId.toLowerCase().trim() == oldPartId.toLowerCase().trim() && _itemMatchesScope(i))
+        .map((i) => i.id)
+        .toList();
+
+    await widget.dbService.recordPartIdReplacement(
+      unitId: _unit.id,
+      sessionId: sessionId,
+      workerName: workerName,
+      oldPartId: oldPartId,
+      newPartId: newPartId,
+      note: note,
+      department: dept,
+      resourceId: resId,
+      targetItemIds: matchingItemIds.isNotEmpty ? matchingItemIds : null,
+    );
+
+    // Reload items from DB to get updated Part IDs
+    final updatedItems = await widget.dbService.getPicklistItems(_unit.id);
+    if (mounted) {
+      setState(() {
+        _items = updatedItems;
+        _inputBuffer = '';
+        // Rebuild replaced map
+        _replacedPartIds.clear();
+        for (final item in updatedItems) {
+          if (item.replacedPartId.isNotEmpty) {
+            _replacedPartIds[item.partId] = item.replacedPartId;
+          }
+        }
+        // Update part summaries to show the new Part ID with refreshed data
+        final newMatchingItems = updatedItems
+            .where((i) => i.partId.toUpperCase() == newPartId.toUpperCase() && _itemMatchesScope(i))
+            .toList();
+        if (newMatchingItems.isNotEmpty) {
+          var refreshedSummary = PartSummary.fromItem(newMatchingItems.first);
+          for (int j = 1; j < newMatchingItems.length; j++) {
+            refreshedSummary = refreshedSummary.add(newMatchingItems[j]);
+          }
+          for (int i = 0; i < _currentParts.length; i++) {
+            if (_currentParts[i].partId.toUpperCase() == oldPartId.toUpperCase()) {
+              _currentParts[i] = refreshedSummary;
+            }
+          }
+        } else {
+          for (int i = 0; i < _currentParts.length; i++) {
+            if (_currentParts[i].partId.toUpperCase() == oldPartId.toUpperCase()) {
+              _currentParts[i] = _currentParts[i].copyWith(
+                partId: newPartId,
+                replacedPartId: oldPartId,
+                replacementNote: note,
+              );
+            }
+          }
+        }
+      });
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text('Part ID replaced: $oldPartId → $newPartId'),
+          backgroundColor: const Color(0xFF00E5FF),
+          duration: const Duration(seconds: 3),
+        ),
+      );
+    }
+    widget.onItemsUpdated?.call(updatedItems);
+  }
+
+  // ---------------------------------------------------------------------------
+  // PICKER NOTE (Free-form note on any part)
+  // ---------------------------------------------------------------------------
+
+  /// Shows the free-form Picker Note dialog for any part.
+  Future<void> _showPickerNoteDialog(PartSummary part) async {
+    final existingNote = _userPartNotes[part.partId] ?? '';
+    final controller = TextEditingController(text: existingNote);
+
+    await showDialog<void>(
+      context: context,
+      barrierDismissible: false,
+      builder: (ctx) {
+        return StatefulBuilder(builder: (ctx, setDlgState) {
+          final noteText = controller.text.trim();
+          final hasChanged = noteText != existingNote;
+
+          return AlertDialog(
+            backgroundColor: AppTheme.cardDark,
+            shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
+            title: Row(
+              children: [
+                const Icon(Icons.comment_rounded, color: Color(0xFF00E5FF), size: 22),
+                const SizedBox(width: 8),
+                Expanded(
+                  child: Text(
+                    'Picker Note: ${part.partId}',
+                    style: const TextStyle(color: AppTheme.textLight, fontSize: 17, fontWeight: FontWeight.bold),
+                    overflow: TextOverflow.ellipsis,
+                  ),
+                ),
+              ],
+            ),
+            content: SizedBox(
+              width: 480,
+              child: SingleChildScrollView(
+                child: Column(
+                  mainAxisSize: MainAxisSize.min,
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    if (part.description.isNotEmpty) ...[
+                      Text(part.description, style: const TextStyle(fontSize: 12, color: AppTheme.textMuted)),
+                      const SizedBox(height: 10),
+                    ],
+                    TextField(
+                      controller: controller,
+                      autofocus: true,
+                      keyboardType: TextInputType.multiline,
+                      minLines: 3,
+                      maxLines: 6,
+                      style: const TextStyle(color: AppTheme.textLight, fontSize: 15),
+                      decoration: const InputDecoration(
+                        labelText: 'Add Note / Comment',
+                        labelStyle: TextStyle(color: AppTheme.textMuted, fontSize: 13),
+                        hintText: 'Type any note or observation for this part...',
+                        hintStyle: TextStyle(color: AppTheme.textMuted, fontSize: 12),
+                        filled: true,
+                        fillColor: AppTheme.bgDark,
+                      ),
+                      onChanged: (_) => setDlgState(() {}),
+                    ),
+                  ],
+                ),
+              ),
+            ),
+            actions: [
+              if (existingNote.isNotEmpty)
+                TextButton.icon(
+                  icon: const Icon(Icons.delete_outline_rounded, size: 16, color: AppTheme.statusDanger),
+                  label: const Text('Clear Note', style: TextStyle(color: AppTheme.statusDanger)),
+                  onPressed: () async {
+                    Navigator.of(ctx).pop();
+                    await widget.dbService.setUserPartNote(
+                      unitId: _unit.id,
+                      partId: part.partId,
+                      note: '',
+                      department: _isResourceScope ? '' : widget.department,
+                    );
+                    if (mounted) {
+                      setState(() {
+                        _userPartNotes.remove(part.partId);
+                      });
+                      ScaffoldMessenger.of(context).showSnackBar(
+                        SnackBar(
+                          content: Text('Cleared note for ${part.partId}'),
+                          duration: const Duration(seconds: 2),
+                        ),
+                      );
+                    }
+                  },
+                ),
+              TextButton(
+                child: const Text('Cancel', style: TextStyle(color: AppTheme.textMuted)),
+                onPressed: () => Navigator.of(ctx).pop(),
+              ),
+              ElevatedButton.icon(
+                style: ElevatedButton.styleFrom(
+                  backgroundColor: const Color(0xFF00E5FF),
+                  foregroundColor: Colors.black,
+                ),
+                icon: const Icon(Icons.check_rounded, size: 18),
+                label: const Text('Save Note', style: TextStyle(fontWeight: FontWeight.bold)),
+                onPressed: hasChanged
+                    ? () async {
+                        Navigator.of(ctx).pop();
+                        await widget.dbService.setUserPartNote(
+                          unitId: _unit.id,
+                          partId: part.partId,
+                          note: noteText,
+                          department: _isResourceScope ? '' : widget.department,
+                        );
+                        if (mounted) {
+                          setState(() {
+                            if (noteText.isEmpty) {
+                              _userPartNotes.remove(part.partId);
+                            } else {
+                              _userPartNotes[part.partId] = noteText;
+                            }
+                          });
+                          ScaffoldMessenger.of(context).showSnackBar(
+                            SnackBar(
+                              content: Text('Note saved for ${part.partId}'),
+                              backgroundColor: const Color(0xFF00E5FF),
+                              duration: const Duration(seconds: 2),
+                            ),
+                          );
+                        }
+                      }
+                    : null,
+              ),
+            ],
+          );
+        });
+      },
+    );
+  }
+
   @override
+
   Widget build(BuildContext context) {
     if (_currentParts.isEmpty) {
       return Scaffold(
@@ -649,126 +1730,211 @@ class _PickModeScreenState extends State<PickModeScreen> with WidgetsBindingObse
     return Scaffold(
       backgroundColor: AppTheme.bgDark,
       body: SafeArea(
-        child: Padding(
-          padding: const EdgeInsets.all(24),
-          child: Column(
-            mainAxisAlignment: MainAxisAlignment.center,
-            children: [
-              Container(
-                padding: const EdgeInsets.all(32),
-                decoration: BoxDecoration(
-                  color: AppTheme.statusComplete.withOpacity(0.08),
-                  borderRadius: BorderRadius.circular(20),
-                  border: Border.all(color: AppTheme.statusComplete.withOpacity(0.4), width: 2),
-                ),
-                child: Column(
-                  children: [
-                    const Icon(Icons.check_circle_outline_rounded, size: 64, color: AppTheme.statusComplete),
-                    const SizedBox(height: 16),
-                    const Text(
-                      'Confirm Pick',
-                      style: TextStyle(fontSize: 22, fontWeight: FontWeight.bold, color: AppTheme.textLight),
-                    ),
-                    const SizedBox(height: 24),
-                    // Part ID
-                    Text(
-                      part.partId,
-                      style: const TextStyle(fontSize: 36, fontWeight: FontWeight.bold, color: AppTheme.accentCyan, letterSpacing: 1.2),
-                      textAlign: TextAlign.center,
-                    ),
-                    Builder(builder: (_) {
-                      final onHandStr = _resolveOnHand(part);
-                      return Padding(
-                        padding: const EdgeInsets.only(top: 8),
-                        child: Wrap(
-                          alignment: WrapAlignment.center,
-                          crossAxisAlignment: WrapCrossAlignment.center,
-                          spacing: 8,
-                          runSpacing: 4,
-                          children: [
-                            if (part.description.isNotEmpty)
-                              Text(
-                                part.description,
-                                style: const TextStyle(fontSize: 14, color: AppTheme.textMuted),
-                                textAlign: TextAlign.center,
-                                maxLines: 2,
-                                overflow: TextOverflow.ellipsis,
-                              ),
-                            Container(
-                              padding: const EdgeInsets.symmetric(horizontal: 7, vertical: 2),
-                              decoration: BoxDecoration(
-                                color: onHandStr.isNotEmpty
-                                    ? AppTheme.accentCyan.withOpacity(0.15)
-                                    : AppTheme.cardDark.withOpacity(0.5),
-                                borderRadius: BorderRadius.circular(5),
-                                border: Border.all(
+        child: Center(
+          child: SingleChildScrollView(
+            padding: const EdgeInsets.symmetric(horizontal: 24, vertical: 16),
+            child: Column(
+              mainAxisAlignment: MainAxisAlignment.center,
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                Container(
+                  padding: const EdgeInsets.symmetric(horizontal: 28, vertical: 24),
+                  decoration: BoxDecoration(
+                    color: AppTheme.statusComplete.withValues(alpha: 0.08),
+                    borderRadius: BorderRadius.circular(20),
+                    border: Border.all(color: AppTheme.statusComplete.withValues(alpha: 0.4), width: 2),
+                  ),
+                  child: Column(
+                    children: [
+                      const Icon(Icons.check_circle_outline_rounded, size: 64, color: AppTheme.statusComplete),
+                      const SizedBox(height: 16),
+                      const Text(
+                        'Confirm Pick',
+                        style: TextStyle(fontSize: 22, fontWeight: FontWeight.bold, color: AppTheme.textLight),
+                      ),
+                      const SizedBox(height: 24),
+                      // Part ID
+                      Text(
+                        part.partId,
+                        style: const TextStyle(fontSize: 36, fontWeight: FontWeight.bold, color: AppTheme.accentCyan, letterSpacing: 1.2),
+                        textAlign: TextAlign.center,
+                      ),
+                      Builder(builder: (_) {
+                        final onHandStr = _resolveOnHand(part);
+                        return Padding(
+                          padding: const EdgeInsets.only(top: 8),
+                          child: Wrap(
+                            alignment: WrapAlignment.center,
+                            crossAxisAlignment: WrapCrossAlignment.center,
+                            spacing: 8,
+                            runSpacing: 4,
+                            children: [
+                              if (part.description.isNotEmpty)
+                                Text(
+                                  part.description,
+                                  style: const TextStyle(fontSize: 14, color: AppTheme.textMuted),
+                                  textAlign: TextAlign.center,
+                                  maxLines: 2,
+                                  overflow: TextOverflow.ellipsis,
+                                ),
+                              Container(
+                                padding: const EdgeInsets.symmetric(horizontal: 7, vertical: 2),
+                                decoration: BoxDecoration(
                                   color: onHandStr.isNotEmpty
-                                      ? AppTheme.accentCyan.withOpacity(0.4)
-                                      : AppTheme.borderDark,
+                                      ? AppTheme.accentCyan.withValues(alpha: 0.15)
+                                      : AppTheme.cardDark.withValues(alpha: 0.5),
+                                  borderRadius: BorderRadius.circular(5),
+                                  border: Border.all(
+                                    color: onHandStr.isNotEmpty
+                                        ? AppTheme.accentCyan.withValues(alpha: 0.4)
+                                        : AppTheme.borderDark,
+                                  ),
+                                ),
+                                child: Row(
+                                  mainAxisSize: MainAxisSize.min,
+                                  children: [
+                                    Icon(
+                                      Icons.location_on_rounded,
+                                      size: 12,
+                                      color: onHandStr.isNotEmpty ? AppTheme.accentCyan : AppTheme.textMuted,
+                                    ),
+                                    const SizedBox(width: 3),
+                                    Text(
+                                      onHandStr.isNotEmpty ? 'ON-HAND: $onHandStr' : 'ON-HAND: —',
+                                      style: TextStyle(
+                                        fontSize: 11,
+                                        color: onHandStr.isNotEmpty ? AppTheme.accentCyan : AppTheme.textMuted,
+                                        fontWeight: onHandStr.isNotEmpty ? FontWeight.bold : FontWeight.w500,
+                                      ),
+                                    ),
+                                  ],
                                 ),
                               ),
-                              child: Row(
-                                mainAxisSize: MainAxisSize.min,
-                                children: [
-                                  Icon(
-                                    Icons.location_on_rounded,
-                                    size: 12,
-                                    color: onHandStr.isNotEmpty ? AppTheme.accentCyan : AppTheme.textMuted,
-                                  ),
-                                  const SizedBox(width: 3),
-                                  Text(
-                                    onHandStr.isNotEmpty ? 'ON-HAND: $onHandStr' : 'ON-HAND: —',
-                                    style: TextStyle(
-                                      fontSize: 11,
-                                      color: onHandStr.isNotEmpty ? AppTheme.accentCyan : AppTheme.textMuted,
-                                      fontWeight: onHandStr.isNotEmpty ? FontWeight.bold : FontWeight.w500,
-                                    ),
-                                  ),
+                            ],
+                          ),
+                        );
+                      }),
+                      const SizedBox(height: 14),
+                      Builder(builder: (_) {
+                        final matchingItems = _items
+                            .where((i) => _itemMatchesScope(i) && i.partId.toLowerCase().trim() == part.partId.toLowerCase().trim())
+                            .toList()
+                          ..sort((a, b) => a.rowOrder.compareTo(b.rowOrder));
+                        final item = matchingItems.isNotEmpty
+                            ? matchingItems.first
+                            : _items.firstWhere(
+                                (i) => i.partId.toLowerCase().trim() == part.partId.toLowerCase().trim(),
+                                orElse: () => PicklistItem(id: '', unitId: '', department: '', line: '', workOrder: '', partId: '', partDescription: '', qtyRequired: 0, qtyDue: 0, qtyPicked: 0, rowOrder: 0),
+                              );
+                        final allDepts = matchingItems
+                            .map((i) => i.department.trim())
+                            .where((d) => d.isNotEmpty)
+                            .toSet()
+                            .toList();
+                        final allLines = matchingItems
+                            .map((i) => i.line.trim())
+                            .where((l) => l.isNotEmpty)
+                            .toSet()
+                            .toList();
+                        final lineStr = item.line.isNotEmpty ? item.line : (widget.lineLabel ?? 'General');
+                        final resStr = item.resourceId.isNotEmpty ? item.resourceId : (part.resourceId.isNotEmpty ? part.resourceId : '');
+                        final showMultipleDepts = _isResourceScope || allDepts.length > 1;
+
+                        // Simulate FIFO allocation with _pendingDelta to preview post-confirm quantities per department/WO
+                        final currentPicked = _getCurrentPicked(part.partId);
+                        final simulatedList = _pendingDelta > 0
+                            ? FifoAllocationEngine.allocateByPartId(
+                                allItems: _items,
+                                department: widget.department,
+                                partId: part.partId,
+                                totalPickedToAllocate: currentPicked + _pendingDelta,
+                              )
+                            : _items;
+
+                        return Column(
+                          mainAxisSize: MainAxisSize.min,
+                          children: [
+                            Wrap(
+                              alignment: WrapAlignment.center,
+                              spacing: 8,
+                              runSpacing: 6,
+                              children: [
+                                _infoChip(Icons.inventory_2_rounded, 'Unit: ${_unit.name}'),
+                                _infoChip(Icons.straighten_rounded, 'UOM: ${part.uom}'),
+                                _infoChip(Icons.apartment_rounded, _isResourceScope ? 'Scope: ${widget.department}' : 'Dept: ${widget.department}'),
+                                if (showMultipleDepts && allDepts.isNotEmpty)
+                                  for (final d in allDepts)
+                                    _infoChip(Icons.domain_rounded, 'Dept: $d')
+                                else if (!showMultipleDepts && item.department.isNotEmpty && item.department != widget.department)
+                                  _infoChip(Icons.domain_rounded, 'Dept: ${item.department}'),
+                                if (!_isResourceScope) ...[
+                                  if (allLines.isNotEmpty)
+                                    for (final l in allLines)
+                                      _infoChip(Icons.view_week_rounded, 'Line: $l')
+                                  else if (lineStr.isNotEmpty && lineStr != 'General')
+                                    _infoChip(Icons.view_week_rounded, 'Line: $lineStr'),
                                 ],
-                              ),
+                                if (resStr.isNotEmpty) _infoChip(Icons.account_tree_rounded, 'Resource: $resStr'),
+                              ],
                             ),
+                            if (matchingItems.isNotEmpty) ...[
+                              const SizedBox(height: 14),
+                              Text(
+                                showMultipleDepts ? 'Work Orders & Departments:' : 'Work Orders:',
+                                style: const TextStyle(fontSize: 11, color: AppTheme.textMuted, fontWeight: FontWeight.bold),
+                              ),
+                              const SizedBox(height: 6),
+                              Wrap(
+                                alignment: WrapAlignment.center,
+                                spacing: 6,
+                                runSpacing: 4,
+                                children: matchingItems.map((wo) {
+                                  final simWo = simulatedList.firstWhere((i) => i.id == wo.id, orElse: () => wo);
+                                  final isAllocated = _pendingDelta > 0 && simWo.qtyPicked > wo.qtyPicked;
+                                  final isCompleteAfterConfirm = simWo.qtyDue <= 0.0001;
+                                  final woColor = isCompleteAfterConfirm ? AppTheme.statusComplete : AppTheme.statusPartial;
+
+                                  final qtyText = isAllocated
+                                      ? '${PicklistItem.formatQty(wo.qtyPicked)} → ${PicklistItem.formatQty(simWo.qtyPicked)}/${PicklistItem.formatQty(wo.qtyRequired)}'
+                                      : '${PicklistItem.formatQty(wo.qtyPicked)}/${PicklistItem.formatQty(wo.qtyRequired)}';
+
+                                  final label = showMultipleDepts
+                                      ? '${wo.workOrder} (${wo.department}): $qtyText'
+                                      : '${wo.workOrder}: $qtyText';
+                                  return Container(
+                                    padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 3),
+                                    decoration: BoxDecoration(
+                                      color: AppTheme.bgDark,
+                                      borderRadius: BorderRadius.circular(6),
+                                      border: Border.all(color: woColor.withValues(alpha: 0.5)),
+                                    ),
+                                    child: Text(
+                                      label,
+                                      style: TextStyle(fontSize: 11, color: woColor, fontWeight: FontWeight.w600),
+                                    ),
+                                  );
+                                }).toList(),
+                              ),
+                            ],
                           ],
-                        ),
-                      );
-                    }),
-                    const SizedBox(height: 14),
-                    Builder(builder: (_) {
-                      final item = _items.firstWhere(
-                        (i) => _itemMatchesScope(i) && i.partId.toLowerCase().trim() == part.partId.toLowerCase().trim(),
-                        orElse: () => _items.firstWhere((i) => i.partId.toLowerCase().trim() == part.partId.toLowerCase().trim(), orElse: () => PicklistItem(id: '', unitId: '', department: '', line: '', workOrder: '', partId: '', partDescription: '', qtyRequired: 0, qtyDue: 0, qtyPicked: 0, rowOrder: 0)),
-                      );
-                      final lineStr = item.line.isNotEmpty ? item.line : (widget.lineLabel ?? 'General');
-                      final resStr = item.resourceId.isNotEmpty ? item.resourceId : (part.resourceId.isNotEmpty ? part.resourceId : '');
-                      return Wrap(
-                        alignment: WrapAlignment.center,
-                        spacing: 8,
-                        runSpacing: 6,
-                        children: [
-                          _infoChip(Icons.inventory_2_rounded, 'Unit: ${_unit.name}'),
-                          _infoChip(Icons.apartment_rounded, _isResourceScope ? 'Scope: ${widget.department}' : 'Dept: ${widget.department}'),
-                          if (_isResourceScope && item.department.isNotEmpty)
-                            _infoChip(Icons.domain_rounded, 'Dept: ${item.department}'),
-                          if (lineStr.isNotEmpty) _infoChip(Icons.view_week_rounded, 'Line: $lineStr'),
-                          if (resStr.isNotEmpty) _infoChip(Icons.account_tree_rounded, 'Resource: $resStr'),
-                        ],
-                      );
-                    }),
-                    const SizedBox(height: 18),
-                    const Divider(color: AppTheme.borderDark),
-                    const SizedBox(height: 16),
-                    // Summary table
-                    _confirmRow('Picking (delta):', '+${PartSummary.formatQty(_pendingDelta)} pcs', AppTheme.statusComplete),
-                    const SizedBox(height: 10),
-                    _confirmRow('Picked after confirm:', '${PartSummary.formatQty(pickedAfterConfirm)} pcs', AppTheme.textLight),
-                    const SizedBox(height: 10),
-                    _confirmRow('Remaining Due:', '${PartSummary.formatQty(dueAfterPick)} pcs',
-                        dueAfterPick <= 0.0001 ? AppTheme.statusComplete : AppTheme.statusPartial),
-                    const SizedBox(height: 10),
-                    _confirmRow('Total Required:', '${PartSummary.formatQty(requiredQty)} pcs', AppTheme.textMuted),
-                  ],
+                        );
+                      }),
+                      const SizedBox(height: 18),
+                      const Divider(color: AppTheme.borderDark),
+                      const SizedBox(height: 16),
+                      // Summary table
+                      _confirmRow('Picking (delta):', '+${PartSummary.formatQty(_pendingDelta)} ${part.uomLabel}', AppTheme.statusComplete),
+                      const SizedBox(height: 10),
+                      _confirmRow('Picked after confirm:', '${PartSummary.formatQty(pickedAfterConfirm)} ${part.uomLabel}', AppTheme.textLight),
+                      const SizedBox(height: 10),
+                      _confirmRow('Remaining Due:', '${PartSummary.formatQty(dueAfterPick)} ${part.uomLabel}',
+                          dueAfterPick <= 0.0001 ? AppTheme.statusComplete : AppTheme.statusPartial),
+                      const SizedBox(height: 10),
+                      _confirmRow('Total Required:', '${PartSummary.formatQty(requiredQty)} ${part.uomLabel}', AppTheme.textMuted),
+                    ],
+                  ),
                 ),
-              ),
-              const SizedBox(height: 32),
+                const SizedBox(height: 24),
               Row(
                 children: [
                   Expanded(
@@ -799,7 +1965,7 @@ class _PickModeScreenState extends State<PickModeScreen> with WidgetsBindingObse
                       ),
                       icon: const Icon(Icons.check_rounded, size: 22),
                       label: Text(
-                        'Save +${PartSummary.formatQty(_pendingDelta)} pcs',
+                        'Save +${PartSummary.formatQty(_pendingDelta)} ${part.uomLabel}',
                         style: const TextStyle(fontSize: 16, fontWeight: FontWeight.bold),
                       ),
                       onPressed: () async {
@@ -815,8 +1981,9 @@ class _PickModeScreenState extends State<PickModeScreen> with WidgetsBindingObse
           ),
         ),
       ),
-    );
-  }
+    ),
+  );
+}
 
   Widget _confirmRow(String label, String value, Color valueColor) {
     return Row(
@@ -866,28 +2033,54 @@ class _PickModeScreenState extends State<PickModeScreen> with WidgetsBindingObse
               crossAxisAlignment: CrossAxisAlignment.start,
               mainAxisSize: MainAxisSize.min,
               children: [
-                Row(
-                  children: [
-                    Flexible(
-                      child: Text(
-                        widget.department,
-                        style: const TextStyle(fontSize: 14, fontWeight: FontWeight.bold, color: AppTheme.textLight),
-                        overflow: TextOverflow.ellipsis,
-                      ),
-                    ),
-                    if (widget.lineLabel != null && widget.lineLabel!.isNotEmpty) ...[
-                      const Text(' › ', style: TextStyle(fontSize: 13, color: AppTheme.textMuted)),
+                Builder(builder: (_) {
+                  String? subLabel;
+                  if (widget.lineLabel != null && widget.lineLabel!.isNotEmpty) {
+                    final raw = widget.lineLabel!.trim();
+                    if (_isResourceScope) {
+                      // In Whole Resource mode, no lines exist.
+                      // If picking a specific department within the resource (By-Dept mode), show Dept: ...
+                      if (raw.toLowerCase().startsWith('department:')) {
+                        subLabel = raw;
+                      } else if (raw.toLowerCase().startsWith('dept:')) {
+                        subLabel = raw;
+                      } else if (!raw.toLowerCase().contains('resource')) {
+                        subLabel = 'Dept: $raw';
+                      }
+                      // Omits 'Resource ID: ...' or 'Resource: ...' since widget.department already displays the resource!
+                    } else {
+                      // In department mode, show Line: ...
+                      if (raw.toLowerCase().startsWith('line:')) {
+                        subLabel = raw;
+                      } else {
+                        subLabel = 'Line: $raw';
+                      }
+                    }
+                  }
+
+                  return Row(
+                    children: [
                       Flexible(
                         child: Text(
-                          'Line: ${widget.lineLabel}',
-                          style: const TextStyle(fontSize: 13, color: AppTheme.accentCyan, fontWeight: FontWeight.w600),
+                          widget.department,
+                          style: const TextStyle(fontSize: 14, fontWeight: FontWeight.bold, color: AppTheme.textLight),
                           overflow: TextOverflow.ellipsis,
                         ),
                       ),
+                      if (subLabel != null && subLabel.isNotEmpty) ...[
+                        const Text(' › ', style: TextStyle(fontSize: 13, color: AppTheme.textMuted)),
+                        Flexible(
+                          child: Text(
+                            subLabel,
+                            style: const TextStyle(fontSize: 13, color: AppTheme.accentCyan, fontWeight: FontWeight.w600),
+                            overflow: TextOverflow.ellipsis,
+                          ),
+                        ),
+                      ],
+                      const Text(' — Pick Mode', style: TextStyle(fontSize: 12, color: AppTheme.textMuted)),
                     ],
-                    const Text(' — Pick Mode', style: TextStyle(fontSize: 12, color: AppTheme.textMuted)),
-                  ],
-                ),
+                  );
+                }),
                 if (session != null)
                   Text(
                     'Picker: ${session.workerName}${session.sessionSeqNo > 0 ? ' | Session #${session.sessionSeqNo}' : ''}${widget.tabletId.isNotEmpty ? ' | ${widget.tabletId}' : ''}',
@@ -915,20 +2108,23 @@ class _PickModeScreenState extends State<PickModeScreen> with WidgetsBindingObse
           ),
           if (_autoAdvance) ...[
             const SizedBox(width: 8),
-            Container(
-              padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
-              decoration: BoxDecoration(
-                color: AppTheme.statusComplete.withValues(alpha: 0.15),
-                borderRadius: BorderRadius.circular(4),
-                border: Border.all(color: AppTheme.statusComplete.withValues(alpha: 0.4)),
-              ),
-              child: const Row(
-                mainAxisSize: MainAxisSize.min,
-                children: [
-                  Icon(Icons.bolt_rounded, size: 13, color: AppTheme.statusComplete),
-                  SizedBox(width: 3),
-                  Text('Auto', style: TextStyle(fontSize: 10, color: AppTheme.statusComplete, fontWeight: FontWeight.bold)),
-                ],
+            Tooltip(
+              message: 'Auto-Advance: automatically advances to next part on pick',
+              child: Container(
+                padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+                decoration: BoxDecoration(
+                  color: AppTheme.statusComplete.withValues(alpha: 0.15),
+                  borderRadius: BorderRadius.circular(4),
+                  border: Border.all(color: AppTheme.statusComplete.withValues(alpha: 0.4)),
+                ),
+                child: const Row(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    Icon(Icons.bolt_rounded, size: 13, color: AppTheme.statusComplete),
+                    SizedBox(width: 4),
+                    Text('Auto-Advance', style: TextStyle(fontSize: 10, color: AppTheme.statusComplete, fontWeight: FontWeight.bold)),
+                  ],
+                ),
               ),
             ),
           ],
@@ -978,12 +2174,12 @@ class _PickModeScreenState extends State<PickModeScreen> with WidgetsBindingObse
     });
 
     widget.onItemsUpdated?.call(updatedList);
-    LogService.picker('RETURN: ${part.partId} -${PartSummary.formatQty(returnQty)} pcs (Reason: "$reason") → Unit: ${_unit.name}, Dept: ${widget.department}');
+    LogService.picker('RETURN: ${part.partId} -${PartSummary.formatQty(returnQty)} ${part.uomLabel} (Reason: "$reason") → Unit: ${_unit.name}, Dept: ${widget.department}');
 
     if (mounted) {
       ScaffoldMessenger.of(context).showSnackBar(
         SnackBar(
-          content: Text('Returned ${PartSummary.formatQty(returnQty)} pcs of ${part.partId}.'),
+          content: Text('Returned ${PartSummary.formatQty(returnQty)} ${part.uomLabel} of ${part.partId}.'),
           backgroundColor: const Color(0xFFE07B00),
           duration: const Duration(seconds: 3),
         ),
@@ -1047,14 +2243,14 @@ class _PickModeScreenState extends State<PickModeScreen> with WidgetsBindingObse
                   ),
                 ),
                 Text(
-                  'Picked: ${PartSummary.formatQty(currentPicked)} pcs',
+                  'Picked: ${PartSummary.formatQty(currentPicked)} ${part.uomLabel}',
                   style: const TextStyle(fontSize: 18, fontWeight: FontWeight.bold, color: AppTheme.accentCyan),
                 ),
               ],
             ),
             const SizedBox(height: 6),
             Text(
-              'Remaining after return: ${PartSummary.formatQty(remainingAfterReturn)} pcs',
+              'Remaining after return: ${PartSummary.formatQty(remainingAfterReturn)} ${part.uomLabel}',
               style: TextStyle(
                 fontSize: 14,
                 fontWeight: FontWeight.w600,
@@ -1066,7 +2262,9 @@ class _PickModeScreenState extends State<PickModeScreen> with WidgetsBindingObse
               controller: _returnReasonController,
               focusNode: _returnReasonFocusNode,
               autofocus: true,
-              maxLines: 2,
+              keyboardType: TextInputType.multiline,
+              minLines: 2,
+              maxLines: 5,
               style: const TextStyle(color: AppTheme.textLight, fontSize: 15),
               decoration: InputDecoration(
                 labelText: 'Reason for Return (min 10 characters)*',
@@ -1116,6 +2314,9 @@ class _PickModeScreenState extends State<PickModeScreen> with WidgetsBindingObse
 
     final isComplete = dueQty <= 0.0001 && requiredQty > 0;
     final isMissing = _flaggedMissingParts.contains(part.partId);
+    final isRemoved = _removedFromPickingParts.contains(part.partId);
+    final originalPartId = _replacedPartIds[part.partId];
+
     final progress = requiredQty > 0 ? (currentPicked / requiredQty).clamp(0.0, 1.0) : 0.0;
 
     final statusColor = isMissing
@@ -1134,6 +2335,11 @@ class _PickModeScreenState extends State<PickModeScreen> with WidgetsBindingObse
         .where((i) => _itemMatchesScope(i) && i.partId.toLowerCase().trim() == part.partId.toLowerCase().trim())
         .toList()
       ..sort((a, b) => a.rowOrder.compareTo(b.rowOrder));
+    final allLines = woItems
+        .map((i) => i.line.trim())
+        .where((l) => l.isNotEmpty)
+        .toSet()
+        .toList();
 
     // Pick/Prod dates from items (formatted without seconds/ISO)
     final pickDateRaw = woItems.firstWhere((i) => i.pickDate.isNotEmpty,
@@ -1173,13 +2379,13 @@ class _PickModeScreenState extends State<PickModeScreen> with WidgetsBindingObse
                       padding: const EdgeInsets.symmetric(horizontal: 7, vertical: 3),
                       decoration: BoxDecoration(
                         color: deptType == 'MAIN LINE'
-                            ? const Color(0xFF0EA5E9).withOpacity(0.15)
-                            : const Color(0xFFF97316).withOpacity(0.15),
+                            ? const Color(0xFF0EA5E9).withValues(alpha: 0.15)
+                            : const Color(0xFFF97316).withValues(alpha: 0.15),
                         borderRadius: BorderRadius.circular(4),
                         border: Border.all(
                           color: deptType == 'MAIN LINE'
-                              ? const Color(0xFF0EA5E9).withOpacity(0.5)
-                              : const Color(0xFFF97316).withOpacity(0.5),
+                              ? const Color(0xFF0EA5E9).withValues(alpha: 0.5)
+                              : const Color(0xFFF97316).withValues(alpha: 0.5),
                         ),
                       ),
                       child: Text(
@@ -1201,56 +2407,187 @@ class _PickModeScreenState extends State<PickModeScreen> with WidgetsBindingObse
             // Row 2: Part ID + Description
             SelectableText(
               part.partId,
-              style: const TextStyle(fontSize: 34, fontWeight: FontWeight.bold, letterSpacing: 1.2, color: AppTheme.textLight),
+              style: TextStyle(
+                fontSize: 34,
+                fontWeight: FontWeight.bold,
+                letterSpacing: 1.2,
+                color: isRemoved ? Colors.grey.shade500 : AppTheme.textLight,
+              ),
             ),
-            const SizedBox(height: 4),
-            Wrap(
-              crossAxisAlignment: WrapCrossAlignment.center,
-              spacing: 10,
-              runSpacing: 6,
-              children: [
-                if (part.description.isNotEmpty)
-                  Text(
-                    part.description,
-                    style: const TextStyle(fontSize: 15, color: AppTheme.textMuted, height: 1.2),
-                    maxLines: 2,
-                    overflow: TextOverflow.ellipsis,
-                  ),
-                Container(
+            // MANUAL ADD badge
+            if (part.isManualAdd) ...[
+              const SizedBox(height: 4),
+              Container(
+                padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 3),
+                decoration: BoxDecoration(
+                  color: const Color(0xFFBB86FC).withValues(alpha: 0.15),
+                  borderRadius: BorderRadius.circular(6),
+                  border: Border.all(color: const Color(0xFFBB86FC).withValues(alpha: 0.6)),
+                ),
+                child: Row(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    const Icon(Icons.add_circle_outline_rounded, size: 12, color: Color(0xFFBB86FC)),
+                    const SizedBox(width: 4),
+                    Flexible(
+                      child: Text(
+                        '➕ MANUAL ADD${part.manualWorker.isNotEmpty ? ' • by ${part.manualWorker}' : ''}${part.manualNote.isNotEmpty ? ': "${part.manualNote}"' : ''}',
+                        style: const TextStyle(fontSize: 11, color: Color(0xFFBB86FC), fontWeight: FontWeight.bold),
+                        overflow: TextOverflow.ellipsis,
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+            ],
+            // Replaced Part ID badge
+            if ((originalPartId != null && originalPartId.isNotEmpty) || part.replacedPartId.isNotEmpty) ...[
+              const SizedBox(height: 4),
+              Container(
+                padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 3),
+                decoration: BoxDecoration(
+                  color: const Color(0xFF00E5FF).withValues(alpha: 0.15),
+                  borderRadius: BorderRadius.circular(6),
+                  border: Border.all(color: const Color(0xFF00E5FF).withValues(alpha: 0.5)),
+                ),
+                child: Row(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    const Icon(Icons.find_replace_rounded, size: 12, color: Color(0xFF00E5FF)),
+                    const SizedBox(width: 4),
+                    Flexible(
+                      child: Text(
+                        '🔄 REPLACED • was: ${part.replacedPartId.isNotEmpty ? part.replacedPartId : originalPartId}${part.replacementNote.isNotEmpty ? ' (${part.replacementNote})' : ''}',
+                        style: const TextStyle(fontSize: 11, color: Color(0xFF00E5FF), fontWeight: FontWeight.bold),
+                        overflow: TextOverflow.ellipsis,
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+            ],
+            // REMOVED FROM PICKING badge
+            if (isRemoved || part.isRemoved) ...[
+              const SizedBox(height: 4),
+              Builder(builder: (_) {
+                final reason = part.removeNote.isNotEmpty
+                    ? part.removeNote
+                    : (_removedPartComments[part.partId] ?? '');
+                return Container(
                   padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 3),
                   decoration: BoxDecoration(
-                    color: onHand.isNotEmpty
-                        ? AppTheme.accentCyan.withOpacity(0.15)
-                        : AppTheme.cardDark.withOpacity(0.5),
+                    color: const Color(0xFF757575).withValues(alpha: 0.18),
                     borderRadius: BorderRadius.circular(6),
-                    border: Border.all(
-                      color: onHand.isNotEmpty
-                          ? AppTheme.accentCyan.withOpacity(0.5)
-                          : AppTheme.borderDark,
-                    ),
+                    border: Border.all(color: const Color(0xFF757575).withValues(alpha: 0.6)),
                   ),
                   child: Row(
                     mainAxisSize: MainAxisSize.min,
                     children: [
-                      Icon(
-                        Icons.location_on_rounded,
-                        size: 13,
-                        color: onHand.isNotEmpty ? AppTheme.accentCyan : AppTheme.textMuted,
-                      ),
+                      const Icon(Icons.block_rounded, size: 12, color: Color(0xFF757575)),
                       const SizedBox(width: 4),
-                      Text(
-                        onHand.isNotEmpty ? 'ON-HAND: $onHand' : 'ON-HAND: —',
-                        style: TextStyle(
-                          fontSize: 12,
-                          color: onHand.isNotEmpty ? AppTheme.accentCyan : AppTheme.textMuted,
-                          fontWeight: onHand.isNotEmpty ? FontWeight.bold : FontWeight.w500,
+                      Flexible(
+                        child: Text(
+                          '⛔ REMOVED FROM PICKING${reason.isNotEmpty ? ' • $reason' : ''}',
+                          style: const TextStyle(fontSize: 11, color: Color(0xFF757575), fontWeight: FontWeight.bold),
+                          overflow: TextOverflow.ellipsis,
                         ),
                       ),
                     ],
                   ),
+                );
+              }),
+            ],
+            // MISSING badge
+            if (isMissing) ...[
+              const SizedBox(height: 4),
+              Builder(builder: (_) {
+                final flag = _missingPartDetails[part.partId];
+                final ts = flag?['created_at'] as int?;
+                final dateStr = ts != null
+                    ? DateFormat('yyyy-MM-dd').format(DateTime.fromMillisecondsSinceEpoch(ts))
+                    : '';
+                final note = flag?['note']?.toString() ?? '';
+                String pickerName = flag?['worker_name']?.toString() ?? '';
+                if (pickerName.isEmpty) {
+                  if (note.contains('Marked missing by ')) {
+                    pickerName = note.replaceAll('Marked missing by ', '').replaceAll(' in Pick Mode', '').trim();
+                  } else if (note.isNotEmpty) {
+                    pickerName = note;
+                  } else {
+                    pickerName = 'Picker';
+                  }
+                }
+                return Container(
+                  padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 3),
+                  decoration: BoxDecoration(
+                    color: const Color(0xFFFF3B30).withValues(alpha: 0.18),
+                    borderRadius: BorderRadius.circular(6),
+                    border: Border.all(color: const Color(0xFFFF3B30).withValues(alpha: 0.6)),
+                  ),
+                  child: Row(
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      const Icon(Icons.warning_amber_rounded, size: 12, color: Color(0xFFFF3B30)),
+                      const SizedBox(width: 4),
+                      Flexible(
+                        child: Text(
+                          '⚠️ MISSING • $pickerName${dateStr.isNotEmpty ? ' • $dateStr' : ''}',
+                          style: const TextStyle(fontSize: 11, color: Color(0xFFFF3B30), fontWeight: FontWeight.bold),
+                          overflow: TextOverflow.ellipsis,
+                        ),
+                      ),
+                    ],
+                  ),
+                );
+              }),
+            ],
+            // Picker Note badge
+            Builder(builder: (_) {
+              final userNote = _userPartNotes[part.partId] ?? '';
+              if (userNote.isEmpty) return const SizedBox.shrink();
+              return Padding(
+                padding: const EdgeInsets.only(top: 4),
+                child: Container(
+                  padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 5),
+                  decoration: BoxDecoration(
+                    color: const Color(0xFF00E5FF).withValues(alpha: 0.12),
+                    borderRadius: BorderRadius.circular(6),
+                    border: Border.all(color: const Color(0xFF00E5FF).withValues(alpha: 0.4)),
+                  ),
+                  child: Row(
+                    children: [
+                      const Icon(Icons.comment_rounded, size: 13, color: Color(0xFF00E5FF)),
+                      const SizedBox(width: 6),
+                      Expanded(
+                        child: Text(
+                          'Picker Note: $userNote',
+                          style: const TextStyle(fontSize: 11, color: Color(0xFF00E5FF), fontWeight: FontWeight.w600),
+                          overflow: TextOverflow.ellipsis,
+                        ),
+                      ),
+                      const SizedBox(width: 6),
+                      InkWell(
+                        onTap: () => _showPickerNoteDialog(part),
+                        child: const Icon(Icons.edit_rounded, size: 13, color: Color(0xFF00E5FF)),
+                      ),
+                    ],
+                  ),
                 ),
-              ],
-            ),
+              );
+            }),
+            if (part.description.isNotEmpty &&
+                !(part.isManualAdd &&
+                    (part.description == part.manualNote ||
+                        part.manualNote.isNotEmpty ||
+                        part.description.isEmpty))) ...[
+              const SizedBox(height: 6),
+              Text(
+                part.description,
+                style: const TextStyle(fontSize: 15, color: AppTheme.textMuted, height: 1.2),
+                maxLines: 2,
+                overflow: TextOverflow.ellipsis,
+              ),
+            ],
 
             // Dedicated ON-HAND Locations & Stock with Legal Disclaimer
             if (onHand.isNotEmpty) ...[
@@ -1316,44 +2653,98 @@ class _PickModeScreenState extends State<PickModeScreen> with WidgetsBindingObse
               runSpacing: 4,
               children: [
                 _infoChip(Icons.inventory_2_rounded, 'Unit: ${widget.unit.name}'),
+                _infoChip(Icons.straighten_rounded, 'UOM: ${part.uom}'),
                 if (pickDate.isNotEmpty) _infoChip(Icons.event_available_rounded, 'Pick: $pickDate'),
                 if (prodDate.isNotEmpty) _infoChip(Icons.precision_manufacturing_rounded, 'Prod: $prodDate'),
                 if (part.resourceId.isNotEmpty) _infoChip(Icons.account_tree_rounded, 'Resource: ${part.resourceId}'),
-                if (part.line.isNotEmpty) _infoChip(Icons.linear_scale_rounded, 'Line: ${part.line}'),
+                if (!_isResourceScope) ...[
+                  if (allLines.isNotEmpty)
+                    for (final l in allLines)
+                      _infoChip(Icons.linear_scale_rounded, 'Line: $l')
+                  else if (part.line.isNotEmpty)
+                    _infoChip(Icons.linear_scale_rounded, 'Line: ${part.line}'),
+                ],
                 if (part.subUnit.isNotEmpty) _infoChip(Icons.view_in_ar_rounded, 'Sub-Unit: ${part.subUnit}'),
               ],
             ),
             const SizedBox(height: 10),
 
-            // Row 4: Work Orders with quantities (per WO)
+            // Row 4: Work Orders with quantities (per WO) — Collapsible when > 6
             if (woItems.isNotEmpty) ...[
-              Text(
-                _isResourceScope ? 'Work Orders & Departments:' : 'Work Orders:',
-                style: const TextStyle(fontSize: 11, color: AppTheme.textMuted, fontWeight: FontWeight.bold),
+              Row(
+                children: [
+                  Text(
+                    _isResourceScope ? 'Work Orders & Departments:' : 'Work Orders:',
+                    style: const TextStyle(fontSize: 11, color: AppTheme.textMuted, fontWeight: FontWeight.bold),
+                  ),
+                  if (woItems.length > 6) ...[
+                    const SizedBox(width: 8),
+                    Text(
+                      '(${woItems.length} total)',
+                      style: const TextStyle(fontSize: 11, color: AppTheme.accentCyan, fontWeight: FontWeight.bold),
+                    ),
+                  ],
+                ],
               ),
               const SizedBox(height: 4),
-              Wrap(
-                spacing: 6,
-                runSpacing: 4,
-                children: woItems.map((wo) {
-                  final woColor = wo.qtyDue <= 0.0001 ? AppTheme.statusComplete : AppTheme.statusPartial;
-                  final label = _isResourceScope
-                      ? '${wo.workOrder} (${wo.department}): ${PicklistItem.formatQty(wo.qtyPicked)}/${PicklistItem.formatQty(wo.qtyRequired)}'
-                      : '${wo.workOrder}: ${PicklistItem.formatQty(wo.qtyPicked)}/${PicklistItem.formatQty(wo.qtyRequired)}';
-                  return Container(
-                    padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 3),
-                    decoration: BoxDecoration(
-                      color: AppTheme.bgDark,
-                      borderRadius: BorderRadius.circular(6),
-                      border: Border.all(color: woColor.withOpacity(0.5)),
-                    ),
-                    child: Text(
-                      label,
-                      style: TextStyle(fontSize: 11, color: woColor, fontWeight: FontWeight.w600),
-                    ),
-                  );
-                }).toList(),
-              ),
+              Builder(builder: (_) {
+                final isExpanded = _expandedWoPartIds.contains(part.partId);
+                final visibleWos = (woItems.length > 6 && !isExpanded) ? woItems.take(6).toList() : woItems;
+                return Wrap(
+                  spacing: 6,
+                  runSpacing: 4,
+                  children: [
+                    ...visibleWos.map((wo) {
+                      final woColor = wo.qtyDue <= 0.0001 ? AppTheme.statusComplete : AppTheme.statusPartial;
+                      final label = _isResourceScope
+                          ? '${wo.workOrder} (${wo.department}): ${PicklistItem.formatQty(wo.qtyPicked)}/${PicklistItem.formatQty(wo.qtyRequired)}'
+                          : '${wo.workOrder}: ${PicklistItem.formatQty(wo.qtyPicked)}/${PicklistItem.formatQty(wo.qtyRequired)}';
+                      return Container(
+                        padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 3),
+                        decoration: BoxDecoration(
+                          color: AppTheme.bgDark,
+                          borderRadius: BorderRadius.circular(6),
+                          border: Border.all(color: woColor.withValues(alpha: 0.5)),
+                        ),
+                        child: Text(
+                          label,
+                          style: TextStyle(fontSize: 11, color: woColor, fontWeight: FontWeight.w600),
+                        ),
+                      );
+                    }),
+                    if (woItems.length > 6)
+                      InkWell(
+                        borderRadius: BorderRadius.circular(6),
+                        onTap: () {
+                          setState(() {
+                            if (isExpanded) {
+                              _expandedWoPartIds.remove(part.partId);
+                            } else {
+                              _expandedWoPartIds.add(part.partId);
+                            }
+                          });
+                        },
+                        child: Container(
+                          padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 3),
+                          decoration: BoxDecoration(
+                            color: AppTheme.cardDark,
+                            borderRadius: BorderRadius.circular(6),
+                            border: Border.all(color: AppTheme.accentCyan.withValues(alpha: 0.6)),
+                          ),
+                          child: Row(
+                            mainAxisSize: MainAxisSize.min,
+                            children: [
+                              Text(
+                                isExpanded ? 'Show less ▴' : '+${woItems.length - 6} more ▾',
+                                style: const TextStyle(fontSize: 11, color: AppTheme.accentCyan, fontWeight: FontWeight.bold),
+                              ),
+                            ],
+                          ),
+                        ),
+                      ),
+                  ],
+                );
+              }),
               const SizedBox(height: 10),
             ],
 
@@ -1494,7 +2885,7 @@ class _PickModeScreenState extends State<PickModeScreen> with WidgetsBindingObse
                             const Text('RETURN QUANTITY (DELTA):',
                                 style: TextStyle(fontSize: 9, color: Color(0xFFE07B00), fontWeight: FontWeight.bold)),
                             Text(
-                              '- ${_returnInputBuffer.isEmpty ? '0' : _returnInputBuffer} pcs',
+                              '- ${_returnInputBuffer.isEmpty ? '0' : _returnInputBuffer} ${part.uomLabel}',
                               style: const TextStyle(fontSize: 24, fontWeight: FontWeight.bold, color: Color(0xFFE07B00)),
                             ),
                           ],
@@ -1605,7 +2996,7 @@ class _PickModeScreenState extends State<PickModeScreen> with WidgetsBindingObse
                           const Text('PICK QUANTITY (DELTA):',
                               style: TextStyle(fontSize: 9, color: AppTheme.textMuted, fontWeight: FontWeight.bold)),
                           Text(
-                            '+ ${_inputBuffer.isEmpty ? '0' : _inputBuffer} pcs',
+                            '+ ${_inputBuffer.isEmpty ? '0' : _inputBuffer} ${part.uomLabel}',
                             style: TextStyle(
                               fontSize: 22,
                               fontWeight: FontWeight.bold,
@@ -1710,6 +3101,104 @@ class _PickModeScreenState extends State<PickModeScreen> with WidgetsBindingObse
                       ),
                     ),
                   ],
+                ),
+                // ──────────────────────────────────────────────────────────────
+                // Partial Picker row: Note | Remove from Picking | Replace Part ID
+                // ──────────────────────────────────────────────────────────────
+                Row(
+                  children: [
+                    // Picker Note
+                    Expanded(
+                      child: OutlinedButton.icon(
+                        style: OutlinedButton.styleFrom(
+                          side: BorderSide(
+                            color: (_userPartNotes[part.partId]?.isNotEmpty ?? false)
+                                ? const Color(0xFF00E5FF)
+                                : const Color(0xFF00E5FF).withValues(alpha: 0.5),
+                          ),
+                          foregroundColor: const Color(0xFF00E5FF),
+                          backgroundColor: (_userPartNotes[part.partId]?.isNotEmpty ?? false)
+                              ? const Color(0xFF00E5FF).withValues(alpha: 0.12)
+                              : Colors.transparent,
+                          padding: const EdgeInsets.symmetric(vertical: 10),
+                          minimumSize: const Size(0, 44),
+                          shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(8)),
+                        ),
+                        icon: const Icon(Icons.comment_rounded, size: 16),
+                        label: Text(
+                          (_userPartNotes[part.partId]?.isNotEmpty ?? false) ? 'Note ✓' : 'Note',
+                          style: const TextStyle(fontSize: 12, fontWeight: FontWeight.bold),
+                        ),
+                        onPressed: () => _showPickerNoteDialog(part),
+                      ),
+                    ),
+                    const SizedBox(width: 8),
+                    // Remove from Picking
+                    Expanded(
+                      child: OutlinedButton.icon(
+                        style: OutlinedButton.styleFrom(
+                          side: BorderSide(
+                            color: _removedFromPickingParts.contains(part.partId)
+                                ? Colors.grey.shade600
+                                : Colors.grey.shade500,
+                          ),
+                          foregroundColor: _removedFromPickingParts.contains(part.partId)
+                              ? Colors.grey.shade500
+                              : Colors.grey.shade300,
+                          backgroundColor: _removedFromPickingParts.contains(part.partId)
+                              ? Colors.grey.shade900
+                              : Colors.transparent,
+                          padding: const EdgeInsets.symmetric(vertical: 10),
+                          minimumSize: const Size(0, 44),
+                          shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(8)),
+                        ),
+                        icon: const Icon(Icons.block_rounded, size: 16),
+                        label: Text(
+                          _removedFromPickingParts.contains(part.partId)
+                              ? '⛔ Removed'
+                              : 'Remove',
+                          style: const TextStyle(fontSize: 12, fontWeight: FontWeight.bold),
+                        ),
+                        onPressed: _removedFromPickingParts.contains(part.partId)
+                            ? null
+                            : () => _showRemoveFromPickingDialog(part),
+                      ),
+                    ),
+                    const SizedBox(width: 8),
+                    // Replace Part ID
+                    Expanded(
+                      child: OutlinedButton.icon(
+                        style: OutlinedButton.styleFrom(
+                          side: const BorderSide(color: Color(0xFFAB47BC)),
+                          foregroundColor: const Color(0xFFCE93D8),
+                          padding: const EdgeInsets.symmetric(vertical: 10),
+                          minimumSize: const Size(0, 44),
+                          shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(8)),
+                        ),
+                        icon: const Icon(Icons.find_replace_rounded, size: 16),
+                        label: const Text('Replace', style: TextStyle(fontSize: 12, fontWeight: FontWeight.bold)),
+                        onPressed: () => _showReplacePartIdDialog(part),
+                      ),
+                    ),
+                  ],
+                ),
+                // ──────────────────────────────────────────────────────────────
+                // Add Part Manually (Pick Mode exclusive)
+                // ──────────────────────────────────────────────────────────────
+                SizedBox(
+                  width: double.infinity,
+                  child: OutlinedButton.icon(
+                    style: OutlinedButton.styleFrom(
+                      side: const BorderSide(color: Color(0xFFBB86FC)),
+                      foregroundColor: const Color(0xFFBB86FC),
+                      padding: const EdgeInsets.symmetric(vertical: 10),
+                      minimumSize: const Size(0, 44),
+                      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(8)),
+                    ),
+                    icon: const Icon(Icons.add_circle_outline_rounded, size: 16),
+                    label: const Text('＋ Add Part Manually', style: TextStyle(fontSize: 13, fontWeight: FontWeight.bold)),
+                    onPressed: _showManualAddPartDialog,
+                  ),
                 ),
                 ], // end of pick vs return else
               ],
@@ -1858,6 +3347,28 @@ class _PickModeScreenState extends State<PickModeScreen> with WidgetsBindingObse
           ],
         ),
       ),
+    );
+  }
+}
+
+/// Input formatter that enforces uppercase A-Z / 0-9 only for Part ID replacement.
+/// Strips spaces, special characters and auto-converts lowercase to uppercase.
+class _UpperAlphanumericInputFormatter extends TextInputFormatter {
+  static final _pattern = RegExp(r'[^A-Z0-9]');
+
+  @override
+  TextEditingValue formatEditUpdate(
+    TextEditingValue oldValue,
+    TextEditingValue newValue,
+  ) {
+    final filtered = newValue.text.toUpperCase().replaceAll(_pattern, '');
+    // Adjust cursor offset if characters were removed
+    final newOffset = filtered.length < newValue.selection.baseOffset
+        ? filtered.length
+        : newValue.selection.baseOffset;
+    return newValue.copyWith(
+      text: filtered,
+      selection: TextSelection.collapsed(offset: newOffset.clamp(0, filtered.length)),
     );
   }
 }

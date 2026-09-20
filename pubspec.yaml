@@ -1,7 +1,7 @@
 name: picklist_tracker
 description: "Android tablet application for Excel picklist tracking, FIFO work order allocation, and session management."
 publish_to: 'none'
-version: 1.0.1
+version: 1.0.2
 
 environment:
   sdk: '>=3.0.0 <4.0.0'

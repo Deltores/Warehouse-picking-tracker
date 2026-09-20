@@ -108,16 +108,40 @@ lib/
 ### Pick Mode Split Screen & Anti-Clear Delta Picking (pick_mode_screen.dart)
 - Upper screen: Large Part ID, Description, ON_HAND location/stock info, metadata chips, status badge (red if missing), and stats (Picked, Due, Required).
 - Lower screen: Integrated touch console with numeric keypad (0-9, `.`, Backspace, Clear), delta input display, Confirm Pick (+X), Match Due (+N), Return Picked, Missing Part, and nav buttons.
+- **Confirm Pick Preview Overlay**:
+  - Displays Part ID, Description, ON-HAND location badge, Unit, UOM, Line, and Resource chips.
+  - **Multi-Department & Work Orders Display**: In Whole Resource mode (`_isResourceScope`) or multi-department parts, every destination department is rendered as an individual chip (`Dept: {Name}`).
+  - **Simulated Post-Pick FIFO Allocation**: Previews exact quantity allocation per Work Order and Department (`{WO} ({Dept}): {Picked} → {NewPicked}/{Required}` in bright green if completed, yellow if partial), enabling workers to visually verify how their delta is distributed before committing.
+  - **Scrollable Safety Layout**: Wrapped in a responsive `SingleChildScrollView` to prevent screen overflow on tablets regardless of the number of work orders or departments.
 - **Delta Picking**: Keypad inputs the delta to add to SQLite.
 - **Anti-Clear Protection**: Clear button resets only the pending keypad input buffer; once saved in SQLite, quantities cannot be zeroed out by typing.
 - **Returns**: Strictly performed via the "Return Picked" dialog requiring worker name and a minimum 10-character reason, logged in `pick_returns`.
 - **Decimal Support**: Quantities are stored as `double` to support measurement units (m, ft, kg, etc.).
-- **Missing Part**: Recorded in SQLite `part_flags` table; displayed in red badge. If the part is subsequently fully picked (`qtyPicked >= qtyRequired`), the `MISSING` flag is automatically cleared from `part_flags` and the red badge is removed.
+- **Missing Part Auto-Clear on First Pick**: Recorded in SQLite `part_flags` table; displayed in red badge. Upon the very first confirmed pick (`delta > 0`), the `MISSING` flag is automatically removed from SQLite and local state, and the red badge disappears immediately.
 - **Strict Group Isolation**: Each 3rd-level group (Department, Resource ID, or Line) is completely solid and isolated during linear picking. Next, Previous, and auto-advance never cross boundaries to other Resource IDs, Lines, or Departments.
 - **Smooth Auto-Advance Loop**: When the end of the parts list is reached with auto-advance enabled, the view smoothly animates (`animateToPage`) back to the first incomplete part (`due > 0.0001 || isMissing`).
 - **15-Minute Admin Session Window**: Any action in the Admin panel requires admin PIN authorization within the last 15 minutes. Inactivity beyond 15 minutes or any screen interaction after expiry immediately terminates the admin session and returns the user to HomeScreen.
 - **Admin PIN Protection in Super Admin Logs**: Changing the Admin PIN is strictly accessible from Tab 7 (System Logs), which is gated by the Super Admin PIN (default 7777).
-- **Standard Pickers (Admin-Managed)**: Worker names can only be added or removed by admins in AdminScreen Tab 1. In Step 1 of the picker flow, manual worker name typing is disabled to prevent duplicate/typo profiles.
+- **Manual Part Addition, Replacement & Removal (Scoped & Persisted)**:
+  - **Scoped Actions & Duplicate Prevention**: Part addition, replacement, and removal are strictly confined to the active scope (current Department or active MAIN LINE Resource ID). When replacing or removing a Part ID, SQLite updates only rows within that specific department/resource, leaving the same Part ID in other departments completely untouched. Duplicate check verifies existing Part IDs strictly within the active scope.
+  - **Full SQLite Persistence**: Manually added parts are saved to both `manual_picks` and `picklist_items` (`row_order = 999999`, `qty_required = qtyPicked`, `qty_due = 0`), ensuring they appear in `GroupingTreeView`, unit progress, and subsequent sessions.
+  - **Removed Parts Carousel Exclusion & List-Recovery**: Parts marked as `REMOVED` are omitted from the normal linear Pick Mode carousel and auto-advance loops. However, pickers can select and open a removed part directly from the List/Tree view. When opened, Pick Mode displays the removed part; if a pick is confirmed (`delta > 0`), the `REMOVED` status is automatically unmarked from DB (`unmarkPartRemoval`) and the part returns to active picked status. If the picker navigates away (`Next` or `Prev`) without picking, the removed part immediately drops out of the carousel.
+  - **Fixed-Width & Multiline Comment Expansion**: All comment, reason, and note input fields in dialogs (Add Part, Remove Part, Replace Part, Picker Note, Return dialog) are constrained to a fixed-width container (`SizedBox(width: 480)`) with multiline input (`minLines: 2-3`, `maxLines: 5-6`), expanding vertically downwards instead of stretching horizontally.
+  - **Distinct Badges & Status Colors (Shown in Pick Mode and Grouping Tree)**:
+    - **MANUAL ADD**: Purple/Violet (`#BB86FC`), badge `➕ MANUAL ADD • by [Worker]: "[Note]"`.
+    - **REPLACED**: Cyan (`#00E5FF`), badge `🔄 REPLACED • was: [OldPart] ([Note])` (always visible even if note is empty).
+    - **REMOVED**: Muted Grey (`#757575`), badge `⛔ REMOVED FROM PICKING • [Reason]`.
+    - **MISSING**: Red (`#FF3B30`), badge `⚠️ MISSING • [Worker] • [Date]`.
+    - **Picker Note**: Cyan (`#00E5FF`), badge `Picker Note: [Note]`.
+- **Work Orders Display (Expand/Collapse for > 6)**: For parts with many Work Orders (up to 30), if $\le 6$ WOs exist, all are rendered directly; if $> 6$, the first 6 chips are displayed with an interactive `+X more ▾` toggle.
+- **Single ON-HAND Display**: PickModeScreen renders ON-HAND information exclusively in the dedicated lower informational card (`ON-HAND LOCATIONS & INVENTORY [Informational Only]`), omitting redundant upper chips.
+- **Free-Form Picker Notes & Consolidated Technical Comment Export**:
+  - Pickers can write, edit, or clear custom notes for any part via `[💬 Note]` in Pick Mode console, saved in SQLite `part_flags` (`flag_type = 'USER_NOTE'`).
+  - Rendered with a cyan note badge in both `PickModeScreen` and `GroupingTreeView`.
+  - Excel exports include two comment columns:
+    1. **`Technical Comments`**: single consolidated column for all technical events (`➕ MANUAL ADD`, `🔄 REPLACED`, `⛔ REMOVED`, `⚠️ MISSING`, `RETURN`).
+    2. **`Picker Note`**: worker's free-form custom comments.
+    - Rows with either technical comments or picker notes are sorted to the top (comments-first sorting).
 - **Exit to Home Session Termination**: Exiting from Picker flow or picking to HomeScreen automatically terminates/closes any active picking sessions to prevent dangling session locks.
 
 ### Departments vs Component Resource IDs vs Grouping Presets
@@ -151,6 +175,7 @@ lib/
       - **Row 2**: Label `View Mode:` + the interactive live toggle (`_buildResourceToggle` or `_buildDepartmentLineToggle`) with 2-minute unlock countdown badge.
     - **Step 3 Department Filtering & Completed Sorting**: In `PickerFlowScreen` Step 3, departments with `0 / 0 parts` (e.g. when all component resources are picked via Whole Resource mode) are completely hidden. Completed departments are sorted to the very bottom of the list, keeping incomplete departments prioritized by urgency at top.
     - **Per-Resource Admin Configuration**: Each MAIN LINE resource is configured individually with its own default view (`Combined` vs `By Dept`) directly on its card in Admin Tab 5 (the redundant global toggle was removed).
+    - **Line Chip Omission in Whole Resource Mode & Multi-Line Department Display**: When picking in Whole Resource mode (`_isResourceScope`), `Line:` chips are completely omitted from Pick Mode (upper card, header, and confirmation dialog) because parts are grouped across all departments by resource, and line levels do not apply. In standard Department mode (Subassembly/Assembly), all distinct lines where a part is used in that department are displayed as individual chips (`Line: {Name}`). In the Pick Mode header, redundant `Line: Resource ID: ...` labels are suppressed in Whole Resource mode.
 - **ON-HAND Location Display**: Displayed side-by-side with Part Description across all picking views (Grouping Tree leaves, Pick Mode console/header, and Confirm Pick dialog), resolved using the first non-empty value for that Part ID.
 - **Dependency Rule**: If a Component Resource ID is blocked from picking on this tablet, its Auto-Issue setting is **disabled and inactive**.
 - **(Empty / Unassigned) Support**: Parts with missing/blank Resource IDs are explicitly listed as `(Empty / Unassigned)` in Component Resources with both picking permission and auto-issue support.

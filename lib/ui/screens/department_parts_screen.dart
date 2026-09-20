@@ -161,12 +161,12 @@ class DepartmentPartsView extends StatelessWidget {
                           padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
                           decoration: BoxDecoration(
                             color: part.onHand.isNotEmpty
-                                ? AppTheme.accentCyan.withOpacity(0.12)
-                                : AppTheme.cardDark.withOpacity(0.5),
+                                ? AppTheme.accentCyan.withValues(alpha: 0.12)
+                                : AppTheme.cardDark.withValues(alpha: 0.5),
                             borderRadius: BorderRadius.circular(4),
                             border: Border.all(
                               color: part.onHand.isNotEmpty
-                                  ? AppTheme.accentCyan.withOpacity(0.4)
+                                  ? AppTheme.accentCyan.withValues(alpha: 0.4)
                                   : AppTheme.borderDark,
                             ),
                           ),

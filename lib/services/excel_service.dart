@@ -75,7 +75,7 @@ class ExcelService {
     final defaultUnitName = p.basenameWithoutExtension(filePath);
     final items = <PicklistItem>[];
     final departments = <String>{};
-    final uuid = const Uuid();
+    const uuid = Uuid();
 
     final fileUnitId = defaultUnitName;
 
@@ -148,6 +148,29 @@ class ExcelService {
           }
         }
       }
+      var uom = getVal(ColumnMapper.keyUom, '');
+      if (uom.isEmpty) {
+        for (final entry in rawColumns.entries) {
+          final norm = ColumnMapper.normalize(entry.key);
+          if (norm == 'UOM' ||
+              norm == 'UM' ||
+              norm == 'U M' ||
+              norm == 'UNIT OF MEASURE' ||
+              norm == 'UNIT OF MEASUREMENT' ||
+              norm == 'MEASURE' ||
+              norm == 'MEAS' ||
+              norm == 'QTY UOM' ||
+              norm == 'UOM CODE') {
+            final v = entry.value?.toString().trim() ?? '';
+            if (v.isNotEmpty && v.toLowerCase() != 'null') {
+              uom = v;
+              break;
+            }
+          }
+        }
+      }
+      rawColumns['_uom'] = uom.isNotEmpty ? uom : 'NA';
+
       final deptTypeRaw = getVal(ColumnMapper.keyDeptType, '');
       final deptType = ColumnMapper.parseDeptType(deptTypeRaw);
 
@@ -198,6 +221,80 @@ class ExcelService {
     };
   }
 
+  /// Calculates the export sorting tier for a picklist item:
+  /// - Tier 0: Any row with any comments (Picker Note, return comments, remove reason/flag, missing flag).
+  /// - Tier 1: Manually added parts (isManualAdd).
+  /// - Tier 2: Replaced parts (replacedPartId is not empty).
+  /// - Tier 3: Standard unedited parts.
+  static int getItemSortingTier({
+    required PicklistItem item,
+    required Map<String, String> partNotes,
+    required Map<String, List<String>> returnComments,
+    required Map<String, String> removeComments,
+    required Map<String, dynamic>? missingFlag,
+  }) {
+    final pickerNote = partNotes[item.partId] ?? '';
+    final hasReturn = (returnComments[item.partId]?.isNotEmpty ?? false);
+    final removeNote = removeComments[item.partId] ?? item.removeNote;
+    final flagType = missingFlag?['flag_type']?.toString().toUpperCase() ?? '';
+    final isFlagRemoved = flagType == 'REMOVED';
+    final isRemoved = item.isRemoved || removeNote.isNotEmpty || isFlagRemoved;
+    final isMissing = flagType == 'MISSING';
+
+    final hasAnyComment = pickerNote.isNotEmpty || hasReturn || isRemoved || isMissing;
+    if (hasAnyComment) return 0; // Tier 0: Any comments, removed, missing, or returns
+    if (item.isManualAdd) return 1; // Tier 1: Manually added parts
+    if (item.replacedPartId.isNotEmpty) return 2; // Tier 2: Replaced parts
+    return 3; // Tier 3: Standard parts
+  }
+
+  static int compareItemsByTier({
+    required PicklistItem a,
+    required PicklistItem b,
+    required Map<String, String> partNotes,
+    required Map<String, List<String>> returnComments,
+    required Map<String, String> removeComments,
+    required Map<String, Map<String, dynamic>> partFlags,
+  }) {
+    final tierA = getItemSortingTier(
+      item: a,
+      partNotes: partNotes,
+      returnComments: returnComments,
+      removeComments: removeComments,
+      missingFlag: partFlags[a.partId],
+    );
+    final tierB = getItemSortingTier(
+      item: b,
+      partNotes: partNotes,
+      returnComments: returnComments,
+      removeComments: removeComments,
+      missingFlag: partFlags[b.partId],
+    );
+    if (tierA != tierB) {
+      return tierA.compareTo(tierB);
+    }
+    return a.rowOrder.compareTo(b.rowOrder);
+  }
+
+  static String formatMissingComment(Map<String, dynamic> flag) {
+    final ts = flag['created_at'] as int?;
+    final dateStr = ts != null
+        ? DateFormat('yyyy-MM-dd').format(DateTime.fromMillisecondsSinceEpoch(ts))
+        : '';
+    final note = flag['note']?.toString() ?? '';
+    String pickerName = flag['worker_name']?.toString() ?? '';
+    if (pickerName.isEmpty) {
+      if (note.contains('Marked missing by ')) {
+        pickerName = note.replaceAll('Marked missing by ', '').replaceAll(' in Pick Mode', '').trim();
+      } else if (note.isNotEmpty) {
+        pickerName = note;
+      } else {
+        pickerName = 'Picker';
+      }
+    }
+    return '⚠️ MISSING • $pickerName${dateStr.isNotEmpty ? ' • $dateStr' : ''}';
+  }
+
   /// Exports the picking results to a new file named after the session display name.
   ///
   /// Output path: `{exportDir}/{sessionDisplayName}_{timestamp}.xlsx`
@@ -215,6 +312,10 @@ class ExcelService {
     Map<String, List<String>> returnComments = const {},
     String? outputPath,
     List<String> autoIssueResourceIds = const [],
+    Map<String, String> removeComments = const {},
+    List<Map<String, dynamic>> manualPicks = const [],
+    Map<String, String> partNotes = const {},
+    Map<String, Map<String, dynamic>> partFlags = const {},
   }) async {
     final originalFile = File(originalFilePath);
     if (!await originalFile.exists()) {
@@ -331,12 +432,16 @@ class ExcelService {
       'Start Time',
       'End Time',
       'Issued Status',
-      'Return Comments',
+      'Technical Comments',
+      'Picker Note',
     ];
 
     final serviceColIndices = <String, int>{};
     for (final sHeader in serviceHeaders) {
-      final existingCol = headerToCol[sHeader.toLowerCase()];
+      int? existingCol = headerToCol[sHeader.toLowerCase()];
+      if (sHeader == 'Technical Comments' && existingCol == null) {
+        existingCol = headerToCol['system comments'];
+      }
       if (existingCol != null) {
         serviceColIndices[sHeader] = existingCol;
       } else {
@@ -376,50 +481,149 @@ class ExcelService {
     }
 
     int outRowIdx = 1;
-    // Export data rows — ONLY those with qtyPicked > 0 or belonging to Auto-Issue resource IDs
-    for (int rowIdx = 1; rowIdx < sheet.rows.length; rowIdx++) {
-      final item = itemByRowOrder[rowIdx];
-      if (item == null) continue;
 
+    CellValue qtyToCell(double val) {
+      if (val % 1 == 0) return IntCellValue(val.toInt());
+      return DoubleCellValue(val);
+    }
+
+    // Incorporate manual picks into export items if not already present
+    final allExportItems = List<PicklistItem>.from(items);
+    final existingPartIds = allExportItems.map((i) => i.partId).toSet();
+    for (final mp in manualPicks) {
+      final mpPartId = mp['part_id']?.toString() ?? '';
+      if (mpPartId.isNotEmpty && !existingPartIds.contains(mpPartId)) {
+        final mpQty = (mp['qty_picked'] as num?)?.toDouble() ?? 0.0;
+        final mpNote = mp['note']?.toString() ?? '';
+        final mpDept = mp['department']?.toString() ?? '';
+        final mpWo = mp['work_order']?.toString() ?? 'MANUAL';
+        final mpWorker = mp['worker_name']?.toString() ?? session.workerName;
+        allExportItems.add(PicklistItem(
+          id: 'manual_${mpPartId}_${mp['created_at']}',
+          unitId: session.unitId,
+          department: mpDept,
+          line: '',
+          workOrder: mpWo,
+          partId: mpPartId,
+          partDescription: mpNote,
+          qtyRequired: mpQty,
+          qtyDue: 0.0,
+          qtyPicked: mpQty,
+          rowOrder: 999999,
+          rawColumns: {
+            '_manual_add': true,
+            '_manual_note': mpNote,
+            '_manual_worker': mpWorker,
+          },
+        ));
+      }
+    }
+
+    // Collect eligible rows first so we can sort (Tier 0 Comments -> Tier 1 Added -> Tier 2 Replaced -> Tier 3 Standard)
+    final eligibleItems = <PicklistItem>[];
+    for (final item in allExportItems) {
       final isComponentResEmpty = item.componentResourceId.trim().isEmpty;
       final isAutoResource = isComponentResEmpty
           ? autoIssueResourceIds.any((r) => r.trim().isEmpty || r == '(Empty / Unassigned)')
           : autoIssueResourceIds.any((r) => r.trim().toLowerCase() == item.componentResourceId.trim().toLowerCase());
 
-      final shouldExport = item.qtyPicked > 0.0001 || isAutoResource;
-      if (!shouldExport) {
-        continue; // Skip unpicked and non-auto-issued rows!
-      }
+      final tier = getItemSortingTier(
+        item: item,
+        partNotes: partNotes,
+        returnComments: returnComments,
+        removeComments: removeComments,
+        missingFlag: partFlags[item.partId],
+      );
+      final isNonStandard = tier < 3;
 
-      // Copy original cells from this row according to header mapping
-      final origRow = sheet.rows[rowIdx];
-      for (int c = 0; c < origRow.length && c < origHeaders.length; c++) {
-        final cellVal = origRow[c]?.value;
-        final targetCol = headerToCol[origHeaders[c].toLowerCase()];
-        if (targetCol != null && cellVal != null) {
-          outSheet.cell(CellIndex.indexByColumnRow(columnIndex: targetCol, rowIndex: outRowIdx)).value = cellVal;
+      final shouldExport = item.qtyPicked > 0.0001 || isAutoResource || isNonStandard;
+      if (!shouldExport) {
+        continue;
+      }
+      eligibleItems.add(item);
+    }
+
+    // Sort: Tier 0 (Comments) -> Tier 1 (Added) -> Tier 2 (Replaced) -> Tier 3 (Standard)
+    eligibleItems.sort((a, b) => compareItemsByTier(
+          a: a,
+          b: b,
+          partNotes: partNotes,
+          returnComments: returnComments,
+          removeComments: removeComments,
+          partFlags: partFlags,
+        ));
+
+    // Export eligible data rows
+    for (final item in eligibleItems) {
+      final rowIdx = item.rowOrder;
+      final isComponentResEmpty = item.componentResourceId.trim().isEmpty;
+      final isAutoResource = isComponentResEmpty
+          ? autoIssueResourceIds.any((r) => r.trim().isEmpty || r == '(Empty / Unassigned)')
+          : autoIssueResourceIds.any((r) => r.trim().toLowerCase() == item.componentResourceId.trim().toLowerCase());
+
+      if (rowIdx > 0 && rowIdx < sheet.rows.length) {
+        // Copy original cells from this row according to header mapping
+        final origRow = sheet.rows[rowIdx];
+        for (int c = 0; c < origRow.length && c < origHeaders.length; c++) {
+          final cellVal = origRow[c]?.value;
+          final targetCol = headerToCol[origHeaders[c].toLowerCase()];
+          if (targetCol != null && cellVal != null) {
+            outSheet.cell(CellIndex.indexByColumnRow(columnIndex: targetCol, rowIndex: outRowIdx)).value = cellVal;
+          }
+        }
+      } else {
+        // Manually added part or row outside original sheet
+        for (final h in orderedHeaders) {
+          final key = columnMapper.identifyColumn(h);
+          final targetCol = headerToCol[h.toLowerCase()];
+          if (targetCol == null) continue;
+          if (key == ColumnMapper.keyPartId) {
+            outSheet.cell(CellIndex.indexByColumnRow(columnIndex: targetCol, rowIndex: outRowIdx)).value =
+                TextCellValue(item.partId);
+          } else if (key == ColumnMapper.keyPartDescription) {
+            outSheet.cell(CellIndex.indexByColumnRow(columnIndex: targetCol, rowIndex: outRowIdx)).value =
+                TextCellValue(item.partDescription.isNotEmpty ? item.partDescription : (item.manualNote.isNotEmpty ? 'MANUAL ADD: ${item.manualNote}' : ''));
+          } else if (key == ColumnMapper.keyDepartment) {
+            outSheet.cell(CellIndex.indexByColumnRow(columnIndex: targetCol, rowIndex: outRowIdx)).value =
+                TextCellValue(item.department);
+          } else if (key == ColumnMapper.keyWorkOrder) {
+            outSheet.cell(CellIndex.indexByColumnRow(columnIndex: targetCol, rowIndex: outRowIdx)).value =
+                TextCellValue(item.workOrder);
+          } else if (key == ColumnMapper.keyLine) {
+            outSheet.cell(CellIndex.indexByColumnRow(columnIndex: targetCol, rowIndex: outRowIdx)).value =
+                TextCellValue(item.line);
+          } else if (key == ColumnMapper.keyResourceId) {
+            outSheet.cell(CellIndex.indexByColumnRow(columnIndex: targetCol, rowIndex: outRowIdx)).value =
+                TextCellValue(item.resourceId);
+          } else if (key == ColumnMapper.keyComponentResourceId) {
+            outSheet.cell(CellIndex.indexByColumnRow(columnIndex: targetCol, rowIndex: outRowIdx)).value =
+                TextCellValue(item.componentResourceId);
+          } else if (key == ColumnMapper.keyUom) {
+            outSheet.cell(CellIndex.indexByColumnRow(columnIndex: targetCol, rowIndex: outRowIdx)).value =
+                TextCellValue(item.uom);
+          } else if (key == ColumnMapper.keyOnHand) {
+            outSheet.cell(CellIndex.indexByColumnRow(columnIndex: targetCol, rowIndex: outRowIdx)).value =
+                TextCellValue(item.onHand);
+          } else if (key == ColumnMapper.keyUnit) {
+            outSheet.cell(CellIndex.indexByColumnRow(columnIndex: targetCol, rowIndex: outRowIdx)).value =
+                TextCellValue(item.subUnit.isNotEmpty ? item.subUnit : unitName);
+          }
         }
       }
 
       // Also copy any raw columns from item.rawColumns if not already set
       for (final e in item.rawColumns.entries) {
+        if (e.key.startsWith('_')) continue;
         final targetCol = headerToCol[e.key.toLowerCase()];
         if (targetCol != null) {
           final cell = outSheet.cell(CellIndex.indexByColumnRow(columnIndex: targetCol, rowIndex: outRowIdx));
-          if (cell.value == null) {
-            cell.value = TextCellValue(e.value.toString());
-          }
+          cell.value ??= TextCellValue(e.value.toString());
         }
       }
 
       final woKey = '${item.department}___${item.workOrder}';
       final woStatus = woStatusMap[woKey] ?? 'Not Picked';
       final woProgress = woProgressMap[woKey] ?? '0.0%';
-
-      CellValue qtyToCell(double val) {
-        if (val % 1 == 0) return IntCellValue(val.toInt());
-        return DoubleCellValue(val);
-      }
 
       final pickedVal = isAutoResource ? item.qtyRequired : item.qtyPicked;
       final dueVal = isAutoResource ? 0.0 : item.qtyDue;
@@ -458,12 +662,38 @@ class ExcelService {
       outSheet.cell(CellIndex.indexByColumnRow(columnIndex: serviceColIndices['Issued Status']!, rowIndex: outRowIdx)).value =
           TextCellValue(session.issuedStatus);
 
-      // Return Comments: join all return comments for this part ID with " | " separator
-      if (serviceColIndices.containsKey('Return Comments')) {
-        final comments = returnComments[item.partId] ?? [];
-        final commentsStr = comments.join(' | ');
-        outSheet.cell(CellIndex.indexByColumnRow(columnIndex: serviceColIndices['Return Comments']!, rowIndex: outRowIdx)).value =
-            commentsStr.isNotEmpty ? TextCellValue(commentsStr) : TextCellValue('');
+      // Populate Technical Comments and Picker Note
+      final techComments = <String>[];
+      if (item.isManualAdd) {
+        techComments.add('➕ MANUAL ADD${item.manualWorker.isNotEmpty ? ' • by ${item.manualWorker}' : ''}${item.manualNote.isNotEmpty ? ': "${item.manualNote}"' : ''}');
+      }
+      if (item.replacedPartId.isNotEmpty) {
+        techComments.add('🔄 REPLACED • was: ${item.replacedPartId}${item.replacementNote.isNotEmpty ? ' (${item.replacementNote})' : ''}');
+      }
+      var removeNote = removeComments[item.partId] ?? item.removeNote;
+      final flagType = partFlags[item.partId]?['flag_type']?.toString().toUpperCase() ?? '';
+      if (removeNote.isEmpty && flagType == 'REMOVED') {
+        removeNote = partFlags[item.partId]?['note']?.toString() ?? '';
+      }
+      if (item.isRemoved || removeNote.isNotEmpty || flagType == 'REMOVED') {
+        techComments.add('⛔ REMOVED FROM PICKING${removeNote.isNotEmpty ? ' • $removeNote' : ''}');
+      }
+      final missingFlag = partFlags[item.partId];
+      if (missingFlag != null && missingFlag['flag_type']?.toString().toUpperCase() == 'MISSING') {
+        techComments.add(formatMissingComment(missingFlag));
+      }
+      final itemRetComments = returnComments[item.partId] ?? [];
+      if (itemRetComments.isNotEmpty) {
+        techComments.add('RETURN: ${itemRetComments.join(', ')}');
+      }
+      final techCol = serviceColIndices['Technical Comments'] ?? serviceColIndices['System Comments'];
+      if (techCol != null) {
+        outSheet.cell(CellIndex.indexByColumnRow(columnIndex: techCol, rowIndex: outRowIdx)).value =
+            TextCellValue(techComments.join(' | '));
+      }
+      if (serviceColIndices.containsKey('Picker Note')) {
+        outSheet.cell(CellIndex.indexByColumnRow(columnIndex: serviceColIndices['Picker Note']!, rowIndex: outRowIdx)).value =
+            TextCellValue(partNotes[item.partId] ?? '');
       }
 
       outRowIdx++;
@@ -556,6 +786,10 @@ class ExcelService {
     Map<String, List<String>> unitAutoIssueResourceIds = const {},
     Map<String, Set<String>> unitBatchPickedPartIds = const {},
     String issuedStatus = 'Pending Issue',
+    Map<String, Map<String, String>> unitRemoveComments = const {},
+    Map<String, List<Map<String, dynamic>>> unitManualPicks = const {},
+    Map<String, Map<String, String>> unitPartNotes = const {},
+    Map<String, Map<String, Map<String, dynamic>>> unitPartFlags = const {},
   }) async {
     if (sessions.isEmpty) {
       throw Exception('No sessions provided for batch export.');
@@ -663,12 +897,16 @@ class ExcelService {
       'Start Time',
       'End Time',
       'Issued Status',
-      'Return Comments',
+      'Technical Comments',
+      'Picker Note',
     ];
 
     final serviceColIndices = <String, int>{};
     for (final sHeader in serviceHeaders) {
-      final existingCol = headerToOutCol[sHeader.toLowerCase()];
+      int? existingCol = headerToOutCol[sHeader.toLowerCase()];
+      if (sHeader == 'Technical Comments' && existingCol == null) {
+        existingCol = headerToOutCol['system comments'];
+      }
       if (existingCol != null) {
         serviceColIndices[sHeader] = existingCol;
       } else {
@@ -711,7 +949,11 @@ class ExcelService {
       final items = unitItems[unitId] ?? [];
       final unitName = unitNames[unitId] ?? unitId;
       final returnComments = unitReturnComments[unitId] ?? {};
+      final removeComments = unitRemoveComments[unitId] ?? {};
+      final manualPicks = unitManualPicks[unitId] ?? [];
       final autoIssueResourceIds = unitAutoIssueResourceIds[unitId] ?? [];
+      final partNotes = unitPartNotes[unitId] ?? {};
+      final currentUnitFlags = unitPartFlags[unitId] ?? {};
 
       final file = File(filePath);
       if (!await file.exists()) continue;
@@ -786,10 +1028,41 @@ class ExcelService {
       final unitHeaderRow = unitSheet.rows.first;
       final sourceFileName = p.basename(filePath);
 
-      for (int rowIdx = 1; rowIdx < unitSheet.rows.length; rowIdx++) {
-        final item = itemByRowOrder[rowIdx];
-        if (item == null) continue;
+      // Incorporate manual picks into export items for this unit if not already present
+      final allUnitExportItems = List<PicklistItem>.from(items);
+      final existingPartIds = allUnitExportItems.map((i) => i.partId).toSet();
+      for (final mp in manualPicks) {
+        final mpPartId = mp['part_id']?.toString() ?? '';
+        if (mpPartId.isNotEmpty && !existingPartIds.contains(mpPartId)) {
+          final mpQty = (mp['qty_picked'] as num?)?.toDouble() ?? 0.0;
+          final mpNote = mp['note']?.toString() ?? '';
+          final mpDept = mp['department']?.toString() ?? '';
+          final mpWo = mp['work_order']?.toString() ?? 'MANUAL';
+          final mpWorker = mp['worker_name']?.toString() ?? workers;
+          allUnitExportItems.add(PicklistItem(
+            id: 'manual_${mpPartId}_${mp['created_at']}',
+            unitId: unitId,
+            department: mpDept,
+            line: '',
+            workOrder: mpWo,
+            partId: mpPartId,
+            partDescription: mpNote,
+            qtyRequired: mpQty,
+            qtyDue: 0.0,
+            qtyPicked: mpQty,
+            rowOrder: 999999,
+            rawColumns: {
+              '_manual_add': true,
+              '_manual_note': mpNote,
+              '_manual_worker': mpWorker,
+            },
+          ));
+        }
+      }
 
+      // Collect eligible rows first so we can sort (Tier 0 Comments -> Tier 1 Added -> Tier 2 Replaced -> Tier 3 Standard)
+      final eligibleItems = <PicklistItem>[];
+      for (final item in allUnitExportItems) {
         final isComponentResEmpty = item.componentResourceId.trim().isEmpty;
         final isAutoResource = isComponentResEmpty
             ? autoIssueResourceIds.any((r) => r.trim().isEmpty || r == '(Empty / Unassigned)')
@@ -800,31 +1073,98 @@ class ExcelService {
             ? batchPartIds.contains(item.partId)
             : item.qtyPicked > 0.0001;
 
-        final shouldExport = wasPickedInBatch || isAutoResource;
-        if (!shouldExport) continue;
+        final tier = getItemSortingTier(
+          item: item,
+          partNotes: partNotes,
+          returnComments: returnComments,
+          removeComments: removeComments,
+          missingFlag: currentUnitFlags[item.partId],
+        );
+        final isNonStandard = tier < 3;
+
+        if (wasPickedInBatch || isAutoResource || isNonStandard) {
+          eligibleItems.add(item);
+        }
+      }
+
+      // Sort: Tier 0 (Comments) -> Tier 1 (Added) -> Tier 2 (Replaced) -> Tier 3 (Standard)
+      eligibleItems.sort((a, b) => compareItemsByTier(
+            a: a,
+            b: b,
+            partNotes: partNotes,
+            returnComments: returnComments,
+            removeComments: removeComments,
+            partFlags: currentUnitFlags,
+          ));
+
+      for (final item in eligibleItems) {
+        final rowIdx = item.rowOrder;
+        final isComponentResEmpty = item.componentResourceId.trim().isEmpty;
+        final isAutoResource = isComponentResEmpty
+            ? autoIssueResourceIds.any((r) => r.trim().isEmpty || r == '(Empty / Unassigned)')
+            : autoIssueResourceIds.any((r) => r.trim().toLowerCase() == item.componentResourceId.trim().toLowerCase());
 
         // Write source File Name in Column 0
         outSheet.cell(CellIndex.indexByColumnRow(columnIndex: 0, rowIndex: outRowIdx)).value =
             TextCellValue(sourceFileName);
 
-        final origRow = unitSheet.rows[rowIdx];
-        for (int c = 0; c < origRow.length && c < unitHeaderRow.length; c++) {
-          final uHeader = unitHeaderRow[c]?.value?.toString().trim().toLowerCase() ?? '';
-          final targetCol = headerToOutCol[uHeader];
-          final cellVal = origRow[c]?.value;
-          if (targetCol != null && cellVal != null) {
-            outSheet.cell(CellIndex.indexByColumnRow(columnIndex: targetCol, rowIndex: outRowIdx)).value = cellVal;
+        if (rowIdx > 0 && rowIdx < unitSheet.rows.length) {
+          final origRow = unitSheet.rows[rowIdx];
+          for (int c = 0; c < origRow.length && c < unitHeaderRow.length; c++) {
+            final uHeader = unitHeaderRow[c]?.value?.toString().trim().toLowerCase() ?? '';
+            final targetCol = headerToOutCol[uHeader];
+            final cellVal = origRow[c]?.value;
+            if (targetCol != null && cellVal != null) {
+              outSheet.cell(CellIndex.indexByColumnRow(columnIndex: targetCol, rowIndex: outRowIdx)).value = cellVal;
+            }
+          }
+        } else {
+          // Manually added part or row outside original sheet
+          for (final h in orderedHeaders) {
+            final key = columnMapper.identifyColumn(h);
+            final targetCol = headerToOutCol[h.toLowerCase()];
+            if (targetCol == null) continue;
+            if (key == ColumnMapper.keyPartId) {
+              outSheet.cell(CellIndex.indexByColumnRow(columnIndex: targetCol, rowIndex: outRowIdx)).value =
+                  TextCellValue(item.partId);
+            } else if (key == ColumnMapper.keyPartDescription) {
+              outSheet.cell(CellIndex.indexByColumnRow(columnIndex: targetCol, rowIndex: outRowIdx)).value =
+                  TextCellValue(item.partDescription.isNotEmpty ? item.partDescription : (item.manualNote.isNotEmpty ? 'MANUAL ADD: ${item.manualNote}' : ''));
+            } else if (key == ColumnMapper.keyDepartment) {
+              outSheet.cell(CellIndex.indexByColumnRow(columnIndex: targetCol, rowIndex: outRowIdx)).value =
+                  TextCellValue(item.department);
+            } else if (key == ColumnMapper.keyWorkOrder) {
+              outSheet.cell(CellIndex.indexByColumnRow(columnIndex: targetCol, rowIndex: outRowIdx)).value =
+                  TextCellValue(item.workOrder);
+            } else if (key == ColumnMapper.keyLine) {
+              outSheet.cell(CellIndex.indexByColumnRow(columnIndex: targetCol, rowIndex: outRowIdx)).value =
+                  TextCellValue(item.line);
+            } else if (key == ColumnMapper.keyResourceId) {
+              outSheet.cell(CellIndex.indexByColumnRow(columnIndex: targetCol, rowIndex: outRowIdx)).value =
+                  TextCellValue(item.resourceId);
+            } else if (key == ColumnMapper.keyComponentResourceId) {
+              outSheet.cell(CellIndex.indexByColumnRow(columnIndex: targetCol, rowIndex: outRowIdx)).value =
+                  TextCellValue(item.componentResourceId);
+            } else if (key == ColumnMapper.keyUom) {
+              outSheet.cell(CellIndex.indexByColumnRow(columnIndex: targetCol, rowIndex: outRowIdx)).value =
+                  TextCellValue(item.uom);
+            } else if (key == ColumnMapper.keyOnHand) {
+              outSheet.cell(CellIndex.indexByColumnRow(columnIndex: targetCol, rowIndex: outRowIdx)).value =
+                  TextCellValue(item.onHand);
+            } else if (key == ColumnMapper.keyUnit) {
+              outSheet.cell(CellIndex.indexByColumnRow(columnIndex: targetCol, rowIndex: outRowIdx)).value =
+                  TextCellValue(item.subUnit.isNotEmpty ? item.subUnit : unitName);
+            }
           }
         }
 
         // Also copy any raw columns from item.rawColumns if not already set
         for (final e in item.rawColumns.entries) {
+          if (e.key.startsWith('_')) continue;
           final targetCol = headerToOutCol[e.key.toLowerCase()];
           if (targetCol != null) {
             final cell = outSheet.cell(CellIndex.indexByColumnRow(columnIndex: targetCol, rowIndex: outRowIdx));
-            if (cell.value == null) {
-              cell.value = TextCellValue(e.value.toString());
-            }
+            cell.value ??= TextCellValue(e.value.toString());
           }
         }
 
@@ -884,15 +1224,43 @@ class ExcelService {
           outSheet.cell(CellIndex.indexByColumnRow(columnIndex: serviceColIndices['Issued Status']!, rowIndex: outRowIdx)).value =
               TextCellValue(issuedStatus);
         }
-        if (serviceColIndices.containsKey('Return Comments')) {
-          final comments = returnComments[item.partId] ?? [];
-          final commentsStr = comments.join(' | ');
-          outSheet.cell(CellIndex.indexByColumnRow(columnIndex: serviceColIndices['Return Comments']!, rowIndex: outRowIdx)).value =
-              commentsStr.isNotEmpty ? TextCellValue(commentsStr) : TextCellValue('');
-        }
         if (colUnit != null) {
           outSheet.cell(CellIndex.indexByColumnRow(columnIndex: colUnit, rowIndex: outRowIdx)).value =
               TextCellValue(item.subUnit.isNotEmpty ? item.subUnit : unitName);
+        }
+
+        // Populate Technical Comments and Picker Note
+        final techComments = <String>[];
+        if (item.isManualAdd) {
+          techComments.add('➕ MANUAL ADD${item.manualWorker.isNotEmpty ? ' • by ${item.manualWorker}' : ''}${item.manualNote.isNotEmpty ? ': "${item.manualNote}"' : ''}');
+        }
+        if (item.replacedPartId.isNotEmpty) {
+          techComments.add('🔄 REPLACED • was: ${item.replacedPartId}${item.replacementNote.isNotEmpty ? ' (${item.replacementNote})' : ''}');
+        }
+        var removeNote = removeComments[item.partId] ?? item.removeNote;
+        final flagType = currentUnitFlags[item.partId]?['flag_type']?.toString().toUpperCase() ?? '';
+        if (removeNote.isEmpty && flagType == 'REMOVED') {
+          removeNote = currentUnitFlags[item.partId]?['note']?.toString() ?? '';
+        }
+        if (item.isRemoved || removeNote.isNotEmpty || flagType == 'REMOVED') {
+          techComments.add('⛔ REMOVED FROM PICKING${removeNote.isNotEmpty ? ' • $removeNote' : ''}');
+        }
+        final missingFlag = currentUnitFlags[item.partId];
+        if (missingFlag != null && missingFlag['flag_type']?.toString().toUpperCase() == 'MISSING') {
+          techComments.add(formatMissingComment(missingFlag));
+        }
+        final itemRetComments = returnComments[item.partId] ?? [];
+        if (itemRetComments.isNotEmpty) {
+          techComments.add('RETURN: ${itemRetComments.join(', ')}');
+        }
+        final techCol = serviceColIndices['Technical Comments'] ?? serviceColIndices['System Comments'];
+        if (techCol != null) {
+          outSheet.cell(CellIndex.indexByColumnRow(columnIndex: techCol, rowIndex: outRowIdx)).value =
+              TextCellValue(techComments.join(' | '));
+        }
+        if (serviceColIndices.containsKey('Picker Note')) {
+          outSheet.cell(CellIndex.indexByColumnRow(columnIndex: serviceColIndices['Picker Note']!, rowIndex: outRowIdx)).value =
+              TextCellValue(partNotes[item.partId] ?? '');
         }
 
         outRowIdx++;
@@ -940,6 +1308,9 @@ class ExcelService {
     required String outputPath,
     List<String> autoIssueResourceIds = const [],
     String issuedStatus = 'Pending Issue',
+    Map<String, String> removeComments = const {},
+    List<Map<String, dynamic>> manualPicks = const [],
+    Map<String, String> partNotes = const {},
   }) async {
     if (sessions.isEmpty) {
       throw Exception('No sessions provided for batch export.');
@@ -955,6 +1326,9 @@ class ExcelService {
       outputPath: outputPath,
       unitAutoIssueResourceIds: {unitId: autoIssueResourceIds},
       issuedStatus: issuedStatus,
+      unitRemoveComments: {unitId: removeComments},
+      unitManualPicks: {unitId: manualPicks},
+      unitPartNotes: {unitId: partNotes},
     );
   }
 }

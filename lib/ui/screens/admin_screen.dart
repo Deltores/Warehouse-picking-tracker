@@ -73,7 +73,6 @@ class _AdminScreenState extends State<AdminScreen> with SingleTickerProviderStat
   // Tab 4 — Grouping Presets
   bool _groupByLine = true;
   Map<String, bool> _deptLineOverrides = {};
-  Map<String, bool> _resourceLineOverrides = {};
 
   // Tab 5 — Storage
   List<UnitRecord> _storedUnits = [];
@@ -176,7 +175,6 @@ class _AdminScreenState extends State<AdminScreen> with SingleTickerProviderStat
     _autoAdvancePick = await widget.dbService.getAutoAdvancePick();
     _groupByLine = await widget.dbService.getGroupByLine();
     _deptLineOverrides = await widget.dbService.getLineGroupingDeptOverrides();
-    _resourceLineOverrides = await widget.dbService.getLineGroupingResourceOverrides();
     _allDistinctResources = await widget.dbService.getAllDistinctComponentResourceIds();
     _blockedResourceIds = await widget.dbService.getBlockedResourceIds();
     _autoIssueResourceIds = await widget.dbService.getAutoIssueResourceIds();
@@ -472,7 +470,7 @@ class _AdminScreenState extends State<AdminScreen> with SingleTickerProviderStat
                     style: TextStyle(fontSize: 12, color: _autoAdvancePick ? AppTheme.statusComplete : AppTheme.textMuted),
                   ),
                   value: _autoAdvancePick,
-                  activeColor: AppTheme.accentCyan,
+                  activeThumbColor: AppTheme.accentCyan,
                   onChanged: (val) async {
                     if (!_ensureAdminSessionValid()) return;
                     await widget.dbService.setAutoAdvancePick(val);
@@ -1636,7 +1634,7 @@ class _AdminScreenState extends State<AdminScreen> with SingleTickerProviderStat
                 style: TextStyle(fontSize: 12, color: _groupByLine ? AppTheme.statusComplete : AppTheme.textMuted),
               ),
               value: _groupByLine,
-              activeColor: AppTheme.accentCyan,
+              activeThumbColor: AppTheme.accentCyan,
               onChanged: (val) async {
                 await widget.dbService.setGroupByLine(val);
                 setState(() => _groupByLine = val);
@@ -1694,7 +1692,7 @@ class _AdminScreenState extends State<AdminScreen> with SingleTickerProviderStat
                     style: TextStyle(fontSize: 12, color: isEnabled ? AppTheme.statusComplete : AppTheme.textMuted),
                   ),
                   value: isEnabled,
-                  activeColor: AppTheme.statusComplete,
+                  activeThumbColor: AppTheme.statusComplete,
                   onChanged: (val) async {
                     await widget.dbService.setLineGroupingDeptOverride(dept, val);
                     setState(() {
@@ -1755,7 +1753,7 @@ class _AdminScreenState extends State<AdminScreen> with SingleTickerProviderStat
                     style: TextStyle(fontSize: 12, color: isEnabled ? AppTheme.statusComplete : AppTheme.textMuted),
                   ),
                   value: isEnabled,
-                  activeColor: AppTheme.accentCyan,
+                  activeThumbColor: AppTheme.accentCyan,
                   onChanged: (val) async {
                     await widget.dbService.setLineGroupingDeptOverride(dept, val);
                     setState(() {
@@ -1842,7 +1840,7 @@ class _AdminScreenState extends State<AdminScreen> with SingleTickerProviderStat
                               style: TextStyle(fontSize: 11, color: isBypassed ? const Color(0xFF0EA5E9) : AppTheme.textMuted),
                             ),
                             value: isBypassed,
-                            activeColor: const Color(0xFF0EA5E9),
+                            activeThumbColor: const Color(0xFF0EA5E9),
                             onChanged: (val) async {
                               setState(() {
                                 if (val) {
@@ -2669,7 +2667,7 @@ class _AdminScreenState extends State<AdminScreen> with SingleTickerProviderStat
                   Container(
                     padding: const EdgeInsets.all(16),
                     decoration: BoxDecoration(
-                      color: AppTheme.accentCyan.withOpacity(0.12),
+                      color: AppTheme.accentCyan.withValues(alpha: 0.12),
                       shape: BoxShape.circle,
                     ),
                     child: const Icon(
@@ -3016,9 +3014,9 @@ class _AdminScreenState extends State<AdminScreen> with SingleTickerProviderStat
                                   Container(
                                     padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
                                     decoration: BoxDecoration(
-                                      color: levelColor.withOpacity(0.18),
+                                      color: levelColor.withValues(alpha: 0.18),
                                       borderRadius: BorderRadius.circular(4),
-                                      border: Border.all(color: levelColor.withOpacity(0.5)),
+                                      border: Border.all(color: levelColor.withValues(alpha: 0.5)),
                                     ),
                                     child: Text(
                                       level,
@@ -3040,16 +3038,16 @@ class _AdminScreenState extends State<AdminScreen> with SingleTickerProviderStat
                                               padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
                                               decoration: BoxDecoration(
                                                 color: tag.toUpperCase() == 'PICKER'
-                                                    ? AppTheme.statusComplete.withOpacity(0.18)
+                                                    ? AppTheme.statusComplete.withValues(alpha: 0.18)
                                                     : tag.toUpperCase() == 'ADMIN'
-                                                        ? AppTheme.accentCyan.withOpacity(0.18)
+                                                        ? AppTheme.accentCyan.withValues(alpha: 0.18)
                                                         : AppTheme.bgDark,
                                                 borderRadius: BorderRadius.circular(4),
                                                 border: Border.all(
                                                   color: tag.toUpperCase() == 'PICKER'
-                                                      ? AppTheme.statusComplete.withOpacity(0.6)
+                                                      ? AppTheme.statusComplete.withValues(alpha: 0.6)
                                                       : tag.toUpperCase() == 'ADMIN'
-                                                          ? AppTheme.accentCyan.withOpacity(0.6)
+                                                          ? AppTheme.accentCyan.withValues(alpha: 0.6)
                                                           : AppTheme.borderDark,
                                                 ),
                                               ),

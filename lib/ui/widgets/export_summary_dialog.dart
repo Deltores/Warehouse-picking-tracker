@@ -71,7 +71,7 @@ class _ExportSummaryDialogState extends State<ExportSummaryDialog> {
                 Container(
                   padding: const EdgeInsets.all(10),
                   decoration: BoxDecoration(
-                    color: AppTheme.statusComplete.withOpacity(0.15),
+                    color: AppTheme.statusComplete.withValues(alpha: 0.15),
                     borderRadius: BorderRadius.circular(10),
                   ),
                   child: const Icon(Icons.file_download_done_rounded, color: AppTheme.statusComplete, size: 28),
@@ -100,14 +100,14 @@ class _ExportSummaryDialogState extends State<ExportSummaryDialog> {
               Container(
                 padding: const EdgeInsets.all(14),
                 decoration: BoxDecoration(
-                  color: AppTheme.statusDanger.withOpacity(0.15),
+                  color: AppTheme.statusDanger.withValues(alpha: 0.15),
                   borderRadius: BorderRadius.circular(10),
                   border: Border.all(color: AppTheme.statusDanger),
                 ),
                 child: const Row(
                   children: [
                     Icon(Icons.warning_amber_rounded, color: AppTheme.statusDanger, size: 30),
-                    const SizedBox(width: 12),
+                    SizedBox(width: 12),
                     Expanded(
                       child: Text(
                         'Empty Session Detected: Exactly 0 parts were picked! Exporting empty sessions is blocked to prevent uploading blank records to ERP.',
@@ -167,7 +167,7 @@ class _ExportSummaryDialogState extends State<ExportSummaryDialog> {
                     onSelected: (selected) {
                       if (selected) setState(() => _selectedIssuedStatus = 'Pending Issue');
                     },
-                    selectedColor: AppTheme.statusPartial.withOpacity(0.25),
+                    selectedColor: AppTheme.statusPartial.withValues(alpha: 0.25),
                     labelStyle: TextStyle(
                       color: (_selectedIssuedStatus == 'Pending Issue' || _selectedIssuedStatus == 'Pending') ? AppTheme.statusPartial : AppTheme.textMuted,
                       fontWeight: FontWeight.bold,
@@ -182,7 +182,7 @@ class _ExportSummaryDialogState extends State<ExportSummaryDialog> {
                     onSelected: (selected) {
                       if (selected) setState(() => _selectedIssuedStatus = 'Issued');
                     },
-                    selectedColor: AppTheme.statusComplete.withOpacity(0.25),
+                    selectedColor: AppTheme.statusComplete.withValues(alpha: 0.25),
                     labelStyle: TextStyle(
                       color: _selectedIssuedStatus == 'Issued' ? AppTheme.statusComplete : AppTheme.textMuted,
                       fontWeight: FontWeight.bold,

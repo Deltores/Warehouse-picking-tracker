@@ -18,6 +18,11 @@ class DatabaseService implements LogDatabase {
   static Database? _database;
   static DatabaseFactory? _ffiFactory;
 
+  /// Allows injecting a mock or in-memory Database for tests.
+  static void setDatabaseForTesting(Database? db) {
+    _database = db;
+  }
+
   /// Initializes database factory for desktop/test platforms if needed
   static void initializeFfi() {
     if (kIsWeb) return;
@@ -50,7 +55,7 @@ class DatabaseService implements LogDatabase {
     return await factory.openDatabase(
       dbPath,
       options: OpenDatabaseOptions(
-        version: 12,
+        version: 13,
         onCreate: _onCreate,
         onUpgrade: _onUpgrade,
         onOpen: (db) async {
@@ -110,6 +115,11 @@ class DatabaseService implements LogDatabase {
         on_hand TEXT NOT NULL DEFAULT '',
         dept_type TEXT NOT NULL DEFAULT '',
         raw_columns TEXT NOT NULL DEFAULT '{}',
+        -- Part ID replacement tracking
+        replaced_part_id TEXT NOT NULL DEFAULT '',
+        replacement_note TEXT NOT NULL DEFAULT '',
+        replaced_at INTEGER,
+        replaced_by TEXT NOT NULL DEFAULT '',
         FOREIGN KEY(unit_id) REFERENCES units(id) ON DELETE CASCADE
       );
     ''');
@@ -213,6 +223,38 @@ class DatabaseService implements LogDatabase {
     ''');
     await db.execute("CREATE INDEX IF NOT EXISTS idx_session_picks_session ON session_picks(session_id);");
     await db.execute("CREATE INDEX IF NOT EXISTS idx_session_picks_part ON session_picks(session_id, part_id);");
+
+    // Manual picks table — for parts entered manually in Pick Mode
+    await db.execute('''
+      CREATE TABLE IF NOT EXISTS manual_picks (
+        id TEXT PRIMARY KEY,
+        unit_id TEXT NOT NULL,
+        session_id TEXT NOT NULL DEFAULT '',
+        worker_name TEXT NOT NULL DEFAULT '',
+        department TEXT NOT NULL DEFAULT '',
+        work_order TEXT NOT NULL DEFAULT 'MANUAL',
+        part_id TEXT NOT NULL,
+        qty_picked REAL NOT NULL DEFAULT 0,
+        note TEXT NOT NULL DEFAULT '',
+        created_at INTEGER NOT NULL
+      );
+    ''');
+    await db.execute("CREATE INDEX IF NOT EXISTS idx_manual_picks_unit ON manual_picks(unit_id);");
+
+    // Part ID replacements log — tracks old→new Part ID swaps
+    await db.execute('''
+      CREATE TABLE IF NOT EXISTS part_id_replacements (
+        id TEXT PRIMARY KEY,
+        unit_id TEXT NOT NULL,
+        session_id TEXT NOT NULL DEFAULT '',
+        worker_name TEXT NOT NULL DEFAULT '',
+        old_part_id TEXT NOT NULL,
+        new_part_id TEXT NOT NULL,
+        note TEXT NOT NULL DEFAULT '',
+        created_at INTEGER NOT NULL
+      );
+    ''');
+    await db.execute("CREATE INDEX IF NOT EXISTS idx_part_replacements_unit ON part_id_replacements(unit_id);");
   }
 
   Future<void> _onUpgrade(Database db, int oldVersion, int newVersion) async {
@@ -306,6 +348,43 @@ class DatabaseService implements LogDatabase {
       await db.execute("ALTER TABLE units ADD COLUMN original_headers TEXT NOT NULL DEFAULT '[]';");
       await db.execute("ALTER TABLE picklist_items ADD COLUMN component_resource_id TEXT NOT NULL DEFAULT '';");
       await db.execute("ALTER TABLE picklist_items ADD COLUMN raw_columns TEXT NOT NULL DEFAULT '{}';");
+    }
+    if (oldVersion < 13) {
+      // Part ID replacement tracking columns on picklist_items
+      await db.execute("ALTER TABLE picklist_items ADD COLUMN replaced_part_id TEXT NOT NULL DEFAULT '';");
+      await db.execute("ALTER TABLE picklist_items ADD COLUMN replacement_note TEXT NOT NULL DEFAULT '';");
+      await db.execute("ALTER TABLE picklist_items ADD COLUMN replaced_at INTEGER;");
+      await db.execute("ALTER TABLE picklist_items ADD COLUMN replaced_by TEXT NOT NULL DEFAULT '';");
+      // Manual picks table
+      await db.execute('''
+        CREATE TABLE IF NOT EXISTS manual_picks (
+          id TEXT PRIMARY KEY,
+          unit_id TEXT NOT NULL,
+          session_id TEXT NOT NULL DEFAULT '',
+          worker_name TEXT NOT NULL DEFAULT '',
+          department TEXT NOT NULL DEFAULT '',
+          work_order TEXT NOT NULL DEFAULT 'MANUAL',
+          part_id TEXT NOT NULL,
+          qty_picked REAL NOT NULL DEFAULT 0,
+          note TEXT NOT NULL DEFAULT '',
+          created_at INTEGER NOT NULL
+        );
+      ''');
+      await db.execute("CREATE INDEX IF NOT EXISTS idx_manual_picks_unit ON manual_picks(unit_id);");
+      // Part ID replacements log
+      await db.execute('''
+        CREATE TABLE IF NOT EXISTS part_id_replacements (
+          id TEXT PRIMARY KEY,
+          unit_id TEXT NOT NULL,
+          session_id TEXT NOT NULL DEFAULT '',
+          worker_name TEXT NOT NULL DEFAULT '',
+          old_part_id TEXT NOT NULL,
+          new_part_id TEXT NOT NULL,
+          note TEXT NOT NULL DEFAULT '',
+          created_at INTEGER NOT NULL
+        );
+      ''');
+      await db.execute("CREATE INDEX IF NOT EXISTS idx_part_replacements_unit ON part_id_replacements(unit_id);");
     }
   }
 
@@ -1691,14 +1770,14 @@ class DatabaseService implements LogDatabase {
     );
   }
 
-  /// Cleans up any MISSING part_flags for parts that have been fully picked (qty_due <= 0.0001).
+  /// Cleans up any MISSING part_flags for parts that have had at least one pick (qty_picked > 0.0001) or are fully picked.
   Future<int> cleanupResolvedMissingFlags(String unitId) async {
     final db = await database;
     return await db.rawDelete('''
       DELETE FROM part_flags
       WHERE unit_id = ? AND UPPER(flag_type) = 'MISSING'
         AND part_id IN (
-          SELECT part_id FROM picklist_items WHERE unit_id = ? GROUP BY part_id HAVING SUM(qty_due) <= 0.0001
+          SELECT part_id FROM picklist_items WHERE unit_id = ? GROUP BY part_id HAVING SUM(qty_due) <= 0.0001 OR SUM(qty_picked) > 0.0001
         )
     ''', [unitId, unitId]);
   }
@@ -1723,10 +1802,495 @@ class DatabaseService implements LogDatabase {
     );
   }
 
+  /// Returns true if a part has been flagged as REMOVED FROM PICKING for this unit.
+  Future<bool> isPartRemovedFromPicking(String unitId, String partId, {String? department}) async {
+    final db = await database;
+    final where = department != null && department.isNotEmpty
+        ? 'unit_id = ? AND part_id = ? AND UPPER(flag_type) = \'REMOVED\''
+        : 'unit_id = ? AND part_id = ? AND UPPER(flag_type) = \'REMOVED\'';
+    final rows = await db.query(
+      'part_flags',
+      where: where,
+      whereArgs: [unitId, partId],
+      limit: 1,
+    );
+    return rows.isNotEmpty;
+  }
+
+  /// Returns all part IDs flagged as REMOVED FROM PICKING for this unit (and optional dept).
+  Future<Set<String>> getRemovedFromPickingParts(String unitId, {String? department}) async {
+    final db = await database;
+    final rows = department != null && department.isNotEmpty
+        ? await db.query(
+            'part_flags',
+            columns: ['part_id'],
+            where: "unit_id = ? AND department = ? AND UPPER(flag_type) = 'REMOVED'",
+            whereArgs: [unitId, department],
+          )
+        : await db.query(
+            'part_flags',
+            columns: ['part_id'],
+            where: "unit_id = ? AND UPPER(flag_type) = 'REMOVED'",
+            whereArgs: [unitId],
+          );
+    return rows.map((r) => r['part_id']?.toString() ?? '').where((s) => s.isNotEmpty).toSet();
+  }
+
+  /// Returns a map of partId -> remove note for parts flagged as REMOVED for a unit.
+  Future<Map<String, String>> getRemovedPartCommentsForUnit(String unitId, {String? department}) async {
+    final db = await database;
+    final rows = department != null && department.isNotEmpty
+        ? await db.query(
+            'part_flags',
+            columns: ['part_id', 'note'],
+            where: "unit_id = ? AND department = ? AND UPPER(flag_type) = 'REMOVED'",
+            whereArgs: [unitId, department],
+            orderBy: 'created_at DESC',
+          )
+        : await db.query(
+            'part_flags',
+            columns: ['part_id', 'note'],
+            where: "unit_id = ? AND UPPER(flag_type) = 'REMOVED'",
+            whereArgs: [unitId],
+            orderBy: 'created_at DESC',
+          );
+    final map = <String, String>{};
+    for (final r in rows) {
+      final pid = r['part_id']?.toString() ?? '';
+      final note = r['note']?.toString() ?? '';
+      if (pid.isNotEmpty && !map.containsKey(pid)) {
+        map[pid] = note;
+      }
+    }
+    return map;
+  }
+
+  /// Sets or clears a free-form picker note for a specific Part ID in a unit.
+  Future<void> setUserPartNote({
+    required String unitId,
+    required String partId,
+    required String note,
+    String department = '',
+  }) async {
+    final db = await database;
+    final trimmed = note.trim();
+    await db.delete(
+      'part_flags',
+      where: 'unit_id = ? AND part_id = ? AND UPPER(flag_type) = ?',
+      whereArgs: [unitId, partId, 'USER_NOTE'],
+    );
+    if (trimmed.isNotEmpty) {
+      await db.insert('part_flags', {
+        'id': const Uuid().v4(),
+        'unit_id': unitId,
+        'part_id': partId,
+        'department': department,
+        'flag_type': 'USER_NOTE',
+        'note': trimmed,
+        'created_at': DateTime.now().millisecondsSinceEpoch,
+      });
+    }
+  }
+
+  /// Returns all free-form picker notes for a unit as a Map<partId, note>.
+  Future<Map<String, String>> getUserPartNotesForUnit(String unitId) async {
+    final db = await database;
+    final rows = await db.query(
+      'part_flags',
+      where: 'unit_id = ? AND UPPER(flag_type) = ?',
+      whereArgs: [unitId, 'USER_NOTE'],
+    );
+    final map = <String, String>{};
+    for (final r in rows) {
+      final pid = r['part_id']?.toString() ?? '';
+      final note = r['note']?.toString() ?? '';
+      if (pid.isNotEmpty && note.isNotEmpty) {
+        map[pid] = note;
+      }
+    }
+    return map;
+  }
+
+  /// Records a manually entered part pick in Pick Mode.
+  /// Inserts a row into [manual_picks] AND inserts a complete [picklist_items] row
+  /// so it appears in all grouping trees and picking views. Also updates unit progress.
+  Future<PicklistItem> recordManualPick({
+    required String unitId,
+    required String sessionId,
+    required String workerName,
+    required String department,
+    required String workOrder,
+    required String partId,
+    required double qtyPicked,
+    required String note,
+    String line = '',
+    String resourceId = '',
+    String componentResourceId = '',
+    String subUnit = '',
+    String deptType = '',
+    String pickDate = '',
+    String prodDate = '',
+    String uom = 'EA',
+  }) async {
+    final db = await database;
+    final uuid = const Uuid().v4();
+    final now = DateTime.now().millisecondsSinceEpoch;
+    final itemId = 'manual_${now}_${uuid.substring(0, 8)}';
+    final wo = workOrder.isNotEmpty ? workOrder : 'MANUAL';
+
+    final rawCols = {
+      '_manual_add': true,
+      '_manual_note': note,
+      '_manual_worker': workerName,
+      '_manual_added_at': now,
+      '_uom': uom,
+    };
+
+    final newItem = PicklistItem(
+      id: itemId,
+      unitId: unitId,
+      department: department,
+      line: line,
+      workOrder: wo,
+      partId: partId,
+      partDescription: note,
+      qtyRequired: qtyPicked,
+      qtyDue: 0.0,
+      qtyPicked: qtyPicked,
+      rowOrder: 999999,
+      pickDate: pickDate,
+      prodDate: prodDate,
+      subUnit: subUnit,
+      resourceId: resourceId,
+      componentResourceId: componentResourceId,
+      deptType: deptType,
+      rawColumns: rawCols,
+    );
+
+    await db.transaction((txn) async {
+      await txn.insert('manual_picks', {
+        'id': uuid,
+        'unit_id': unitId,
+        'session_id': sessionId,
+        'worker_name': workerName,
+        'department': department,
+        'work_order': wo,
+        'part_id': partId,
+        'qty_picked': qtyPicked,
+        'note': note,
+        'created_at': now,
+      });
+
+      await txn.insert('picklist_items', newItem.toMap());
+
+      // Update unit total_picked
+      await txn.rawUpdate('''
+        UPDATE units
+        SET total_picked = (SELECT COALESCE(SUM(qty_picked), 0) FROM picklist_items WHERE unit_id = ?),
+            last_accessed_at = ?
+        WHERE id = ?
+      ''', [unitId, now, unitId]);
+    });
+
+    LogService.picker('MANUAL ADD: $partId +${PicklistItem.formatQty(qtyPicked)} (Note: "$note") → Unit: $unitId, Dept: $department');
+    return newItem;
+  }
+
+  /// Returns all manually added picks for a unit, newest first.
+  Future<List<Map<String, dynamic>>> getManualPicksForUnit(String unitId) async {
+    final db = await database;
+    return await db.query(
+      'manual_picks',
+      where: 'unit_id = ?',
+      whereArgs: [unitId],
+      orderBy: 'created_at ASC',
+    );
+  }
+
+  /// Records a Part ID replacement. Updates [picklist_items] to use the new Part ID,
+  /// stores original Part ID in replacement tracking columns, and logs to [part_id_replacements].
+  /// Synchronizes [manual_picks], [session_picks], and [part_flags] to maintain strict database integrity.
+  /// Scoped strictly to [targetItemIds], or [department] / [resourceId] if provided.
+  Future<void> recordPartIdReplacement({
+    required String unitId,
+    required String sessionId,
+    required String workerName,
+    required String oldPartId,
+    required String newPartId,
+    required String note,
+    String? department,
+    String? resourceId,
+    List<String>? targetItemIds,
+  }) async {
+    final db = await database;
+    final uuid = const Uuid().v4();
+    final now = DateTime.now().millisecondsSinceEpoch;
+
+    await db.transaction((txn) async {
+      String whereClause;
+      List<dynamic> whereArgs;
+
+      if (targetItemIds != null && targetItemIds.isNotEmpty) {
+        final placeholders = List.filled(targetItemIds.length, '?').join(',');
+        whereClause = 'unit_id = ? AND id IN ($placeholders)';
+        whereArgs = [unitId, ...targetItemIds];
+      } else {
+        whereClause = 'unit_id = ? AND LOWER(TRIM(part_id)) = LOWER(TRIM(?))';
+        whereArgs = [unitId, oldPartId];
+
+        if (department != null && department.isNotEmpty && department != 'All Departments') {
+          whereClause += ' AND LOWER(TRIM(department)) = LOWER(TRIM(?))';
+          whereArgs.add(department);
+        } else if (resourceId != null && resourceId.isNotEmpty) {
+          whereClause += ' AND (LOWER(TRIM(resource_id)) = LOWER(TRIM(?)) OR LOWER(TRIM(component_resource_id)) = LOWER(TRIM(?)))';
+          whereArgs.add(resourceId);
+          whereArgs.add(resourceId);
+        }
+      }
+
+      await txn.rawUpdate('''
+        UPDATE picklist_items
+        SET part_id = ?,
+            replaced_part_id = CASE WHEN replaced_part_id = '' THEN ? ELSE replaced_part_id END,
+            replacement_note = ?,
+            replaced_at = ?,
+            replaced_by = ?
+        WHERE $whereClause
+      ''', [newPartId, oldPartId, note, now, workerName, ...whereArgs]);
+
+      // If any of the replaced items were manual adds, also record replaced_from in raw_columns
+      final updatedRows = await txn.query(
+        'picklist_items',
+        columns: ['id', 'raw_columns'],
+        where: 'unit_id = ? AND LOWER(TRIM(part_id)) = LOWER(TRIM(?))',
+        whereArgs: [unitId, newPartId],
+      );
+      for (final r in updatedRows) {
+        final rawStr = r['raw_columns']?.toString() ?? '';
+        if (rawStr.isNotEmpty) {
+          try {
+            final raw = jsonDecode(rawStr) as Map<String, dynamic>;
+            if (raw['_manual_add'] == true || raw['_manual_add'] == 1 || raw['_manual_add'] == 'true') {
+              raw['_manual_replaced_from'] = oldPartId;
+              raw['_manual_replacement_note'] = note;
+              await txn.update(
+                'picklist_items',
+                {'raw_columns': jsonEncode(raw)},
+                where: 'id = ?',
+                whereArgs: [r['id']],
+              );
+            }
+          } catch (_) {}
+        }
+      }
+
+      // Synchronize manual_picks table so exports and history do not retain stale part_id
+      await txn.rawUpdate('''
+        UPDATE manual_picks
+        SET part_id = ?
+        WHERE unit_id = ? AND LOWER(TRIM(part_id)) = LOWER(TRIM(?))
+      ''', [newPartId, unitId, oldPartId]);
+
+      // Synchronize session_picks table so session metrics recognize the new part_id
+      await txn.rawUpdate('''
+        UPDATE session_picks
+        SET part_id = ?
+        WHERE unit_id = ? AND LOWER(TRIM(part_id)) = LOWER(TRIM(?))
+      ''', [newPartId, unitId, oldPartId]);
+
+      // Synchronize part_flags table (e.g. notes or missing flags)
+      await txn.rawUpdate('''
+        UPDATE part_flags
+        SET part_id = ?
+        WHERE unit_id = ? AND LOWER(TRIM(part_id)) = LOWER(TRIM(?))
+      ''', [newPartId, unitId, oldPartId]);
+
+      // Insert replacement log record
+      await txn.insert('part_id_replacements', {
+        'id': uuid,
+        'unit_id': unitId,
+        'session_id': sessionId,
+        'worker_name': workerName,
+        'old_part_id': oldPartId,
+        'new_part_id': newPartId,
+        'note': note,
+        'department': department ?? '',
+        'created_at': now,
+      });
+    });
+    LogService.picker('REPLACE PART ID: $oldPartId → $newPartId (Scope: ${department ?? resourceId ?? targetItemIds?.join(",") ?? "all"}) (Note: "$note") by $workerName on unit $unitId');
+  }
+
+  /// Updates the quantity of a manually added pick in [manual_picks] and [picklist_items].
+  Future<void> updateManualPickQuantity({
+    required String unitId,
+    required String partId,
+    required double newQty,
+  }) async {
+    final db = await database;
+    await db.transaction((txn) async {
+      await txn.rawUpdate('''
+        UPDATE manual_picks
+        SET qty_picked = ?
+        WHERE unit_id = ? AND LOWER(TRIM(part_id)) = LOWER(TRIM(?))
+      ''', [newQty, unitId, partId]);
+
+      await txn.rawUpdate('''
+        UPDATE picklist_items
+        SET qty_required = ?,
+            qty_picked = ?,
+            qty_due = 0.0
+        WHERE unit_id = ? AND LOWER(TRIM(part_id)) = LOWER(TRIM(?))
+      ''', [newQty, newQty, unitId, partId]);
+    });
+  }
+
+  /// Records a part removal strictly for the specified scope (Department or Resource ID).
+  /// Updates [picklist_items.raw_columns] with _is_removed and _remove_note, and logs to [part_flags].
+  Future<void> recordPartRemoval({
+    required String unitId,
+    required String partId,
+    required String workerName,
+    required String reason,
+    String? department,
+    String? resourceId,
+  }) async {
+    final db = await database;
+    final uuid = const Uuid().v4();
+    final now = DateTime.now().millisecondsSinceEpoch;
+
+    await db.transaction((txn) async {
+      await txn.insert('part_flags', {
+        'id': uuid,
+        'unit_id': unitId,
+        'part_id': partId,
+        'department': department ?? resourceId ?? '',
+        'flag_type': 'REMOVED',
+        'note': reason,
+        'created_at': now,
+      });
+
+      String whereClause = 'unit_id = ? AND LOWER(TRIM(part_id)) = LOWER(TRIM(?))';
+      List<dynamic> whereArgs = [unitId, partId];
+
+      if (department != null && department.isNotEmpty && department != 'All Departments') {
+        whereClause += ' AND LOWER(TRIM(department)) = LOWER(TRIM(?))';
+        whereArgs.add(department);
+      } else if (resourceId != null && resourceId.isNotEmpty) {
+        whereClause += ' AND (LOWER(TRIM(resource_id)) = LOWER(TRIM(?)) OR LOWER(TRIM(component_resource_id)) = LOWER(TRIM(?)))';
+        whereArgs.add(resourceId);
+        whereArgs.add(resourceId);
+      }
+
+      final rows = await txn.query(
+        'picklist_items',
+        columns: ['id', 'raw_columns'],
+        where: whereClause,
+        whereArgs: whereArgs,
+      );
+
+      for (final r in rows) {
+        final id = r['id']?.toString() ?? '';
+        var raw = <String, dynamic>{};
+        final rawStr = r['raw_columns']?.toString() ?? '';
+        if (rawStr.isNotEmpty) {
+          try {
+            raw = jsonDecode(rawStr) as Map<String, dynamic>;
+          } catch (_) {}
+        }
+        raw['_is_removed'] = true;
+        raw['_remove_note'] = reason;
+        raw['_remove_worker'] = workerName;
+        raw['_removed_at'] = now;
+
+        await txn.update(
+          'picklist_items',
+          {'raw_columns': jsonEncode(raw)},
+          where: 'id = ?',
+          whereArgs: [id],
+        );
+      }
+    });
+    LogService.picker('REMOVED PART: $partId in ${department ?? resourceId ?? "all"} (Reason: "$reason") by $workerName on unit $unitId');
+  }
+
+  /// Unmarks a part as REMOVED when it is picked, restoring it to active picking.
+  /// The removal note and worker are preserved in raw_columns for technical comments/audit.
+  Future<void> unmarkPartRemoval({
+    required String unitId,
+    required String partId,
+    String? department,
+    String? resourceId,
+  }) async {
+    final db = await database;
+    await db.transaction((txn) async {
+      String flagWhere = 'unit_id = ? AND LOWER(TRIM(part_id)) = LOWER(TRIM(?)) AND UPPER(flag_type) = \'REMOVED\'';
+      List<dynamic> flagArgs = [unitId, partId];
+      if (department != null && department.isNotEmpty && department != 'All Departments') {
+        flagWhere += ' AND (department = ? OR department = \'\')';
+        flagArgs.add(department);
+      }
+      await txn.delete('part_flags', where: flagWhere, whereArgs: flagArgs);
+
+      String whereClause = 'unit_id = ? AND LOWER(TRIM(part_id)) = LOWER(TRIM(?))';
+      List<dynamic> whereArgs = [unitId, partId];
+      if (department != null && department.isNotEmpty && department != 'All Departments') {
+        whereClause += ' AND LOWER(TRIM(department)) = LOWER(TRIM(?))';
+        whereArgs.add(department);
+      } else if (resourceId != null && resourceId.isNotEmpty) {
+        whereClause += ' AND (LOWER(TRIM(resource_id)) = LOWER(TRIM(?)) OR LOWER(TRIM(component_resource_id)) = LOWER(TRIM(?)))';
+        whereArgs.add(resourceId);
+        whereArgs.add(resourceId);
+      }
+
+      final rows = await txn.query(
+        'picklist_items',
+        columns: ['id', 'raw_columns'],
+        where: whereClause,
+        whereArgs: whereArgs,
+      );
+
+      for (final r in rows) {
+        final id = r['id']?.toString() ?? '';
+        var raw = <String, dynamic>{};
+        final rawStr = r['raw_columns']?.toString() ?? '';
+        if (rawStr.isNotEmpty) {
+          try {
+            raw = jsonDecode(rawStr) as Map<String, dynamic>;
+          } catch (_) {}
+        }
+        raw['_is_removed'] = false;
+        // Preserve _remove_note, _remove_worker, and _removed_at for comment history
+
+        await txn.update(
+          'picklist_items',
+          {'raw_columns': jsonEncode(raw)},
+          where: 'id = ?',
+          whereArgs: [id],
+        );
+      }
+    });
+    LogService.picker('UNMARKED REMOVED PART: $partId in ${department ?? resourceId ?? "all"} on unit $unitId');
+  }
+
+  /// Returns all Part ID replacement logs for a unit, in insertion order.
+  Future<List<Map<String, dynamic>>> getPartIdReplacements(String unitId) async {
+    final db = await database;
+    return await db.query(
+      'part_id_replacements',
+      where: 'unit_id = ?',
+      whereArgs: [unitId],
+      orderBy: 'created_at ASC',
+    );
+  }
+
+
+
   /// Calculates progress by unique Part IDs for the given unit.
   /// Parts belonging to blocked departments or blocked component resources are completely excluded.
   /// Returns a Map with 'totalParts' and 'completedParts'.
   Future<Map<String, int>> getUnitPartProgress(String unitId) async {
+
     final allItems = await getPicklistItems(unitId);
     if (allItems.isEmpty) {
       return {'totalParts': 0, 'completedParts': 0};
@@ -1740,6 +2304,7 @@ class DatabaseService implements LogDatabase {
         .toSet();
 
     final unblockedItems = allItems.where((i) {
+      if (i.isManualAdd) return true;
       if (blockedDepts.contains(i.department)) return false;
       final cr = i.componentResourceId.trim().toLowerCase();
       if (cr.isEmpty) {
@@ -1763,22 +2328,6 @@ class DatabaseService implements LogDatabase {
       'completedParts': completedParts,
     };
   }
-
-  String _buildMainLineResourceExcludeSql(List<String> mainLineResourcePicks) {
-    if (mainLineResourcePicks.isEmpty) return '';
-    final conditions = <String>[];
-    for (final r in mainLineResourcePicks) {
-      if (r == '(Empty / Unassigned)') {
-        conditions.add("(resource_id IS NULL OR TRIM(resource_id) = '')");
-      } else {
-        final escaped = r.replaceAll("'", "''").trim().toLowerCase();
-        conditions.add("LOWER(TRIM(resource_id)) = '$escaped'");
-      }
-    }
-    if (conditions.isEmpty) return '';
-    return ' AND NOT (${conditions.join(' OR ')})';
-  }
-
   /// Calculates progress by unique Part IDs for the given department in a unit.
   /// Parts belonging to blocked component resources are completely excluded.
   /// Returns a Map with 'totalParts', 'completedParts', and 'missingParts'.
@@ -1832,7 +2381,7 @@ class DatabaseService implements LogDatabase {
     final db = await database;
     final missingFlags = await db.query(
       'part_flags',
-      where: 'unit_id = ? AND department = ? AND UPPER(flag_type) = "MISSING"',
+      where: 'unit_id = ? AND department = ? AND UPPER(flag_type) = \'MISSING\'',
       whereArgs: [unitId, department],
     );
     final missingPartIds = missingFlags.map((f) => f['part_id']?.toString() ?? '').toSet();
@@ -1843,10 +2392,27 @@ class DatabaseService implements LogDatabase {
       }
     }
 
+    final addedPartIds = unblockedItems.where((i) => i.isManualAdd).map((i) => i.partId).toSet();
+    final replacedPartIds = unblockedItems.where((i) => i.replacedPartId.isNotEmpty).map((i) => i.partId).toSet();
+
+    final removedFlags = await db.query(
+      'part_flags',
+      where: 'unit_id = ? AND department = ? AND UPPER(flag_type) = \'REMOVED\'',
+      whereArgs: [unitId, department],
+    );
+    final removedFlagPartIds = removedFlags.map((f) => f['part_id']?.toString() ?? '').toSet();
+    final removedPartIds = unblockedItems
+        .where((i) => i.isRemoved || removedFlagPartIds.contains(i.partId))
+        .map((i) => i.partId)
+        .toSet();
+
     return {
       'totalParts': totalParts,
       'completedParts': completedParts,
       'missingParts': missingCount,
+      'addedParts': addedPartIds.length,
+      'replacedParts': replacedPartIds.length,
+      'removedParts': removedPartIds.length,
     };
   }
 
@@ -1878,7 +2444,7 @@ class DatabaseService implements LogDatabase {
     final missingRows = await db.query(
       'part_flags',
       columns: ['part_id'],
-      where: 'unit_id = ? AND UPPER(flag_type) = "MISSING"',
+      where: 'unit_id = ? AND UPPER(flag_type) = \'MISSING\'',
       whereArgs: [unitId],
     );
     final missingPartIds = missingRows.map((r) => r['part_id']?.toString() ?? '').toSet();
@@ -2502,15 +3068,6 @@ class DatabaseService implements LogDatabase {
     await setConfig('auto_issue_resource_ids', jsonEncode(list));
   }
 
-  Future<List<String>> _getRawDistinctResourceNames() async {
-    final db = await database;
-    final rows = await db.rawQuery(
-      "SELECT DISTINCT resource_id FROM picklist_items WHERE resource_id IS NOT NULL AND TRIM(resource_id) != ''",
-    );
-    final list = rows.map((r) => (r['resource_id'] as String).trim()).where((s) => s.isNotEmpty).toList();
-    list.add('(Empty / Unassigned)');
-    return list;
-  }
 
   Future<List<Map<String, dynamic>>> getResourcePatternRules() async {
     final val = await getConfig('component_resource_pattern_rules');

@@ -16,6 +16,7 @@ class ColumnMapper {
   static const String keyComponentResourceId = 'component_resource_id';
   static const String keyOnHand = 'on_hand';
   static const String keyDeptType = 'dept_type';
+  static const String keyUom = 'uom';
 
   final Map<String, List<String>> aliases;
 
@@ -234,6 +235,22 @@ class ColumnMapper {
       'TYPE',
       'DEPT CATEGORY',
       'CATEGORY',
+    ],
+    keyUom: [
+      'UOM',
+      'U.O.M.',
+      'U.O.M',
+      'UNIT OF MEASURE',
+      'UNIT OF MEASUREMENT',
+      'UNIT OF MEAS',
+      'MEASURE UNIT',
+      'MEASURE',
+      'MEASUREMENT',
+      'UM',
+      'U/M',
+      'QTY UOM',
+      'UOM CODE',
+      'MEAS',
     ],
   };
 

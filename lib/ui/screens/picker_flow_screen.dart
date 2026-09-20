@@ -58,6 +58,7 @@ class _PickerFlowScreenState extends State<PickerFlowScreen> {
   Map<String, int> _unitMissingParts = {};
   UnitRecord? _selectedUnit;
   bool _isImporting = false;
+  bool _isLoadingUnits = true;
 
   // Step 3 state
   Map<String, bool> _departments = {};
@@ -69,6 +70,7 @@ class _PickerFlowScreenState extends State<PickerFlowScreen> {
   void initState() {
     super.initState();
     _loadStandardPickers();
+    _loadUnits();
     _nameController.addListener(() {
       if (mounted) setState(() {});
     });
@@ -259,6 +261,9 @@ class _PickerFlowScreenState extends State<PickerFlowScreen> {
   // ─── Step 2: Unit Loading & Import ───────────────────────────
 
   Future<void> _loadUnits() async {
+    if (_availableUnits.isEmpty && mounted && !_isLoadingUnits) {
+      setState(() => _isLoadingUnits = true);
+    }
     try {
       await widget.dbService.syncAllKnownCatalogs(widget.columnMapper);
     } catch (_) {}
@@ -280,6 +285,13 @@ class _PickerFlowScreenState extends State<PickerFlowScreen> {
         _unitPartProgress = progressMap;
         _unitUrgencies = urgencyMap;
         _unitMissingParts = missingMap;
+        _isLoadingUnits = false;
+        if (_selectedUnit != null) {
+          final match = units.where((u) => u.id == _selectedUnit!.id).firstOrNull;
+          if (match != null) {
+            _selectedUnit = match;
+          }
+        }
       });
     }
   }
@@ -740,7 +752,7 @@ class _PickerFlowScreenState extends State<PickerFlowScreen> {
 
   // ─── Step 3: Department Loading ───────────────────────────────
 
-  Future<void> _loadDepartments(UnitRecord unit) async {
+  Future<void> _loadDepartments(UnitRecord unit, {String? preselectDept}) async {
     final depts = await widget.dbService.getDepartmentsForUnit(unit.id);
     final deptUrgencies = await widget.dbService.getDepartmentPickDates(unit.id);
     final deptProgress = <String, Map<String, int>>{};
@@ -788,9 +800,45 @@ class _PickerFlowScreenState extends State<PickerFlowScreen> {
             final due = forPart.fold<double>(0.0, (s, i) => s + i.qtyDue);
             return due <= 0.0001;
           }).length;
+
+          final db = await widget.dbService.database;
+          final missingFlags = await db.query(
+            'part_flags',
+            where: 'unit_id = ? AND UPPER(flag_type) = \'MISSING\'',
+            whereArgs: [unit.id],
+          );
+          final missingPartIds = missingFlags.map((f) => f['part_id']?.toString() ?? '').toSet();
+          int missingCount = 0;
+          for (final pid in partIds) {
+            final forPart = resItems.where((i) => i.partId == pid);
+            final due = forPart.fold<double>(0.0, (s, i) => s + i.qtyDue);
+            if (due > 0.0001 && missingPartIds.contains(pid)) {
+              missingCount++;
+            }
+          }
+
+          final addedCount = resItems.where((i) => i.isManualAdd).map((i) => i.partId).toSet().length;
+          final replacedCount = resItems.where((i) => i.replacedPartId.isNotEmpty).map((i) => i.partId).toSet().length;
+
+          final removedFlags = await db.query(
+            'part_flags',
+            where: 'unit_id = ? AND UPPER(flag_type) = \'REMOVED\'',
+            whereArgs: [unit.id],
+          );
+          final removedFlagPartIds = removedFlags.map((f) => f['part_id']?.toString() ?? '').toSet();
+          final removedCount = resItems
+              .where((i) => i.isRemoved || removedFlagPartIds.contains(i.partId))
+              .map((i) => i.partId)
+              .toSet()
+              .length;
+
           deptProgress[resKey] = {
             'totalParts': totalParts,
             'completedParts': completedParts,
+            'missingParts': missingCount,
+            'addedParts': addedCount,
+            'replacedParts': replacedCount,
+            'removedParts': removedCount,
           };
 
           DateTime? earliest;
@@ -814,16 +862,20 @@ class _PickerFlowScreenState extends State<PickerFlowScreen> {
       }
     }
 
+    final targetDept = preselectDept ?? _selectedDepartment;
     setState(() {
       _departments = depts;
       _departmentUrgencies = deptUrgencies;
       _departmentPartProgress = deptProgress;
-      // Pre-select the first non-zero active department if only one is active
-      final activeDepts = depts.entries
-          .where((e) => e.value && (deptProgress[e.key]?['totalParts'] ?? 0) > 0)
-          .map((e) => e.key)
-          .toList();
-      _selectedDepartment = activeDepts.length == 1 ? activeDepts.first : null;
+      if (targetDept != null && depts.containsKey(targetDept)) {
+        _selectedDepartment = targetDept;
+      } else {
+        final activeDepts = depts.entries
+            .where((e) => e.value && (deptProgress[e.key]?['totalParts'] ?? 0) > 0)
+            .map((e) => e.key)
+            .toList();
+        _selectedDepartment = activeDepts.length == 1 ? activeDepts.first : null;
+      }
     });
   }
 
@@ -848,7 +900,8 @@ class _PickerFlowScreenState extends State<PickerFlowScreen> {
         );
         await widget.dbService.updateUnit(updatedUnit);
         LogService.picker('$_workerName → dept $_selectedDepartment (resume session)');
-        await Navigator.of(context).push(
+        if (!mounted) return;
+        final returnedDept = await Navigator.of(context).push<String>(
           MaterialPageRoute(
             builder: (_) => PickingScreen(
               dbService: widget.dbService,
@@ -862,12 +915,16 @@ class _PickerFlowScreenState extends State<PickerFlowScreen> {
           ),
         );
         if (mounted) {
-          _loadUnits();
-          if (_selectedUnit != null) _loadDepartments(_selectedUnit!);
+          final deptToKeep = returnedDept ?? _selectedDepartment;
+          await _loadUnits();
+          if (_selectedUnit != null) {
+            await _loadDepartments(_selectedUnit!, preselectDept: deptToKeep);
+          }
         }
         return;
       }
 
+      if (!mounted) return;
       final choice = await showDialog<String>(
         context: context,
         barrierDismissible: false,
@@ -945,7 +1002,8 @@ class _PickerFlowScreenState extends State<PickerFlowScreen> {
           lastAccessedAt: DateTime.now().millisecondsSinceEpoch,
         );
         await widget.dbService.updateUnit(updatedUnit);
-        await Navigator.of(context).push(
+        if (!mounted) return;
+        final returnedDept = await Navigator.of(context).push<String>(
           MaterialPageRoute(
             builder: (_) => PickingScreen(
               dbService: widget.dbService,
@@ -959,8 +1017,11 @@ class _PickerFlowScreenState extends State<PickerFlowScreen> {
           ),
         );
         if (mounted) {
-          _loadUnits();
-          if (_selectedUnit != null) _loadDepartments(_selectedUnit!);
+          final deptToKeep = returnedDept ?? _selectedDepartment;
+          await _loadUnits();
+          if (_selectedUnit != null) {
+            await _loadDepartments(_selectedUnit!, preselectDept: deptToKeep);
+          }
         }
         return;
       }
@@ -1010,7 +1071,7 @@ class _PickerFlowScreenState extends State<PickerFlowScreen> {
 
     if (!mounted) return;
 
-    await Navigator.of(context).push(
+    final returnedDept = await Navigator.of(context).push<String>(
       MaterialPageRoute(
         builder: (_) => PickingScreen(
           dbService: widget.dbService,
@@ -1025,8 +1086,11 @@ class _PickerFlowScreenState extends State<PickerFlowScreen> {
     );
 
     if (mounted) {
-      _loadUnits();
-      if (_selectedUnit != null) _loadDepartments(_selectedUnit!);
+      final deptToKeep = returnedDept ?? _selectedDepartment;
+      await _loadUnits();
+      if (_selectedUnit != null) {
+        await _loadDepartments(_selectedUnit!, preselectDept: deptToKeep);
+      }
     }
   }
 
@@ -1150,7 +1214,7 @@ class _PickerFlowScreenState extends State<PickerFlowScreen> {
                 if (activeSessions.isNotEmpty) {
                   await _promptExitFromPicker();
                 } else {
-                  Navigator.of(context).pop();
+                  if (context.mounted) Navigator.of(context).pop();
                 }
               },
             ),
@@ -1471,26 +1535,37 @@ class _PickerFlowScreenState extends State<PickerFlowScreen> {
                 ),
               ),
               Expanded(
-                child: _availableUnits.isEmpty
-                    ? Center(
+                child: _isLoadingUnits && _availableUnits.isEmpty
+                    ? const Center(
                         child: Column(
                           mainAxisSize: MainAxisSize.min,
                           children: [
-                            const Icon(Icons.folder_open_rounded, size: 64, color: AppTheme.borderDark),
-                            const SizedBox(height: 16),
-                            const Text(
-                              'No files imported yet.',
-                              style: TextStyle(fontSize: 18, color: AppTheme.textMuted),
-                            ),
-                            const SizedBox(height: 8),
-                            ElevatedButton.icon(
-                              icon: const Icon(Icons.upload_file_rounded),
-                              label: const Text('Import Excel Picklist'),
-                              onPressed: _importNewFile,
-                            ),
+                            CircularProgressIndicator(color: AppTheme.accentCyan),
+                            SizedBox(height: 16),
+                            Text('Loading units...', style: TextStyle(color: AppTheme.textMuted)),
                           ],
                         ),
                       )
+                    : _availableUnits.isEmpty
+                        ? Center(
+                            child: Column(
+                              mainAxisSize: MainAxisSize.min,
+                              children: [
+                                const Icon(Icons.folder_open_rounded, size: 64, color: AppTheme.borderDark),
+                                const SizedBox(height: 16),
+                                const Text(
+                                  'No files imported yet.',
+                                  style: TextStyle(fontSize: 18, color: AppTheme.textMuted),
+                                ),
+                                const SizedBox(height: 8),
+                                ElevatedButton.icon(
+                                  icon: const Icon(Icons.upload_file_rounded),
+                                  label: const Text('Import Excel Picklist'),
+                                  onPressed: _importNewFile,
+                                ),
+                              ],
+                            ),
+                          )
                     : ListView.builder(
                         padding: const EdgeInsets.symmetric(horizontal: 24, vertical: 8),
                         itemCount: _availableUnits.length,
@@ -1507,13 +1582,13 @@ class _PickerFlowScreenState extends State<PickerFlowScreen> {
                             switch (urgency.status) {
                               case UnitUrgencyStatus.pastDue:
                                 urgencyBorderColor = const Color(0xFFFF3B30);
-                                glowColor = const Color(0xFFFF3B30).withOpacity(0.35);
+                                glowColor = const Color(0xFFFF3B30).withValues(alpha: 0.35);
                                 final days = urgency.daysRemaining?.abs() ?? 0;
                                 final daysText = days == 0 ? 'Due Today' : '$days d overdue';
                                 urgencyBadge = Container(
                                   padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
                                   decoration: BoxDecoration(
-                                    color: const Color(0xFFFF3B30).withOpacity(0.18),
+                                    color: const Color(0xFFFF3B30).withValues(alpha: 0.18),
                                     borderRadius: BorderRadius.circular(8),
                                     border: Border.all(color: const Color(0xFFFF3B30), width: 1.2),
                                   ),
@@ -1540,13 +1615,13 @@ class _PickerFlowScreenState extends State<PickerFlowScreen> {
 
                               case UnitUrgencyStatus.dueSoon:
                                 urgencyBorderColor = const Color(0xFFFFB300);
-                                glowColor = const Color(0xFFFFB300).withOpacity(0.30);
+                                glowColor = const Color(0xFFFFB300).withValues(alpha: 0.30);
                                 final days = urgency.daysRemaining ?? 0;
                                 final daysText = days == 0 ? 'Due Today' : 'Due in $days d';
                                 urgencyBadge = Container(
                                   padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
                                   decoration: BoxDecoration(
-                                    color: const Color(0xFFFFB300).withOpacity(0.18),
+                                    color: const Color(0xFFFFB300).withValues(alpha: 0.18),
                                     borderRadius: BorderRadius.circular(8),
                                     border: Border.all(color: const Color(0xFFFFB300), width: 1.2),
                                   ),
@@ -1573,12 +1648,12 @@ class _PickerFlowScreenState extends State<PickerFlowScreen> {
 
                               case UnitUrgencyStatus.normal:
                                 urgencyBorderColor = const Color(0xFF2196F3);
-                                glowColor = const Color(0xFF2196F3).withOpacity(0.25);
+                                glowColor = const Color(0xFF2196F3).withValues(alpha: 0.25);
                                 final days = urgency.daysRemaining ?? 0;
                                 urgencyBadge = Container(
                                   padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
                                   decoration: BoxDecoration(
-                                    color: const Color(0xFF2196F3).withOpacity(0.14),
+                                    color: const Color(0xFF2196F3).withValues(alpha: 0.14),
                                     borderRadius: BorderRadius.circular(8),
                                     border: Border.all(color: const Color(0xFF2196F3), width: 1),
                                   ),
@@ -1605,11 +1680,11 @@ class _PickerFlowScreenState extends State<PickerFlowScreen> {
 
                               case UnitUrgencyStatus.completed:
                                 urgencyBorderColor = AppTheme.statusComplete;
-                                glowColor = AppTheme.statusComplete.withOpacity(0.25);
+                                glowColor = AppTheme.statusComplete.withValues(alpha: 0.25);
                                 urgencyBadge = Container(
                                   padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
                                   decoration: BoxDecoration(
-                                    color: AppTheme.statusComplete.withOpacity(0.15),
+                                    color: AppTheme.statusComplete.withValues(alpha: 0.15),
                                     borderRadius: BorderRadius.circular(8),
                                     border: Border.all(color: AppTheme.statusComplete, width: 1),
                                   ),
@@ -1651,7 +1726,7 @@ class _PickerFlowScreenState extends State<PickerFlowScreen> {
                               padding: const EdgeInsets.all(18),
                               decoration: BoxDecoration(
                                 color: isSelected
-                                    ? AppTheme.primaryBlue.withOpacity(0.18)
+                                    ? AppTheme.primaryBlue.withValues(alpha: 0.18)
                                     : AppTheme.cardDark,
                                 borderRadius: BorderRadius.circular(14),
                                 border: Border.all(
@@ -1899,6 +1974,9 @@ class _PickerFlowScreenState extends State<PickerFlowScreen> {
                       final totalParts = partInfo?['totalParts'] ?? 0;
                       final completedParts = partInfo?['completedParts'] ?? 0;
                       final missingParts = partInfo?['missingParts'] ?? 0;
+                      final addedParts = partInfo?['addedParts'] ?? 0;
+                      final replacedParts = partInfo?['replacedParts'] ?? 0;
+                      final removedParts = partInfo?['removedParts'] ?? 0;
                       final pendingParts = (totalParts - completedParts).clamp(0, totalParts);
                       final isDeptCompleted = (deptUrgency?.isAllCompleted == true) || (totalParts > 0 && completedParts >= totalParts);
                       final partPct = totalParts > 0
@@ -2068,12 +2146,83 @@ class _PickerFlowScreenState extends State<PickerFlowScreen> {
                                           ),
                                         ),
                                         if (missingParts > 0)
-                                          Text(
-                                            '• $missingParts missing',
-                                            style: const TextStyle(
-                                              fontSize: 12,
-                                              fontWeight: FontWeight.bold,
-                                              color: Color(0xFFFF3B30),
+                                          Container(
+                                            padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
+                                            decoration: BoxDecoration(
+                                              color: const Color(0xFFFF3B30).withValues(alpha: 0.16),
+                                              borderRadius: BorderRadius.circular(5),
+                                              border: Border.all(color: const Color(0xFFFF3B30).withValues(alpha: 0.6)),
+                                            ),
+                                            child: Row(
+                                              mainAxisSize: MainAxisSize.min,
+                                              children: [
+                                                const Icon(Icons.warning_amber_rounded, size: 12, color: Color(0xFFFF3B30)),
+                                                const SizedBox(width: 4),
+                                                Text(
+                                                  '$missingParts MISSING',
+                                                  style: const TextStyle(fontSize: 10.5, fontWeight: FontWeight.bold, color: Color(0xFFFF3B30)),
+                                                ),
+                                              ],
+                                            ),
+                                          ),
+                                        if (addedParts > 0)
+                                          Container(
+                                            padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
+                                            decoration: BoxDecoration(
+                                              color: const Color(0xFFBB86FC).withValues(alpha: 0.16),
+                                              borderRadius: BorderRadius.circular(5),
+                                              border: Border.all(color: const Color(0xFFBB86FC).withValues(alpha: 0.6)),
+                                            ),
+                                            child: Row(
+                                              mainAxisSize: MainAxisSize.min,
+                                              children: [
+                                                const Icon(Icons.add_circle_outline_rounded, size: 12, color: Color(0xFFBB86FC)),
+                                                const SizedBox(width: 4),
+                                                Text(
+                                                  '$addedParts ADDED',
+                                                  style: const TextStyle(fontSize: 10.5, fontWeight: FontWeight.bold, color: Color(0xFFBB86FC)),
+                                                ),
+                                              ],
+                                            ),
+                                          ),
+                                        if (replacedParts > 0)
+                                          Container(
+                                            padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
+                                            decoration: BoxDecoration(
+                                              color: const Color(0xFF00E5FF).withValues(alpha: 0.15),
+                                              borderRadius: BorderRadius.circular(5),
+                                              border: Border.all(color: const Color(0xFF00E5FF).withValues(alpha: 0.5)),
+                                            ),
+                                            child: Row(
+                                              mainAxisSize: MainAxisSize.min,
+                                              children: [
+                                                const Icon(Icons.find_replace_rounded, size: 12, color: Color(0xFF00E5FF)),
+                                                const SizedBox(width: 4),
+                                                Text(
+                                                  '$replacedParts REPLACED',
+                                                  style: const TextStyle(fontSize: 10.5, fontWeight: FontWeight.bold, color: Color(0xFF00E5FF)),
+                                                ),
+                                              ],
+                                            ),
+                                          ),
+                                        if (removedParts > 0)
+                                          Container(
+                                            padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
+                                            decoration: BoxDecoration(
+                                              color: const Color(0xFF757575).withValues(alpha: 0.18),
+                                              borderRadius: BorderRadius.circular(5),
+                                              border: Border.all(color: const Color(0xFF757575).withValues(alpha: 0.6)),
+                                            ),
+                                            child: Row(
+                                              mainAxisSize: MainAxisSize.min,
+                                              children: [
+                                                const Icon(Icons.block_rounded, size: 12, color: Color(0xFF757575)),
+                                                const SizedBox(width: 4),
+                                                Text(
+                                                  '$removedParts REMOVED',
+                                                  style: const TextStyle(fontSize: 10.5, fontWeight: FontWeight.bold, color: Color(0xFF757575)),
+                                                ),
+                                              ],
                                             ),
                                           ),
                                       ],

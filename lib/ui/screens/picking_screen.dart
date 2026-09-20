@@ -65,6 +65,7 @@ class _PickingScreenState extends State<PickingScreen> with WidgetsBindingObserv
   String? _activeDepartment;
   String _tabletId = '';
   Map<String, Map<String, dynamic>> _partFlags = {};
+  Map<String, String> _userPartNotes = {};
   List<String> _mainLineResourcePicks = [];
 
   bool _isLoading = false;
@@ -198,6 +199,7 @@ class _PickingScreenState extends State<PickingScreen> with WidgetsBindingObserv
         flagMap[pid] = f;
       }
     }
+    final userNotes = await widget.dbService.getUserPartNotesForUnit(unit.id);
 
     final blockedDepts = await widget.dbService.getBlockedDepartmentSet();
     final blockedRes = await widget.dbService.getBlockedResourceIds();
@@ -215,6 +217,7 @@ class _PickingScreenState extends State<PickingScreen> with WidgetsBindingObserv
         .toSet();
 
     final visibleItems = items.where((i) {
+      if (i.isManualAdd) return true;
       if (blockedDepts.contains(i.department.trim())) return false;
       final r = i.componentResourceId.trim().toLowerCase();
       final isEmpty = r.isEmpty;
@@ -236,6 +239,7 @@ class _PickingScreenState extends State<PickingScreen> with WidgetsBindingObserv
       _selectedPreset = autoPreset;
       _tabletId = tabletId;
       _partFlags = flagMap;
+      _userPartNotes = userNotes;
       _mainLineResourcePicks = mainLinePicks;
       _isLoading = false;
     });
@@ -289,7 +293,29 @@ class _PickingScreenState extends State<PickingScreen> with WidgetsBindingObserv
 
     final itemsForPart = updatedList.where((i) => i.partId == partId);
     final totalDue = itemsForPart.fold<double>(0.0, (s, i) => s + i.qtyDue);
-    if (totalDue <= 0.0001) {
+    if (deltaPicked > 0.0001) {
+      final flag = _partFlags[partId];
+      final flagType = flag?['flag_type']?.toString().toUpperCase() ?? '';
+      if (flagType == 'MISSING' || totalDue <= 0.0001) {
+        await widget.dbService.clearPartFlag(unitId: _activeUnit!.id, partId: partId, flagType: 'MISSING');
+        setState(() => _partFlags.remove(partId));
+      }
+      if (flagType == 'REMOVED' || updatedList.any((i) => i.partId == partId && i.isRemoved)) {
+        await widget.dbService.unmarkPartRemoval(
+          unitId: _activeUnit!.id,
+          partId: partId,
+          department: department,
+        );
+        setState(() {
+          _partFlags.remove(partId);
+          for (int i = 0; i < _items.length; i++) {
+            if (_items[i].partId == partId) {
+              _items[i] = _items[i].copyWith(isRemoved: false);
+            }
+          }
+        });
+      }
+    } else if (totalDue <= 0.0001) {
       await widget.dbService.clearPartFlag(unitId: _activeUnit!.id, partId: partId);
       setState(() => _partFlags.remove(partId));
     }
@@ -352,7 +378,25 @@ class _PickingScreenState extends State<PickingScreen> with WidgetsBindingObserv
     await widget.dbService.updateItemQtyPicked(item.id, updated.qtyPicked, updated.qtyDue);
     await widget.dbService.updateUnit(updatedUnit);
 
-    if (updated.qtyDue <= 0.0001) {
+    if (delta > 0.0001) {
+      final flag = _partFlags[updated.partId];
+      final flagType = flag?['flag_type']?.toString().toUpperCase() ?? '';
+      if (flagType == 'MISSING' || updated.qtyDue <= 0.0001) {
+        await widget.dbService.clearPartFlag(unitId: _activeUnit!.id, partId: updated.partId, flagType: 'MISSING');
+        setState(() => _partFlags.remove(updated.partId));
+      }
+      if (flagType == 'REMOVED' || updated.isRemoved) {
+        await widget.dbService.unmarkPartRemoval(
+          unitId: _activeUnit!.id,
+          partId: updated.partId,
+          department: updated.department,
+        );
+        setState(() {
+          _partFlags.remove(updated.partId);
+          _items[idx] = _items[idx].copyWith(isRemoved: false);
+        });
+      }
+    } else if (updated.qtyDue <= 0.0001) {
       await widget.dbService.clearPartFlag(unitId: _activeUnit!.id, partId: updated.partId);
       setState(() => _partFlags.remove(updated.partId));
     }
@@ -418,15 +462,17 @@ class _PickingScreenState extends State<PickingScreen> with WidgetsBindingObserv
               Text('Admin Authorization', style: TextStyle(color: AppTheme.textLight, fontSize: 18)),
             ],
           ),
-          content: Column(
-            mainAxisSize: MainAxisSize.min,
-            crossAxisAlignment: CrossAxisAlignment.start,
-            children: [
-              Text(
-                'Enter Admin PIN to switch $reason.\nIt will remain unlocked for 2 minutes.',
-                style: const TextStyle(color: AppTheme.textMuted, fontSize: 13, height: 1.4),
-              ),
-              const SizedBox(height: 12),
+          content: SizedBox(
+            width: 400,
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text(
+                  'Enter Admin PIN to switch $reason.\nIt will remain unlocked for 2 minutes.',
+                  style: const TextStyle(color: AppTheme.textMuted, fontSize: 13, height: 1.4),
+                ),
+                const SizedBox(height: 12),
               TextField(
                 controller: pinController,
                 autofocus: true,
@@ -442,7 +488,8 @@ class _PickingScreenState extends State<PickingScreen> with WidgetsBindingObserv
                   border: const OutlineInputBorder(borderRadius: BorderRadius.all(Radius.circular(10))),
                 ),
               ),
-            ],
+              ],
+            ),
           ),
           actions: [
             TextButton(
@@ -518,6 +565,19 @@ class _PickingScreenState extends State<PickingScreen> with WidgetsBindingObserv
     }
   }
 
+  void _handleLockViewMode() {
+    setState(() {
+      _toggleUnlockExpiresAt = null;
+    });
+    ScaffoldMessenger.of(context).showSnackBar(
+      const SnackBar(
+        content: Text('View Mode saved and locked.'),
+        duration: Duration(seconds: 2),
+        backgroundColor: AppTheme.statusComplete,
+      ),
+    );
+  }
+
   bool _itemMatchesActiveScope(PicklistItem i) {
     if (_activeDepartment == null) return true;
     if (_isResourceScope) {
@@ -553,25 +613,58 @@ class _PickingScreenState extends State<PickingScreen> with WidgetsBindingObserv
     return true;
   }
 
+  bool _isPartRemoved(String partId) {
+    final norm = partId.trim().toUpperCase();
+    for (final entry in _partFlags.entries) {
+      if (entry.key.trim().toUpperCase() == norm &&
+          entry.value['flag_type']?.toString().toUpperCase() == 'REMOVED') {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  bool _isPartMissing(String partId) {
+    final norm = partId.trim().toUpperCase();
+    for (final entry in _partFlags.entries) {
+      if (entry.key.trim().toUpperCase() == norm &&
+          entry.value['flag_type']?.toString().toUpperCase() == 'MISSING') {
+        return true;
+      }
+    }
+    return false;
+  }
+
   /// Build the sorted part summaries for the active department or resource (optionally filtered to a line).
   /// [pendingOnly]: when true (for Pick Mode), excludes fully picked parts while keeping pending and missing parts.
-  List<PartSummary> _buildPartSummaries({String? lineFilter, bool pendingOnly = false}) {
+  List<PartSummary> _buildPartSummaries({String? lineFilter, bool pendingOnly = false, String? targetPartId}) {
+    final targetNorm = targetPartId?.trim().toUpperCase();
     final partsMap = <String, PartSummary>{};
     for (final item in _items) {
       if (!_itemMatchesActiveScope(item)) continue;
       if (lineFilter != null && item.line != lineFilter) continue;
-      if (partsMap.containsKey(item.partId)) {
-        partsMap[item.partId] = partsMap[item.partId]!.add(item);
+      final pid = item.partId.trim();
+      if (partsMap.containsKey(pid)) {
+        partsMap[pid] = partsMap[pid]!.add(item);
       } else {
-        partsMap[item.partId] = PartSummary.fromItem(item);
+        partsMap[pid] = PartSummary.fromItem(item);
       }
     }
     var list = partsMap.values.toList();
+    // In Pick Mode, do not show removed parts, unless specifically targeted
+    list = list.where((p) {
+      final isTarget = targetNorm != null && p.partId.trim().toUpperCase() == targetNorm;
+      if (isTarget) return true;
+      final isRemoved = p.isRemoved || _isPartRemoved(p.partId);
+      return !isRemoved;
+    }).toList();
+
     if (pendingOnly) {
       // In Pick Mode, do not show fully picked parts!
       // Only show pending parts (qtyPicked < qtyRequired) or parts flagged as MISSING.
       list = list.where((p) {
-        final isMissing = _partFlags[p.partId]?['flag_type']?.toString().toUpperCase() == 'MISSING';
+        if (targetNorm != null && p.partId.trim().toUpperCase() == targetNorm) return true;
+        final isMissing = _isPartMissing(p.partId);
         final isPending = p.qtyPicked < p.qtyRequired - 0.0001;
         return isPending || isMissing;
       }).toList();
@@ -587,23 +680,24 @@ class _PickingScreenState extends State<PickingScreen> with WidgetsBindingObserv
 
   /// Navigate to PickModeScreen starting at the part index corresponding to [partId].
   void _openPickModeAtPart(String partId) {
+    final targetNorm = partId.trim().toUpperCase();
     final matchingItem = _items.firstWhere(
-      (i) => i.partId == partId && _itemMatchesActiveScope(i),
+      (i) => i.partId.trim().toUpperCase() == targetNorm && _itemMatchesActiveScope(i),
       orElse: () => _items.firstWhere(
-        (i) => i.partId == partId,
+        (i) => i.partId.trim().toUpperCase() == targetNorm,
         orElse: () => PicklistItem(id: '', unitId: '', department: '', line: '', workOrder: '', partId: '', partDescription: '', qtyRequired: 0, qtyDue: 0, qtyPicked: 0, rowOrder: 0),
       ),
     );
     final hasLineGrouping = _selectedPreset.levels.contains(GroupLevel.line);
     final lineLabel = (hasLineGrouping && matchingItem.line.isNotEmpty) ? matchingItem.line : null;
 
-    final parts = _buildPartSummaries(lineFilter: lineLabel, pendingOnly: false);
+    final parts = _buildPartSummaries(lineFilter: lineLabel, pendingOnly: false, targetPartId: partId);
     final deptItems = _items
         .where((i) => _itemMatchesActiveScope(i) &&
                       (lineLabel == null || i.line == lineLabel))
         .toList()
       ..sort((a, b) => a.rowOrder.compareTo(b.rowOrder));
-    var startIndex = parts.indexWhere((p) => p.partId == partId);
+    var startIndex = parts.indexWhere((p) => p.partId.trim().toUpperCase() == targetNorm);
     if (startIndex < 0) startIndex = 0;
     _navigateToPickMode(parts, deptItems, startIndex: startIndex, lineLabel: lineLabel);
   }
@@ -614,25 +708,83 @@ class _PickingScreenState extends State<PickingScreen> with WidgetsBindingObserv
     final groupItems = List<PicklistItem>.from(node.leafItems)
       ..sort((a, b) => a.rowOrder.compareTo(b.rowOrder));
 
-    if (groupItems.isEmpty) return;
+    if (groupItems.isEmpty) {
+      if (targetPartId != null) {
+        _openPickModeAtPart(targetPartId);
+      }
+      return;
+    }
 
     final partsMap = <String, PartSummary>{};
     for (final item in groupItems) {
-      if (partsMap.containsKey(item.partId)) {
-        partsMap[item.partId] = partsMap[item.partId]!.add(item);
+      final pid = item.partId.trim();
+      if (partsMap.containsKey(pid)) {
+        partsMap[pid] = partsMap[pid]!.add(item);
       } else {
-        partsMap[item.partId] = PartSummary.fromItem(item);
+        partsMap[pid] = PartSummary.fromItem(item);
       }
     }
 
-    var list = partsMap.values.toList();
-    if (targetPartId == null) {
-      // Pick Mode button tapped -> only pending and missing parts
-      list = list.where((p) {
-        final isMissing = _partFlags[p.partId]?['flag_type']?.toString().toUpperCase() == 'MISSING';
-        final isPending = p.qtyPicked < p.qtyRequired - 0.0001;
-        return isPending || isMissing;
+    final targetNorm = targetPartId?.trim().toUpperCase();
+
+    // 1. If a specific part was targeted (e.g. user tapped on a leaf part in the tree):
+    if (targetNorm != null) {
+      final targetedPart = partsMap.values.where((p) => p.partId.trim().toUpperCase() == targetNorm).firstOrNull;
+
+      if (targetedPart != null) {
+        // Build the list of parts for this node:
+        // Include all active (non-removed) parts + the specifically targeted part (even if removed or completed)
+        var list = partsMap.values.where((p) {
+          if (p.partId.trim().toUpperCase() == targetNorm) return true;
+          final isRemoved = p.isRemoved || _isPartRemoved(p.partId);
+          return !isRemoved;
+        }).toList();
+
+        list.sort((a, b) {
+          final aDone = a.qtyPicked >= a.qtyRequired;
+          final bDone = b.qtyPicked >= b.qtyRequired;
+          if (aDone != bDone) return aDone ? 1 : -1;
+          return a.minRowOrder.compareTo(b.minRowOrder);
+        });
+
+        int startIndex = list.indexWhere((p) => p.partId.trim().toUpperCase() == targetNorm);
+        if (startIndex < 0) startIndex = 0;
+
+        final groupLabel = '${node.level.displayName}: ${node.label}';
+        _navigateToPickMode(
+          list,
+          groupItems,
+          startIndex: startIndex,
+          lineLabel: groupLabel,
+        );
+        return;
+      } else {
+        // If not found in this node's leafItems for some reason, fallback to global scope part opener!
+        _openPickModeAtPart(targetPartId!);
+        return;
+      }
+    }
+
+    // 2. targetPartId == null: User tapped the [⚡ Pick Mode] button on a group node (Line, Dept, Resource)
+    var list = partsMap.values.where((p) {
+      final isRemoved = p.isRemoved || _isPartRemoved(p.partId);
+      if (isRemoved) return false;
+      final isMissing = _isPartMissing(p.partId);
+      final isPending = p.qtyPicked < p.qtyRequired - 0.0001;
+      return isPending || isMissing;
+    }).toList();
+
+    // If all non-removed parts are picked, BUT there are incomplete removed parts in this node,
+    // and the user tapped [⚡ Pick Mode], include the removed parts so the picker can enter and pick them!
+    if (list.isEmpty) {
+      final removedIncomplete = partsMap.values.where((p) {
+        final isRemoved = p.isRemoved || _isPartRemoved(p.partId);
+        return isRemoved && (p.qtyPicked < p.qtyRequired - 0.0001);
       }).toList();
+
+      if (removedIncomplete.isNotEmpty) {
+        list = removedIncomplete;
+      }
     }
 
     list.sort((a, b) {
@@ -653,17 +805,11 @@ class _PickingScreenState extends State<PickingScreen> with WidgetsBindingObserv
       return;
     }
 
-    int startIndex = 0;
-    if (targetPartId != null) {
-      startIndex = list.indexWhere((p) => p.partId == targetPartId);
-      if (startIndex < 0) startIndex = 0;
-    }
-
     final groupLabel = '${node.level.displayName}: ${node.label}';
     _navigateToPickMode(
       list,
       groupItems,
-      startIndex: startIndex,
+      startIndex: 0,
       lineLabel: groupLabel,
     );
   }
@@ -700,6 +846,7 @@ class _PickingScreenState extends State<PickingScreen> with WidgetsBindingObserv
           onItemsUpdated: (updatedItems) async {
             if (mounted) {
               final freshFlags = await widget.dbService.getPartFlags(_activeUnit!.id);
+              final freshNotes = await widget.dbService.getUserPartNotesForUnit(_activeUnit!.id);
               final freshMap = <String, Map<String, dynamic>>{};
               for (final f in freshFlags) {
                 final pid = f['part_id']?.toString() ?? '';
@@ -710,9 +857,14 @@ class _PickingScreenState extends State<PickingScreen> with WidgetsBindingObserv
               setState(() {
                 for (final updated in updatedItems) {
                   final idx = _items.indexWhere((i) => i.id == updated.id);
-                  if (idx >= 0) _items[idx] = updated;
+                  if (idx >= 0) {
+                    _items[idx] = updated;
+                  } else {
+                    _items.add(updated);
+                  }
                 }
                 _partFlags = freshMap;
+                _userPartNotes = freshNotes;
                 final newTotalPicked = _items.fold<double>(0.0, (sum, i) => sum + i.qtyPicked).round();
                 final allPartIds = _items.map((i) => i.partId).toSet();
                 final allPartsDone = allPartIds.isNotEmpty && allPartIds.every((pid) {
@@ -745,6 +897,7 @@ class _PickingScreenState extends State<PickingScreen> with WidgetsBindingObserv
     // Immediately refresh flags and items from DB upon returning to PickingScreen
     if (mounted && _activeUnit != null) {
       final freshFlags = await widget.dbService.getPartFlags(_activeUnit!.id);
+      final freshNotes = await widget.dbService.getUserPartNotesForUnit(_activeUnit!.id);
       final freshMap = <String, Map<String, dynamic>>{};
       for (final f in freshFlags) {
         final pid = f['part_id']?.toString() ?? '';
@@ -769,6 +922,7 @@ class _PickingScreenState extends State<PickingScreen> with WidgetsBindingObserv
           .toSet();
 
       final visibleItems = freshItems.where((i) {
+        if (i.isManualAdd) return true;
         if (blockedDepts.contains(i.department.trim())) return false;
         final r = i.componentResourceId.trim().toLowerCase();
         final isEmpty = r.isEmpty;
@@ -796,6 +950,7 @@ class _PickingScreenState extends State<PickingScreen> with WidgetsBindingObserv
       setState(() {
         _items = visibleItems;
         _partFlags = freshMap;
+        _userPartNotes = freshNotes;
         _activeUnit = _activeUnit!.copyWith(
           totalPicked: newTotalPicked,
           status: isUnitComplete ? 'FULLY_PICKED' : 'IN_PROGRESS',
@@ -820,7 +975,7 @@ class _PickingScreenState extends State<PickingScreen> with WidgetsBindingObserv
     }
     LogService.picker('${_activeSession?.workerName ?? "Worker"} returned from picking to department selection');
     if (!mounted) return;
-    Navigator.of(context).pop();
+    Navigator.of(context).pop(_activeDepartment);
   }
 
   /// Close Session: marks session as CLOSED in SQLite (ready for Batch Super Export in Export Hub).
@@ -1174,6 +1329,29 @@ class _PickingScreenState extends State<PickingScreen> with WidgetsBindingObserv
                                   ],
                                 ),
                               ),
+                              const SizedBox(width: 8),
+                              InkWell(
+                                onTap: _handleLockViewMode,
+                                borderRadius: BorderRadius.circular(5),
+                                child: Container(
+                                  padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 3),
+                                  decoration: BoxDecoration(
+                                    color: AppTheme.statusComplete,
+                                    borderRadius: BorderRadius.circular(5),
+                                  ),
+                                  child: const Row(
+                                    mainAxisSize: MainAxisSize.min,
+                                    children: [
+                                      Icon(Icons.check_rounded, size: 12, color: Colors.black),
+                                      SizedBox(width: 3),
+                                      Text(
+                                        'Save & Lock',
+                                        style: TextStyle(fontSize: 10.5, fontWeight: FontWeight.bold, color: Colors.black),
+                                      ),
+                                    ],
+                                  ),
+                                ),
+                              ),
                             ],
                           ],
                         ),
@@ -1206,6 +1384,7 @@ class _PickingScreenState extends State<PickingScreen> with WidgetsBindingObserv
                   }
                 },
                 partFlags: _partFlags,
+                userPartNotes: _userPartNotes,
               ),
             ),
           ],
